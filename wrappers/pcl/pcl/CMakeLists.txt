@@ -2,9 +2,12 @@ cmake_minimum_required(VERSION 3.10)
 
 project(RealSensePCLExample)
 
-add_executable(rs-pcl rs-pcl.cpp)
+file(GLOB PCL_IMGUI_SOURCES "../../../third-party/imgui/*.cpp")
+
+add_executable(rs-pcl rs-pcl.cpp ${PCL_IMGUI_SOURCES})
 set_property(TARGET rs-pcl PROPERTY CXX_STANDARD 11)
 target_link_libraries(rs-pcl ${DEPENDENCIES})
+target_include_directories(rs-pcl PRIVATE ../../../third-party/imgui ../../../examples)
 if(NOT glfw3_DIR)
     target_include_directories(rs-pcl PUBLIC "${PROJECT_SOURCE_DIR}/third-party/glfw/include")
     target_link_directories(rs-pcl PUBLIC "${CMAKE_BINARY_DIR}/third-party/glfw/src/${CMAKE_BUILD_TYPE}")

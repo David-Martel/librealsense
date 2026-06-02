@@ -7,10 +7,12 @@ find_package(OpenGL REQUIRED)
 
 set(DEPENDENCIES glfw ${OPENGL_LIBRARIES} ${DEPENDENCIES})
 
-add_executable(rs-kinfu rs-kinfu.cpp ../../../examples/example.hpp)
+file(GLOB KINFU_IMGUI_SOURCES "../../../third-party/imgui/*.cpp")
+
+add_executable(rs-kinfu rs-kinfu.cpp ../../../examples/example.hpp ${KINFU_IMGUI_SOURCES})
 set_property(TARGET rs-kinfu PROPERTY CXX_STANDARD 11)
 target_link_libraries(rs-kinfu ${DEPENDENCIES})
-include_directories(../../../examples)
+include_directories(../../../examples ../../../third-party/imgui)
 set_target_properties (rs-kinfu PROPERTIES
 	FOLDER "Examples/OpenCV"
 )

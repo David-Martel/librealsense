@@ -42,7 +42,9 @@ endif()
 if(POLICY CMP0104)
     # Use modern approach
     cmake_policy(SET CMP0104 NEW)
-    set(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCH_LIST})
+    if(NOT CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCH_LIST})
+    endif()
 else()
     # Fallback for older CMake: build NVCC flags from architecture list
     foreach(ARCH ${CUDA_ARCH_LIST})

@@ -31,9 +31,40 @@
 #include <iostream>
 #include <map>
 #include <set>
+#include <cstring>
 
 using namespace realdds;
 using rsutils::json;
+
+
+static bool has_arg( int argc, char * argv[], char const * short_name, char const * long_name )
+{
+    for( int i = 1; i < argc; ++i )
+    {
+        if( 0 == std::strcmp( argv[i], short_name ) || 0 == std::strcmp( argv[i], long_name ) )
+            return true;
+    }
+    return false;
+}
+
+
+static void print_usage()
+{
+    std::cout << "\nUSAGE:\n\n"
+              << "   rs-dds-adapter  [--] [--version] [-h] [--debug] [--domain-id <0-232>]\n\n"
+              << "Where:\n\n"
+              << "   --, --ignore_rest\n"
+              << "     Ignores the rest of the labeled arguments following this flag.\n\n"
+              << "   --version\n"
+              << "     Displays version information and exits.\n\n"
+              << "   -h, --help\n"
+              << "     Displays usage information and exits.\n\n"
+              << "   --debug\n"
+              << "     Turn on librealsense debug logs\n\n"
+              << "   --domain-id <0-232>\n"
+              << "     Select domain ID to publish on\n\n"
+              << "   librealsense rs-dds-adapter tool: use USB devices as network devices\n\n";
+}
 
 
 std::string build_node_name( std::string const & rs2_camera_name, std::string const & serial_number )
@@ -127,6 +158,19 @@ static json load_settings( json const & local_settings )
 int main( int argc, char * argv[] )
 try
 {
+    if( has_arg( argc, argv, "-h", "--help" ) )
+    {
+        print_usage();
+        std::cout.flush();
+        std::_Exit( EXIT_SUCCESS );
+    }
+    if( has_arg( argc, argv, "--version", "--version" ) )
+    {
+        std::cout << RS2_API_FULL_VERSION_STR << std::endl;
+        std::cout.flush();
+        std::_Exit( EXIT_SUCCESS );
+    }
+
     using cli = rs2::cli_no_dds;  // no --eth, --no-eth, --eth-only, --domain-id
     cli::value< dds_domain_id > domain_arg( "domain-id", "0-232", 0, "Select domain ID to publish on" );
     cli cmd( "librealsense rs-dds-adapter tool: use USB devices as network devices" );

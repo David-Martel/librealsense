@@ -15,9 +15,10 @@ elseif(COMPILER_SUPPORTS_CXX0X)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++0x")
 endif()
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -msse4.1")
-
 add_executable(rs-depth-filter rs-depth-filter.cpp downsample.h downsample.cpp)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i[3-6]86)$")
+    target_compile_options(rs-depth-filter PRIVATE -msse4.1)
+endif()
 include_directories(../../../common)
 target_link_libraries(rs-depth-filter ${DEPENDENCIES})
 set_target_properties (rs-depth-filter PROPERTIES

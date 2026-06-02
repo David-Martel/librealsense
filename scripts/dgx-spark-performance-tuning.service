@@ -1,0 +1,11 @@
+[Unit]
+Description=DGX Spark RealSense performance power tuning
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/dgx-spark-performance-tuning
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

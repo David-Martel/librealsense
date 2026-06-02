@@ -9,6 +9,7 @@
 #include <list>
 #include <map>
 #include <mutex>
+#include <string>
 #include <thread>
 
 #pragma warning(disable:4100) // unreferenced formal parameter
