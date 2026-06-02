@@ -172,7 +172,8 @@ DeviceBase* Rs2Driver::deviceOpen(const char* uri, const char* mode)
 	{
 		Rs2ScopedMutex lock(m_devicesMx);
 
-		if (m_devices.find(uri) != m_devices.end())
+		const std::string uriKey(uri);
+		if (m_devices.find(uriKey) != m_devices.end())
 		{
 			rsTraceError("Already opened");
 			break;
@@ -216,7 +217,7 @@ DeviceBase* Rs2Driver::deviceOpen(const char* uri, const char* mode)
 				}
 				else
 				{
-					m_devices[serial] = deviceObj;
+					m_devices[std::string(serial)] = deviceObj;
 					device = nullptr; // don't release device handle
 				}
 				break;
@@ -241,7 +242,7 @@ void Rs2Driver::deviceClose(DeviceBase* deviceBase)
 		Rs2ScopedMutex lock(m_devicesMx);
 
 		Rs2Device* deviceObj = (Rs2Device*)deviceBase;
-		m_devices.erase(deviceObj->getInfo()->uri);
+		m_devices.erase(std::string(deviceObj->getInfo()->uri));
 		delete(deviceObj);
 	}
 }

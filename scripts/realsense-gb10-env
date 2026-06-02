@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PREFIX="${REALSENSE_GB10_PREFIX:-/opt/vigil/opt/librealsense-v2.58.1-dgx-spark-gb10}"
+PYTHON_VERSION="${REALSENSE_GB10_PYTHON_VERSION:-$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')}"
+
+export PATH="$PREFIX/bin:${PATH:-}"
+export LD_LIBRARY_PATH="$PREFIX/lib:${LD_LIBRARY_PATH:-}"
+export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+export CMAKE_PREFIX_PATH="$PREFIX:${CMAKE_PREFIX_PATH:-}"
+export PYTHONPATH="$PREFIX/lib/python${PYTHON_VERSION}/site-packages:${PYTHONPATH:-}"
+
+if [[ $# -eq 0 ]]; then
+    cat <<USAGE
+RealSense GB10 environment is active for this command:
+  PREFIX=$PREFIX
+
+Run a command through this environment, for example:
+  realsense-gb10-env rs-enumerate-devices -s
+  realsense-gb10-env python3 -c 'import pyrealsense2 as rs; print(len(rs.context().query_devices()))'
+USAGE
+    exit 0
+fi
+
+exec "$@"

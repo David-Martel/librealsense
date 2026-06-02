@@ -5,9 +5,22 @@ project (rs2driver)
 set(OPENNI2_DIR "c:/Program Files/OpenNI2" CACHE FILEPATH "OpenNI2 SDK directory")
 set(REALSENSE2_DIR "c:/Program Files (x86)/Intel RealSense SDK 2.0" CACHE FILEPATH "RealSense2 SDK directory")
 
+if (UNIX)
+    find_path(OPENNI2_INCLUDE_DIR
+        NAMES Driver/OniDriverAPI.h
+        PATHS
+            /usr/include/openni2
+            /usr/local/include/openni2
+            ${OPENNI2_DIR}
+    )
+    if (NOT OPENNI2_INCLUDE_DIR)
+        message(FATAL_ERROR "OpenNI2 driver headers were not found")
+    endif()
+endif()
+
 # INCLUDE DIR
 if (UNIX)
-    include_directories (${OPENNI2_DIR})
+    include_directories (${OPENNI2_INCLUDE_DIR})
 else ()
     include_directories (${OPENNI2_DIR}/Include)
 endif ()
