@@ -20,9 +20,8 @@ is_realsense_device() {
 write_if_writable() {
   local path="$1"
   local value="$2"
-  if [[ -w "$path" ]]; then
-    printf '%s\n' "$value" >"$path" || true
-  fi
+  [[ -e "$path" ]] || return 0
+  printf '%s\n' "$value" 2>/dev/null | tee "$path" >/dev/null 2>&1 || true
 }
 
 apply_power_tuning() {
