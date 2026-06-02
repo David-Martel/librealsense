@@ -18,25 +18,30 @@ done
 
 write_if_writable /sys/module/usbcore/parameters/autosuspend -1
 
-while IFS= read -r control; do
+for control in /sys/bus/usb/devices/*/power/control; do
+  [[ -e "$control" ]] || continue
   write_if_writable "$control" on
-done < <(find -L /sys/bus/usb/devices -path '*/power/control' 2>/dev/null)
+done
 
-while IFS= read -r autosuspend; do
+for autosuspend in /sys/bus/usb/devices/*/power/autosuspend; do
+  [[ -e "$autosuspend" ]] || continue
   write_if_writable "$autosuspend" -1
-done < <(find -L /sys/bus/usb/devices -path '*/power/autosuspend' 2>/dev/null)
+done
 
-while IFS= read -r delay; do
+for delay in /sys/bus/usb/devices/*/power/autosuspend_delay_ms; do
+  [[ -e "$delay" ]] || continue
   write_if_writable "$delay" -1
-done < <(find -L /sys/bus/usb/devices -path '*/power/autosuspend_delay_ms' 2>/dev/null)
+done
 
-while IFS= read -r control; do
+for control in /sys/bus/pci/devices/*/power/control; do
+  [[ -e "$control" ]] || continue
   write_if_writable "$control" on
-done < <(find -L /sys/bus/pci/devices -path '*/power/control' 2>/dev/null)
+done
 
-while IFS= read -r policy; do
+for policy in /sys/class/scsi_host/*/link_power_management_policy; do
+  [[ -e "$policy" ]] || continue
   write_if_writable "$policy" max_performance
-done < <(find -L /sys/class/scsi_host -path '*/link_power_management_policy' 2>/dev/null)
+done
 
 write_if_writable /sys/module/pcie_aspm/parameters/policy performance
 write_if_writable /sys/module/nvme_core/parameters/default_ps_max_latency_us 0
