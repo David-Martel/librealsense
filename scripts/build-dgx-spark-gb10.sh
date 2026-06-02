@@ -165,6 +165,10 @@ validate() {
   export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 
   "$PREFIX/bin/rs-enumerate-devices" --version
+  "$PREFIX/bin/rs-gb10-profiler" --list-profiles --output-dir "" --no-evidence
+  "$PREFIX/bin/rs-dds-sniffer" --help >/dev/null
+  "$PREFIX/bin/rs-dds-config" --help >/dev/null
+  "$PREFIX/bin/rs-dds-adapter" --help >/dev/null
   pkg-config --modversion realsense2
   pkg-config --libs realsense2 | grep -F -- "-L$PREFIX/lib" >/dev/null
 

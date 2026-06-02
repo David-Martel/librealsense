@@ -120,6 +120,11 @@ Default feature set:
 - With a D435 attached and authorized, a 60 second profile run reaches at least
   25 Hz for RGB plus depth preview on USB3 and records frame drops, CPU use, GPU
   use, USB bandwidth, and reconnect behavior.
+- `rs-gb10-profiler --list-profiles` succeeds from the isolated prefix.
+- DDS command-line tools at least handle `--help` without loader or shutdown
+  crashes from the isolated prefix.
+- Non-headless profiler runs produce bounded log output plus one framebuffer
+  evidence image per rendered cycle under `/tmp/rs-gb10-profiler/`.
 
 ## Session Results
 
@@ -157,15 +162,105 @@ Default feature set:
   - RGB + Z16 depth `640x480@30` steady-state stream test with SDK alignment to
     color processed `300/300` aligned frames at `29.98` wall FPS and `29.99`
     sensor FPS with no observed timeouts.
+- Added `rs-gb10-profiler`, a GB10-specific benchmark and lifecycle stress
+  tool:
+  - Default mode opens a GLFW/OpenGL render window and writes a PPM framebuffer
+    evidence image after each rendered cycle.
+  - `--no-render` runs the same capture/start/stop path without the visible
+    window for stress and automation.
+  - Built-in profiles cover `vga30`, `vga60`, `depth90-ir`, `hd15`, and `all`.
+  - The tool uses a process lock, serial/device preflight, bounded frame waits,
+    clean RAII stop, and a hard stop watchdog so failed stops do not silently
+    leave camera ownership stuck.
+  - Summary output records USB3 state, start and stop latency, frame count,
+    effective FPS, timeouts, inter-frame gaps, processing/render timing, RSS,
+    and evidence paths.
+- Added validation coverage for `rs-gb10-profiler --list-profiles`,
+  `rs-dds-sniffer --help`, `rs-dds-config --help`, and
+  `rs-dds-adapter --help`.
+- Added system-level GB10 performance tuning:
+  - `/usr/local/sbin/dgx-spark-performance-tuning`
+  - `/etc/systemd/system/dgx-spark-performance-tuning.service`
+  - `/etc/udev/rules.d/99-dgx-spark-performance.rules`
+  - `/etc/modprobe.d/99-dgx-spark-usbcore.conf`
+  - `/etc/default/grub.d/99-dgx-spark-performance.cfg`
+- Installed `uhubctl` for supported hub per-port power inspection/cycling.
+- The performance service is enabled and active. Current-boot sysfs tuning set
+  USB autosuspend to `-1`, PCIe ASPM policy to `performance`, NVMe default
+  power-state latency to `0`, and CPU governors to `performance` where exposed.
+- `update-grub` installed kernel command-line defaults for
+  `usbcore.autosuspend=-1`, `pcie_aspm=off`, `pcie_port_pm=off`, and
+  `nvme_core.default_ps_max_latency_us=0`. Reboot is still required before those
+  boot-time settings are fully active.
+- Added `realsense-rsusb-metal` for low-level RSUSB/user-space ownership work:
+  - `status` reports RealSense USB device speed, authorization, power, and
+    bound interface drivers.
+  - `tune` applies RealSense USB power tuning.
+  - `unbind-uvcvideo` detaches only RealSense UVC interfaces from `uvcvideo`.
+  - `rebind-uvcvideo` restores those interfaces if needed.
+- RSUSB source review:
+  - `FORCE_RSUSB_BACKEND=ON` selects the libuvc/libusb backend through
+    `RS2_USE_LIBUVC_BACKEND`.
+  - The Linux RSUSB path compiles `src/libuvc/rsusb-backend-linux.cpp`.
+  - The libusb handle sets auto-detach on claimed interfaces before claiming
+    them, so normal streaming already bypasses the kernel UVC data path after
+    the device has enumerated.
+  - Kernel `uvcvideo` can still probe the device at attach time and emit UVC
+    format/control warnings. Do not globally blacklist `uvcvideo`; use
+    `realsense-rsusb-metal unbind-uvcvideo` only as a targeted recovery or
+    interference test for RealSense interfaces.
+- USB3 profiler observations before the camera disconnected:
+  - Visible `vga30` with pointcloud and filters reached `26.79` effective FPS
+    over 5 seconds, with `134` framesets, `2` timeouts, `4` inter-frame gaps,
+    clean stop, and NVIDIA GB10 OpenGL rendering.
+  - Visible `vga30` without the heavy pointcloud/filter path reached `28.91`
+    effective FPS over 15 seconds, with `434` framesets, `2` timeouts, `4`
+    gaps, clean stop, and about `2.75 ms` mean render time.
+  - No-render `all` stress over `vga30`, `vga60`, `depth90-ir`, and `hd15`
+    completed without profile failures and produced `779` total framesets.
+  - A later short no-render stream hit libusb/UVC control-transfer errors,
+    endpoint reset timeouts, and a hardware disconnect.
+- Current blocker:
+  - `lsusb -t` no longer shows the D435.
+  - Kernel logs show `usb 4-1: USB disconnect, device number 2` at
+    `2026-06-01 23:20:43`.
+  - After a manual camera power cycle at `2026-06-01T23:43:05-04:00`,
+    `lsusb -t`, sysfs USB device enumeration, USBGuard device listing, and
+    `realsense-rsusb-metal status` still showed no `8086:0b07` device.
+  - Kernel logs for that retry window contained no new RealSense attach event.
+  - Current validation therefore reports `devices=0` until the camera is
+    physically reconnected on a live USB3 link or the machine is rebooted.
 
 ## Open Items
 
-- Run a CUDA arch configure test for `121`; if unsupported, use `120`.
-- Decide whether `LRS_GB10_WITH_IPO=ON` is stable with CUDA in this tree.
-- Benchmark RealDDS/FastDDS tools against the ROS wrapper path and decide
-  whether DDS should remain enabled in production builds or only in debug
-  builds.
+- Reconnect the D435 or reboot the DGX Spark, then run:
+
+  ```bash
+  realsense-gb10-env rs-gb10-profiler --profile vga30 --cycles 1 --duration-sec 15
+  realsense-gb10-env rs-gb10-profiler --profile all --cycles 3 --duration-sec 5 --pointcloud --filters --no-render
+  sudo realsense-rsusb-metal status
+  ```
+
+- If kernel UVC probing or reattach appears to interfere with RSUSB after
+  reconnect, run a targeted test:
+
+  ```bash
+  sudo realsense-rsusb-metal unbind-uvcvideo
+  realsense-gb10-env rs-gb10-profiler --profile all --cycles 3 --duration-sec 5 --no-render
+  sudo realsense-rsusb-metal rebind-uvcvideo
+  ```
+
+- Reboot once to apply the installed kernel command-line power settings, then
+  repeat the visible and no-render profiler runs.
+- Keep CUDA architecture `121`; the GB10 configure/build path accepted it.
+- Keep `LRS_GB10_WITH_IPO=OFF` for now. LTO should only be enabled after a clean
+  A/B benchmark because pybind/CUDA builds are more sensitive to link-time
+  optimization and no measured win has been shown yet.
+- Investigate the remaining RealDDS duplicate static/shared symbol issue before
+  relying on normal `rs-dds-adapter` shutdown in production. The `--help` and
+  `--version` paths are fixed and covered by validation.
 - Build or install CUDA-enabled OpenCV under `/opt/vigil/opt/opencv-cuda` before
-  moving VIGIL preview processing onto `cv2.cuda`.
-- Re-run VIGIL display and SAM profiles after the camera is physically stable
-  and permanently authorized by USBGuard.
+  moving VIGIL preview processing onto `cv2.cuda`; the current system `cv2`
+  install did not expose usable CUDA devices.
+- Re-run VIGIL display and SAM profiles after the camera is physically stable,
+  authorized by USBGuard, and validated by `rs-gb10-profiler`.

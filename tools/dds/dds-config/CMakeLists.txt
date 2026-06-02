@@ -14,10 +14,15 @@ file( GLOB_RECURSE RS_DDS_CONFIG_SOURCE_FILES
 target_sources( ${PROJECT_NAME} PRIVATE ${RS_DDS_CONFIG_SOURCE_FILES} )
 
 target_link_libraries( ${PROJECT_NAME} PRIVATE realdds realsense2 tclap )
+target_compile_definitions( ${PROJECT_NAME} PRIVATE NO_ELPP_INIT )
+if( UNIX AND NOT APPLE )
+    target_link_options( ${PROJECT_NAME} PRIVATE "-Wl,--exclude-libs,ALL" )
+endif()
 
 set_target_properties (${PROJECT_NAME} PROPERTIES
     FOLDER Tools/dds
     CXX_STANDARD 14
+    INSTALL_RPATH "\$ORIGIN/../lib"
     )
 
 install( TARGETS ${PROJECT_NAME}
@@ -25,4 +30,3 @@ install( TARGETS ${PROJECT_NAME}
     )
 
 using_easyloggingpp( ${PROJECT_NAME} SHARED )
-
