@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -19,6 +20,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <fcntl.h>
 #include <sstream>
 #include <stdexcept>
@@ -40,9 +42,11 @@ struct options
     int cycles = 1;
     double duration_sec = 30.0;
     int timeout_ms = 250;
-    int cooldown_ms = 500;
+    int pre_stop_drain_ms = 1200;
+    int pre_stop_settle_ms = 250;
+    int cooldown_ms = 1000;
     int stop_warn_ms = 5000;
-    int hard_stop_ms = 15000;
+    int hard_stop_ms = 30000;
     std::string output_dir = "/tmp/rs-gb10-profiler";
     bool render = true;
     bool require_usb3 = true;
@@ -117,8 +121,11 @@ struct cycle_result
     std::string evidence_path;
     uint64_t framesets = 0;
     uint64_t timeouts = 0;
+    uint64_t drain_framesets = 0;
+    uint64_t drain_timeouts = 0;
     uint64_t exceptions = 0;
     double start_ms = 0.0;
+    double pre_stop_ms = 0.0;
     double stop_ms = 0.0;
     double wall_sec = 0.0;
     running_stats wait_ms;
@@ -167,6 +174,8 @@ static void usage()
         << "  --cycles <n>           Start/stop cycles per profile\n"
         << "  --duration-sec <n>     Seconds per cycle\n"
         << "  --timeout-ms <n>       try_wait_for_frames timeout\n"
+        << "  --pre-stop-drain-ms <n> Drain and drop frames before stop\n"
+        << "  --pre-stop-settle-ms <n> Sleep after releasing processing state\n"
         << "  --cooldown-ms <n>      Sleep after stop before next start\n"
         << "  --stop-warn-ms <n>     Mark stop dirty if it takes longer than this\n"
         << "  --hard-stop-ms <n>     Terminate if pipeline.stop() wedges past this\n"
@@ -207,6 +216,10 @@ static options parse_options(int argc, char** argv)
             opt.duration_sec = std::max(0.1, std::atof(value.c_str()));
         else if (arg == "--timeout-ms" && read_arg(argc, argv, i, &value))
             opt.timeout_ms = std::max(1, std::atoi(value.c_str()));
+        else if (arg == "--pre-stop-drain-ms" && read_arg(argc, argv, i, &value))
+            opt.pre_stop_drain_ms = std::max(0, std::atoi(value.c_str()));
+        else if (arg == "--pre-stop-settle-ms" && read_arg(argc, argv, i, &value))
+            opt.pre_stop_settle_ms = std::max(0, std::atoi(value.c_str()));
         else if (arg == "--cooldown-ms" && read_arg(argc, argv, i, &value))
             opt.cooldown_ms = std::max(0, std::atoi(value.c_str()));
         else if (arg == "--stop-warn-ms" && read_arg(argc, argv, i, &value))
@@ -446,6 +459,59 @@ static bool is_usb3(const rs2::device& dev)
     return usb.find("3.") != std::string::npos || usb == "3";
 }
 
+class stop_watchdog
+{
+public:
+    explicit stop_watchdog(int hard_stop_ms)
+        : _timeout(std::chrono::milliseconds(hard_stop_ms))
+        , _thread([this](std::stop_token token) { watch(token); })
+    {
+    }
+
+    ~stop_watchdog()
+    {
+        complete();
+    }
+
+    void complete()
+    {
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            _done = true;
+        }
+        _cv.notify_all();
+        if (_thread.joinable())
+        {
+            _thread.request_stop();
+            _thread.join();
+        }
+    }
+
+    stop_watchdog(const stop_watchdog&) = delete;
+    stop_watchdog& operator=(const stop_watchdog&) = delete;
+
+private:
+    void watch(std::stop_token token)
+    {
+        std::unique_lock<std::mutex> lock(_mutex);
+        const auto completed = _cv.wait_for(lock, _timeout, [&]() {
+            return _done || token.stop_requested();
+        });
+        if (!completed)
+        {
+            std::cerr << "stop.fatal=pipeline.stop exceeded hard timeout "
+                      << _timeout.count() << "ms; terminating to release camera ownership\n";
+            std::_Exit(EXIT_FAILURE);
+        }
+    }
+
+    std::chrono::milliseconds _timeout;
+    std::mutex _mutex;
+    std::condition_variable_any _cv;
+    bool _done = false;
+    std::jthread _thread;
+};
+
 class pipeline_session
 {
 public:
@@ -493,36 +559,27 @@ public:
     {
         if (!_started)
             return true;
-        auto stop_done = std::make_shared<std::atomic<bool>>(false);
-        std::thread([stop_done, hard_stop_ms]() {
-            std::this_thread::sleep_for(std::chrono::milliseconds(hard_stop_ms));
-            if (!stop_done->load())
-            {
-                std::cerr << "stop.fatal=pipeline.stop exceeded hard timeout "
-                          << hard_stop_ms << "ms; terminating to release camera ownership\n";
-                std::_Exit(EXIT_FAILURE);
-            }
-        }).detach();
 
+        stop_watchdog watchdog(hard_stop_ms);
         try
         {
             _pipe.stop();
             _started = false;
-            stop_done->store(true);
+            watchdog.complete();
             return true;
         }
         catch (const std::exception& e)
         {
             std::cerr << "stop.warning=" << e.what() << "\n";
             _started = false;
-            stop_done->store(true);
+            watchdog.complete();
             return false;
         }
         catch (...)
         {
             std::cerr << "stop.warning=unknown exception\n";
             _started = false;
-            stop_done->store(true);
+            watchdog.complete();
             return false;
         }
     }
@@ -578,6 +635,38 @@ static void apply_processing(const test_profile& profile,
     }
 }
 
+static void drain_before_stop(pipeline_session& session,
+                              const options& opt,
+                              cycle_result& result)
+{
+    if (opt.pre_stop_drain_ms <= 0)
+        return;
+
+    auto drain_begin = clock_type::now();
+    auto deadline = drain_begin + std::chrono::milliseconds(opt.pre_stop_drain_ms);
+    const auto wait_ms = std::max(1, std::min(opt.timeout_ms, 100));
+
+    while (clock_type::now() < deadline)
+    {
+        rs2::frameset dropped;
+        try
+        {
+            if (session.try_wait(&dropped, wait_ms))
+                ++result.drain_framesets;
+            else
+                ++result.drain_timeouts;
+        }
+        catch (const std::exception& e)
+        {
+            std::cerr << "pre_stop.warning=" << e.what() << "\n";
+            ++result.exceptions;
+            break;
+        }
+    }
+
+    result.pre_stop_ms += elapsed_ms(drain_begin, clock_type::now());
+}
+
 static cycle_result run_cycle(rs2::context& ctx,
                               const options& opt,
                               const test_profile& profile,
@@ -623,70 +712,80 @@ static cycle_result run_cycle(rs2::context& ctx,
         return result;
     }
 
-    rs2::colorizer colorizer;
-    rs2::align align_to_color(RS2_STREAM_COLOR);
-    rs2::pointcloud pc;
-    rs2::decimation_filter decimation;
-    rs2::spatial_filter spatial;
-    rs2::temporal_filter temporal;
-
     auto run_begin = clock_type::now();
-    auto deadline = run_begin + std::chrono::duration_cast<clock_type::duration>(
-        std::chrono::duration<double>(opt.duration_sec));
-
-    while (clock_type::now() < deadline)
     {
-        try
+        rs2::colorizer colorizer;
+        rs2::align align_to_color(RS2_STREAM_COLOR);
+        rs2::pointcloud pc;
+        rs2::decimation_filter decimation;
+        rs2::spatial_filter spatial;
+        rs2::temporal_filter temporal;
+
+        auto deadline = run_begin + std::chrono::duration_cast<clock_type::duration>(
+            std::chrono::duration<double>(opt.duration_sec));
+
+        while (clock_type::now() < deadline)
         {
-            rs2::frameset frames;
-            auto wait_begin = clock_type::now();
-            if (!session.try_wait(&frames, opt.timeout_ms))
+            try
             {
-                result.wait_ms.add(elapsed_ms(wait_begin, clock_type::now()));
-                result.timeouts++;
-                continue;
+                rs2::frameset frames;
+                auto wait_begin = clock_type::now();
+                if (!session.try_wait(&frames, opt.timeout_ms))
+                {
+                    result.wait_ms.add(elapsed_ms(wait_begin, clock_type::now()));
+                    result.timeouts++;
+                    continue;
+                }
+                auto wait_end = clock_type::now();
+                result.wait_ms.add(elapsed_ms(wait_begin, wait_end));
+                result.framesets++;
+
+                for (auto&& frame : frames)
+                    update_stream_counter(result, frame);
+
+                auto process_begin = clock_type::now();
+                apply_processing(profile, opt, frames, align_to_color, pc, decimation, spatial, temporal);
+                auto process_end = clock_type::now();
+                result.process_ms.add(elapsed_ms(process_begin, process_end));
+
+                if (app)
+                {
+                    auto render_begin = clock_type::now();
+                    auto render_frames = build_render_frames(frames, colorizer);
+                    app->show(render_frames);
+                    bool keep_open = static_cast<bool>(*app);
+                    if (opt.capture_evidence && result.evidence_path.empty())
+                    {
+                        result.evidence_path = artifact_path(opt, profile.name, cycle, ".ppm");
+                        save_frontbuffer_ppm(result.evidence_path, static_cast<int>(app->width()), static_cast<int>(app->height()));
+                    }
+                    auto render_end = clock_type::now();
+                    result.render_ms.add(elapsed_ms(render_begin, render_end));
+                    if (!keep_open)
+                    {
+                        result.window_closed = true;
+                        break;
+                    }
+                }
             }
-            auto wait_end = clock_type::now();
-            result.wait_ms.add(elapsed_ms(wait_begin, wait_end));
-            result.framesets++;
-
-            for (auto&& frame : frames)
-                update_stream_counter(result, frame);
-
-            auto process_begin = clock_type::now();
-            apply_processing(profile, opt, frames, align_to_color, pc, decimation, spatial, temporal);
-            auto process_end = clock_type::now();
-            result.process_ms.add(elapsed_ms(process_begin, process_end));
-
-            if (app)
+            catch (const std::exception& e)
             {
-                auto render_begin = clock_type::now();
-                auto render_frames = build_render_frames(frames, colorizer);
-                app->show(render_frames);
-                bool keep_open = static_cast<bool>(*app);
-                if (opt.capture_evidence && result.evidence_path.empty())
-                {
-                    result.evidence_path = artifact_path(opt, profile.name, cycle, ".ppm");
-                    save_frontbuffer_ppm(result.evidence_path, static_cast<int>(app->width()), static_cast<int>(app->height()));
-                }
-                auto render_end = clock_type::now();
-                result.render_ms.add(elapsed_ms(render_begin, render_end));
-                if (!keep_open)
-                {
-                    result.window_closed = true;
-                    break;
-                }
+                std::cerr << "cycle.warning profile=" << profile.name << " cycle=" << cycle << " " << e.what() << "\n";
+                result.exceptions++;
+                break;
             }
         }
-        catch (const std::exception& e)
-        {
-            std::cerr << "cycle.warning profile=" << profile.name << " cycle=" << cycle << " " << e.what() << "\n";
-            result.exceptions++;
-            break;
-        }
+
+        drain_before_stop(session, opt, result);
     }
 
     result.wall_sec = elapsed_sec(run_begin, clock_type::now());
+    if (opt.pre_stop_settle_ms > 0)
+    {
+        auto settle_begin = clock_type::now();
+        std::this_thread::sleep_for(std::chrono::milliseconds(opt.pre_stop_settle_ms));
+        result.pre_stop_ms += elapsed_ms(settle_begin, clock_type::now());
+    }
 
     auto stop_begin = clock_type::now();
     result.stopped_cleanly = session.stop_noexcept(opt.hard_stop_ms);
@@ -723,10 +822,13 @@ static void print_cycle_result(const cycle_result& r)
               << " framesets=" << r.framesets
               << " fps=" << fps
               << " timeouts=" << r.timeouts
+              << " drain_framesets=" << r.drain_framesets
+              << " drain_timeouts=" << r.drain_timeouts
               << " gaps=" << total_gaps
               << " exceptions=" << r.exceptions
               << " evidence=" << (r.evidence_path.empty() ? "none" : r.evidence_path)
               << " start_ms=" << r.start_ms
+              << " pre_stop_ms=" << r.pre_stop_ms
               << " stop_ms=" << r.stop_ms
               << " wait_ms_mean=" << r.wait_ms.mean()
               << " process_ms_mean=" << r.process_ms.mean()
@@ -787,10 +889,13 @@ static std::string result_line(const cycle_result& r)
        << " framesets=" << r.framesets
        << " fps=" << fps
        << " timeouts=" << r.timeouts
+       << " drain_framesets=" << r.drain_framesets
+       << " drain_timeouts=" << r.drain_timeouts
        << " gaps=" << total_gaps
        << " exceptions=" << r.exceptions
        << " evidence=" << (r.evidence_path.empty() ? "none" : r.evidence_path)
        << " start_ms=" << r.start_ms
+       << " pre_stop_ms=" << r.pre_stop_ms
        << " stop_ms=" << r.stop_ms
        << " wait_ms_mean=" << r.wait_ms.mean()
        << " process_ms_mean=" << r.process_ms.mean()

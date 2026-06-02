@@ -175,6 +175,29 @@ Default feature set:
   - Summary output records USB3 state, start and stop latency, frame count,
     effective FPS, timeouts, inter-frame gaps, processing/render timing, RSS,
     and evidence paths.
+- Hardened `rs-gb10-profiler` stop management after repeated D435 stop/restart
+  failures:
+  - It drains and drops frames for `--pre-stop-drain-ms` before calling
+    `pipeline.stop()`.
+  - It destroys processing objects that can retain frame references, including
+    align, colorizer, pointcloud, and temporal/spatial filters, before
+    `pipeline.stop()`.
+  - It adds a firmware/USB settle period via `--pre-stop-settle-ms`.
+  - Defaults now use `1200 ms` pre-stop drain, `250 ms` pre-stop settle,
+    `1000 ms` post-stop cooldown, and a `30000 ms` hard stop watchdog.
+  - Result lines now include `pre_stop_ms`, `drain_framesets`, and
+    `drain_timeouts`.
+- Rebuilt the GB10 SDK path with C++20 enabled for the main C++ targets and the
+  profiler compiled as strict C++20:
+  - `rs-gb10-profiler` now uses a C++20 `std::jthread` RAII watchdog instead of
+    a detached watchdog thread.
+  - A C++20 compatibility fix was required in vendored `rsutils`:
+    `single_consumer_frame_queue<T>(...)` was changed to the standard constructor
+    spelling `single_consumer_frame_queue(...)`.
+  - `librealsense2.so`, `librealsense2-gl.so`, and `rs-gb10-profiler` linked
+    successfully under the updated C++20 build configuration.
+  - Known C++20 warning debt remains in older vendored/upstream code, including
+    deprecated implicit `this` captures and EasyLogging++ fortify warnings.
 - Added validation coverage for `rs-gb10-profiler --list-profiles`,
   `rs-dds-sniffer --help`, `rs-dds-config --help`, and
   `rs-dds-adapter --help`.
@@ -209,6 +232,20 @@ Default feature set:
     format/control warnings. Do not globally blacklist `uvcvideo`; use
     `realsense-rsusb-metal unbind-uvcvideo` only as a targeted recovery or
     interference test for RealSense interfaces.
+- Stop-path source review:
+  - `rs2::pipeline::stop()` has no public timeout parameter. It synchronously
+    stops sync/aggregation, stops the multistream, closes stream profiles, and
+    stops its dispatcher.
+  - RSUSB UVC stop cancels request callbacks, stops the watchdog, stops backend
+    frame allocation, clears queued frames, cancels outstanding USB requests,
+    waits for backend frame ownership to empty, resets the read endpoint, and
+    stops the publish thread.
+  - Application-held frames and processing objects matter because retained frame
+    references can extend the backend archive drain and make stop slow or dirty.
+  - The D400 errata history includes multiple start/stop and reset-adjacent
+    failures, so the production interface should treat stop/restart as a
+    state-machine transition with drain, settle, bounded stop, cooldown, and
+    telemetry.
 - USB3 profiler observations before the camera disconnected:
   - Visible `vga30` with pointcloud and filters reached `26.79` effective FPS
     over 5 seconds, with `134` framesets, `2` timeouts, `4` inter-frame gaps,
@@ -236,8 +273,8 @@ Default feature set:
 - Reconnect the D435 or reboot the DGX Spark, then run:
 
   ```bash
-  realsense-gb10-env rs-gb10-profiler --profile vga30 --cycles 1 --duration-sec 15
-  realsense-gb10-env rs-gb10-profiler --profile all --cycles 3 --duration-sec 5 --pointcloud --filters --no-render
+  realsense-gb10-env rs-gb10-profiler --profile vga30 --cycles 1 --duration-sec 15 --pre-stop-drain-ms 1200 --pre-stop-settle-ms 250 --cooldown-ms 1000
+  realsense-gb10-env rs-gb10-profiler --profile all --cycles 3 --duration-sec 5 --pointcloud --filters --no-render --pre-stop-drain-ms 1200 --pre-stop-settle-ms 250 --cooldown-ms 1000
   sudo realsense-rsusb-metal status
   ```
 
@@ -246,13 +283,17 @@ Default feature set:
 
   ```bash
   sudo realsense-rsusb-metal unbind-uvcvideo
-  realsense-gb10-env rs-gb10-profiler --profile all --cycles 3 --duration-sec 5 --no-render
+  realsense-gb10-env rs-gb10-profiler --profile all --cycles 3 --duration-sec 5 --no-render --pre-stop-drain-ms 1200 --pre-stop-settle-ms 250
   sudo realsense-rsusb-metal rebind-uvcvideo
   ```
 
 - Reboot once to apply the installed kernel command-line power settings, then
   repeat the visible and no-render profiler runs.
 - Keep CUDA architecture `121`; the GB10 configure/build path accepted it.
+- Keep `LRS_GB10_CXX_STANDARD=20` for GB10 experiments unless a downstream
+  wrapper shows an ABI or source-compatibility issue. If production stability is
+  prioritized over toolchain modernization, rebuild with
+  `LRS_GB10_CXX_STANDARD=14` and keep only `rs-gb10-profiler` on C++20.
 - Keep `LRS_GB10_WITH_IPO=OFF` for now. LTO should only be enabled after a clean
   A/B benchmark because pybind/CUDA builds are more sensitive to link-time
   optimization and no measured win has been shown yet.

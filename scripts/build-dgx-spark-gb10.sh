@@ -13,6 +13,7 @@ PYTHON_INSTALL_DIR="${LRS_GB10_PYTHON_INSTALL_DIR:-$PREFIX/lib/python${PYTHON_VE
 GENERATOR="${LRS_GB10_GENERATOR:-Ninja}"
 NATIVE_FLAGS="${LRS_GB10_NATIVE_FLAGS:--O3 -DNDEBUG -mcpu=native -ffunction-sections -fdata-sections}"
 LINK_FLAGS="${LRS_GB10_LINK_FLAGS:--Wl,--gc-sections}"
+CXX_STANDARD="${LRS_GB10_CXX_STANDARD:-20}"
 WITH_DDS="${LRS_GB10_WITH_DDS:-ON}"
 WITH_OPENMP="${LRS_GB10_WITH_OPENMP:-ON}"
 WITH_IPO="${LRS_GB10_WITH_IPO:-OFF}"
@@ -40,6 +41,7 @@ Useful environment:
   LRS_GB10_WITH_OPENMP     Enable OpenMP, default ON
   LRS_GB10_WITH_IPO        Enable release IPO/LTO, default OFF
   LRS_GB10_EXTERNAL_LZ4    Use external LZ4 CMake package, default OFF
+  LRS_GB10_CXX_STANDARD    C++ standard for unpinned targets, default 20
   PYTHON_EXECUTABLE        Python ABI for pyrealsense2
   LRS_GB10_PYTHON_INSTALL_DIR
                            Python install dir, default under the GB10 prefix
@@ -121,6 +123,8 @@ configure() {
     -DCMAKE_INSTALL_LIBDIR=lib \
     -DCMAKE_C_FLAGS_RELEASE="$NATIVE_FLAGS" \
     -DCMAKE_CXX_FLAGS_RELEASE="$NATIVE_FLAGS" \
+    -DCMAKE_CXX_STANDARD="$CXX_STANDARD" \
+    -DCMAKE_CXX_STANDARD_REQUIRED=ON \
     -DCMAKE_EXE_LINKER_FLAGS_RELEASE="$LINK_FLAGS" \
     -DCMAKE_SHARED_LINKER_FLAGS_RELEASE="$LINK_FLAGS" \
     -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE="$WITH_IPO" \
@@ -186,7 +190,7 @@ int main()
     return 0;
 }
 CPP
-  c++ -std=c++17 "$smoke_dir/smoke.cpp" $(pkg-config --cflags --libs realsense2) -o "$smoke_dir/smoke"
+  c++ -std=c++20 "$smoke_dir/smoke.cpp" $(pkg-config --cflags --libs realsense2) -o "$smoke_dir/smoke"
   "$smoke_dir/smoke"
 
   local py_pkg_dir py_site_dir
