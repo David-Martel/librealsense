@@ -28,10 +28,10 @@ apply_power_tuning() {
   write_if_writable /sys/module/usbcore/parameters/autosuspend -1
   while IFS= read -r control; do
     write_if_writable "$control" on
-  done < <(find /sys/bus/usb/devices -path '*/power/control' 2>/dev/null)
+  done < <(find -L /sys/bus/usb/devices -path '*/power/control' 2>/dev/null)
   while IFS= read -r delay; do
     write_if_writable "$delay" -1
-  done < <(find /sys/bus/usb/devices -path '*/power/autosuspend_delay_ms' 2>/dev/null)
+  done < <(find -L /sys/bus/usb/devices -path '*/power/autosuspend_delay_ms' 2>/dev/null)
 }
 
 status() {
