@@ -112,8 +112,11 @@ Validation:
   backend (`RS2_USE_LIBUVC_BACKEND`).
 - RSUSB claims interfaces through libusb and can auto-detach kernel drivers.
   The Linux kernel can still probe the device before RSUSB owns the interfaces.
-- Do not globally blacklist `uvcvideo`; use `realsense-rsusb-metal
-  unbind-uvcvideo` only for targeted RealSense recovery or interference tests.
+- `scripts/build-dgx-spark-gb10.sh` accepts `LRS_GB10_FORCE_RSUSB=OFF` for
+  native Linux V4L2/`uvcvideo` backend validation in a separate build/prefix.
+- Do not globally blacklist `uvcvideo`; keep it bound for normal operation.
+  `realsense-rsusb-metal unbind-uvcvideo` is now opt-in only and should be used
+  only for controlled fault-isolation experiments.
 - `rs2::pipeline::stop()` has no public timeout parameter. The profiler now
   drains frames, releases processing objects, waits briefly, then calls stop
   under a hard watchdog.
@@ -121,24 +124,79 @@ Validation:
   by changing `single_consumer_frame_queue<T>(...)` to
   `single_consumer_frame_queue(...)`.
 
+## Runtime Findings From Spark-3066
+
+### Stable Bound Baseline
+
+Validation output:
+`/home/damartel/realsense-gb10-validation/20260602-143904`
+
+- Device: Intel RealSense D435, serial `347622075921`, firmware `5.15.1.55`,
+  USB `3.2`.
+- Renderer: visible OpenGL render on `NVIDIA GB10/PCIe`, OpenGL `4.6.0`.
+- Result: `SUMMARY framesets=1823 timeouts=0 failures=0`.
+- Remaining issues treated as failures for production readiness:
+  331 libusb control-transfer warnings, 3 UVC streamer watchdogs, repeated
+  kernel RealSense UVC format/control warnings, and profile-specific frame gaps.
+
+### Rejected RSUSB Unbind Experiment
+
+Validation output:
+`/home/damartel/realsense-gb10-validation/20260602-144941-rsusb-unbound`
+
+Targeted `uvcvideo` unbind made the failure mode worse:
+
+- The profiler reported `SUMMARY framesets=108 timeouts=0 failures=1`.
+- It produced 322 control-transfer warnings and 3 UVC streamer watchdogs.
+- Stop/start degraded into a dirty stop with synthetic-stream/XU polling
+  exceptions.
+- The host controller then failed:
+  `xHCI host not responding to stop endpoint command`, `Host halt failed,
+  -110`, `xHCI host controller not responding, assume dead`, and `HC died`.
+- The same controller/hub path dropped both the RealSense camera and the USB
+  Ethernet adapter. This is not Ethernet signaling interference; it is shared
+  host-controller failure under the USB endpoint stop/reset path.
+
+Conclusion: RSUSB direct ownership with `uvcvideo` unbound is not acceptable on
+this GB10 USB4/TB4 path. Normal operation should keep `uvcvideo` bound and the
+next production candidate should be a native V4L2 backend build.
+
 ## Current Runtime Blocker
 
 The D435 currently does not enumerate on USB. `lsusb`, USB sysfs inventory,
 USBGuard inventory, `realsense-rsusb-metal status`, and
 `rs-enumerate-devices -s` all show no `8086:0b07` device.
 
+`NVDA8000:02` is still present as a platform device but no longer bound to
+`xhci-hcd`. Rebinding through `/sys/bus/platform/drivers/xhci-hcd/bind` returns
+`Connection timed out` and repeats `probe with driver xhci-hcd failed with
+error -110`. Recovery requires rebooting the host or physically power-cycling
+the affected USB4/TB4 hub/controller path.
+
 Recommended next run after physical USB3 reconnection or reboot:
 
 ```bash
-realsense-gb10-env rs-gb10-profiler --profile vga30 --cycles 1 --duration-sec 15 --pre-stop-drain-ms 1200 --pre-stop-settle-ms 250 --cooldown-ms 1000
-realsense-gb10-env rs-gb10-profiler --profile all --cycles 3 --duration-sec 5 --pointcloud --filters --no-render --pre-stop-drain-ms 1200 --pre-stop-settle-ms 250 --cooldown-ms 1000
 sudo realsense-rsusb-metal status
+sudo realsense-rsusb-metal tune
+realsense-gb10-usb-soak
 ```
 
-Optional RSUSB isolation test after reconnection:
+Native backend validation build after controller recovery:
 
 ```bash
-sudo realsense-rsusb-metal unbind-uvcvideo
-realsense-gb10-env rs-gb10-profiler --profile all --cycles 3 --duration-sec 5 --no-render --pre-stop-drain-ms 1200 --pre-stop-settle-ms 250
-sudo realsense-rsusb-metal rebind-uvcvideo
+export LRS_GB10_FORCE_RSUSB=OFF
+export LRS_GB10_BUILD_DIR=/opt/vigil/build/librealsense-v2.58.1-dgx-spark-gb10-v4l2
+export LRS_GB10_PREFIX=/opt/vigil/opt/librealsense-v2.58.1-dgx-spark-gb10-v4l2
+scripts/build-dgx-spark-gb10.sh all
+RS_GB10_SOAK_PROFILE=all RS_GB10_SOAK_CYCLES=5 RS_GB10_SOAK_DURATION_SEC=30 \
+  realsense-gb10-usb-soak
 ```
+
+Optional RSUSB isolation now requires explicit acknowledgement:
+
+```bash
+LRS_GB10_ALLOW_UVC_UNBIND=1 sudo -E realsense-rsusb-metal unbind-uvcvideo
+```
+
+Do not run that on the production path unless the test objective is to reproduce
+host-controller failure.

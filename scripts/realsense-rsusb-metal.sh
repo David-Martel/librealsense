@@ -3,6 +3,7 @@ set -euo pipefail
 
 MODE="${1:-status}"
 REALSense_IDS=("8086:0b07" "8086:0ad1" "8086:0ad2" "8086:0ad3" "8086:0b3a" "8086:0b3d" "8086:0b5c")
+ALLOW_UVC_UNBIND="${LRS_GB10_ALLOW_UVC_UNBIND:-${REALSENSE_RSUSB_ALLOW_UVC_UNBIND:-0}}"
 
 is_realsense_device() {
   local dev="$1"
@@ -37,6 +38,17 @@ apply_power_tuning() {
 }
 
 status() {
+  for controller in /sys/bus/platform/devices/NVDA8000:* /sys/bus/platform/devices/NVDA8001:*; do
+    [[ -e "$controller" ]] || continue
+    local driver="unbound"
+    [[ -e "$controller/driver" ]] && driver="$(basename "$(readlink -f "$controller/driver")")"
+    printf 'xhci=%s driver=%s runtime=%s power=%s\n' \
+      "$(basename "$controller")" \
+      "$driver" \
+      "$(cat "$controller/power/runtime_status" 2>/dev/null || true)" \
+      "$(cat "$controller/power/control" 2>/dev/null || true)"
+  done
+
   for dev in /sys/bus/usb/devices/*; do
     [[ -d "$dev" ]] || continue
     is_realsense_device "$dev" || continue
@@ -59,6 +71,30 @@ status() {
 }
 
 unbind_uvcvideo() {
+  if [[ "$ALLOW_UVC_UNBIND" != "1" ]]; then
+    cat >&2 <<'WARN'
+Refusing to unbind RealSense interfaces from uvcvideo by default.
+
+On DGX Spark / GB10, RSUSB direct ownership can wedge the NVDA8000 xHCI
+controller during endpoint stop/reset sequences. Keep uvcvideo bound for normal
+operation and use a native V4L2 librealsense build for production validation.
+
+To run an explicit fault-isolation experiment, set:
+  LRS_GB10_ALLOW_UVC_UNBIND=1 realsense-rsusb-metal unbind-uvcvideo
+WARN
+    exit 1
+  fi
+
+  local dead_controller=0
+  for controller in /sys/bus/platform/devices/NVDA8000:* /sys/bus/platform/devices/NVDA8001:*; do
+    [[ -e "$controller" ]] || continue
+    if [[ ! -e "$controller/driver" ]]; then
+      printf 'refusing unbind: xHCI controller %s is not bound to a driver\n' "$(basename "$controller")" >&2
+      dead_controller=1
+    fi
+  done
+  [[ "$dead_controller" -eq 0 ]] || exit 1
+
   apply_power_tuning
   for dev in /sys/bus/usb/devices/*; do
     [[ -d "$dev" ]] || continue
@@ -95,9 +131,10 @@ case "$MODE" in
     cat >&2 <<'USAGE'
 Usage: realsense-rsusb-metal [status|tune|unbind-uvcvideo|rebind-uvcvideo]
 
-The GB10 SDK is built with FORCE_RSUSB_BACKEND=ON. This helper keeps RealSense
-USB runtime power disabled and can unbind only RealSense UVC interfaces from
-uvcvideo so librealsense/libusb can own the interfaces directly.
+This helper keeps RealSense USB runtime power disabled and reports GB10 xHCI
+controller health. RealSense-only uvcvideo unbind is disabled by default because
+it can wedge the host xHCI controller on this platform; set
+LRS_GB10_ALLOW_UVC_UNBIND=1 only for controlled fault-isolation experiments.
 USAGE
     exit 2
     ;;

@@ -18,6 +18,7 @@ WITH_DDS="${LRS_GB10_WITH_DDS:-ON}"
 WITH_OPENMP="${LRS_GB10_WITH_OPENMP:-ON}"
 WITH_IPO="${LRS_GB10_WITH_IPO:-OFF}"
 WITH_EXTERNAL_LZ4="${LRS_GB10_EXTERNAL_LZ4:-OFF}"
+FORCE_RSUSB="${LRS_GB10_FORCE_RSUSB:-ON}"
 MODE="all"
 
 usage() {
@@ -41,6 +42,8 @@ Useful environment:
   LRS_GB10_WITH_OPENMP     Enable OpenMP, default ON
   LRS_GB10_WITH_IPO        Enable release IPO/LTO, default OFF
   LRS_GB10_EXTERNAL_LZ4    Use external LZ4 CMake package, default OFF
+  LRS_GB10_FORCE_RSUSB     Force libusb/RSUSB backend, default ON.
+                           Set OFF to validate the native Linux V4L2 backend.
   LRS_GB10_CXX_STANDARD    C++ standard for unpinned targets, default 20
   PYTHON_EXECUTABLE        Python ABI for pyrealsense2
   LRS_GB10_PYTHON_INSTALL_DIR
@@ -130,7 +133,7 @@ configure() {
     -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE="$WITH_IPO" \
     -DCUDA_TOOLKIT_ROOT_DIR="$CUDA_HOME" \
     -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
-    -DFORCE_RSUSB_BACKEND=ON \
+    -DFORCE_RSUSB_BACKEND="$FORCE_RSUSB" \
     -DBUILD_WITH_CUDA=ON \
     -DBUILD_WITH_NEON=ON \
     -DBUILD_WITH_CPU_EXTENSIONS=ON \
