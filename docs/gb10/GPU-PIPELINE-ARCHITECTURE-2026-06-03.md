@@ -20,27 +20,35 @@ stage-by-stage map. **Measured numbers are marked ✅; analysis/untested is mark
 | | raw capture | rosbag2 `.db3` = **uncompressed/CPU** (not a GPU path) | — | `just hil-capture-playback` |
 
 ## The shared-memory finding (the headline architectural result)
-GB10 is unified memory, so the intuition was "eliminate H2D/D2H copies." **Measured, that intuition is
-wrong for these kernels.** The pointcloud attribution ladder (baseline → cached-device → cached-managed,
-each correctness-checked vs a numpy deproject, all `max_abs_diff = 0`) shows:
-- The shipped CUDA path was **0.57×/slow because it calls `cudaMalloc`/`cudaFree` every frame**
-  (~180 alloc+free/sec — synchronizing, heavyweight). **Caching the device buffers → 3.3× faster, and
-  CUDA now beats NEON.** The copy was never the problem.
-- **`cudaMallocManaged` (the "zero-copy/unified" path) is *slower* than cached device buffers** (0.50 vs
-  0.32 ms): on GB10 a `cudaMemcpy` over coherent RAM is cheap, while managed-memory coherence + the
-  required `cudaDeviceSynchronize` cost more than they save.
-- **Lever on GB10 = eliminate per-frame allocation churn (cache buffers), not eliminate copies.** This
-  generalizes: apply the same cached-buffer pattern to `cuda-conversion.cu` and `cuda-align.cu`.
+GB10 is unified memory, so the intuition was "eliminate H2D/D2H copies." The pointcloud attribution
+ladder (baseline → cached-device → cached-managed, each correctness-checked vs a numpy deproject, all
+`max_abs_diff = 0`) shows the **dominant** cost is elsewhere:
+- **ROCK-SOLID (mode0→mode1):** the shipped CUDA path was 0.57×/slow because it calls `cudaMalloc`/
+  `cudaFree` **every frame** (~180 alloc+free/sec — synchronizing, heavyweight). **Caching the device
+  buffers → 3.3× faster than the shipped baseline** (and ≥ NEON: cached-device 0.32 ms vs a scene-dependent
+  NEON 0.38–0.54, i.e. ~1.2–1.7×). **Allocation churn was the bottleneck.**
+- **NOT a clean copy-vs-no-copy test:** `cudaMallocManaged` (mode 2) came in *slower* than cached-device
+  (0.50 vs 0.32 ms) — **but mode 2 still does two plain `memcpy`s (in/out) AND an explicit
+  `cudaDeviceSynchronize`, so it did not eliminate the copies; it swapped `cudaMemcpy` for `memcpy`+sync.**
+  So "copies don't matter on GB10" is **unproven** — what is shown is only that *this* managed-memory
+  variant was not faster than cached-device. **True pool-level zero-copy on the SDK's own frame buffers
+  (cached `cudaHostRegister`) was not isolated.**
+- **Proven lever = eliminate per-frame allocation churn (cache buffers).** Apply the same cached-buffer
+  pattern to `cuda-conversion.cu` and `cuda-align.cu`. Whether removing copies adds anything on top is
+  a separate, untested question.
 
 ## TensorRT — where it legitimately fits (capability-probed, not integrated)
 The core convert/align/pointcloud pipeline is deterministic geometry — **no neural net, so TensorRT has
 nothing to accelerate there, and bolting it on would be fabrication.** TensorRT becomes real only for a
 **learned** stage: a CNN depth **denoise / hole-completion / super-resolution** replacing the scalar
 post-processing filters (which have zero acceleration today), or a downstream perception model (vigil's).
-Capability probe (`rs-gb10-trt-probe.py`, synthetic 5-conv depth filter @848×480, FP32 strongly-typed):
-**median 0.897 ms, 37× headroom inside a 30 fps frame** (FP16/INT8 would be ~2–4× faster). **Compute is
-not the constraint — a trained model is.** This is an app/research-layer opportunity; nothing is wired
-into the SDK.
+Capability probe (`rs-gb10-trt-probe.py`, synthetic **small** 5-conv/16ch depth filter @848×480, FP32
+strongly-typed, **trtexec GPU-compute only — excludes H2D/D2H**): **median 0.897 ms, 37× headroom inside a
+30 fps frame** (FP16/INT8 ~2–4× faster). Read this as "a *small* learned filter fits with large margin" —
+**production-size depth-completion/denoise U-Nets are orders of magnitude larger and would need their own
+probe** (headroom collapses fast, and real use pays the transfer the probe excludes). The honest takeaway:
+for a *modest* learned stage, GB10 compute is not the constraint — a trained model is. App/research-layer;
+nothing wired into the SDK.
 
 ## "All the way to disk on the GPU" — what that actually means
 The only GPU file-write path is **NVENC** (h264/hevc via the `/opt/gb10-cuda` ffmpeg) — measured
