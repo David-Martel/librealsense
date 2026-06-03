@@ -34,6 +34,14 @@ def ver(s):
         return (0,)
 
 
+def image_version(path):
+    """Parse the firmware version from a signed-image filename, e.g.
+    Signed_Image_UVC_5_17_0_10.bin -> (5,17,0,10). Returns None if not parseable."""
+    import re
+    m = re.search(r"(\d+)[._](\d+)[._](\d+)[._](\d+)", os.path.basename(path))
+    return tuple(int(g) for g in m.groups()) if m else None
+
+
 def controller_green():
     out = subprocess.run(["bash", "-c", "journalctl -k --no-pager -n 120 2>/dev/null"],
                          capture_output=True, text=True).stdout
@@ -45,6 +53,8 @@ def main():
     ap.add_argument("--flash", action="store_true", help="actually flash (default: report only)")
     ap.add_argument("--image", help="signed firmware .bin (required to flash)")
     ap.add_argument("--serial", help="restrict to one SDK serial")
+    ap.add_argument("--allow-downgrade", action="store_true",
+                    help="permit flashing an image OLDER than a camera's current firmware")
     args = ap.parse_args()
 
     import pyrealsense2 as rs
@@ -87,10 +97,23 @@ def main():
         print(f"ERROR: rs-fw-update not found at {RS_FW_UPDATE} (set LRS_RS_FW_UPDATE).", file=sys.stderr)
         return 2
 
+    img_ver = image_version(args.image)
+    if img_ver is None:
+        print(f"ERROR: cannot parse a firmware version from '{os.path.basename(args.image)}' — expected a name "
+              f"like Signed_Image_UVC_5_17_0_10.bin. rs-fw-update -f flashes ANY image regardless of version, so "
+              f"the downgrade guard cannot run; aborting.", file=sys.stderr)
+        return 2
+    print(f"Image version: {'.'.join(map(str, img_ver))}")
+
     rc_all = 0
     for c in cams:
-        if not c["needs_update"]:
-            print(f"skip {c['serial']} (already {c['fw']})"); continue
+        # Downgrade guard: rs-fw-update flashes whatever image it is given, regardless of version.
+        if img_ver < ver(c["fw"]) and not args.allow_downgrade:
+            print(f"REFUSE {c['serial']}: image {'.'.join(map(str, img_ver))} is OLDER than current "
+                  f"{c['fw']} — silent downgrade. Pass --allow-downgrade to override.", file=sys.stderr)
+            rc_all = 1; continue
+        if img_ver == ver(c["fw"]):
+            print(f"skip {c['serial']} (already at image version {c['fw']})"); continue
         if not c["usb3"]:
             print(f"REFUSE {c['serial']}: USB-2 link ({c['usb']}) — a half-flash over a marginal link "
                   f"can brick the camera. Move to a native USB-3 port first.", file=sys.stderr)
