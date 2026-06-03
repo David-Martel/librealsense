@@ -46,8 +46,14 @@ grep first** — which procs have a CUDA path: `src/cuda/` has `cuda-conversion.
 |----|----------------|-----|---------|--------------|---------|
 | `rs.colorizer` | **NO** | 848×480 | 1.467 | 1.475 | identical because **both ran the same CPU code** — `BUILD_WITH_CUDA` is irrelevant to colorize |
 | `rs.colorizer` | **NO** | 1280×720 | 3.161 | 3.178 | same — no CUDA path |
-| `rs.pointcloud` | **YES** | 848×480 | 0.995 | **0.563** | **0.57× — CUDA genuinely SLOWER than CPU** |
-| `rs.pointcloud` | **YES** | 1280×720 | 1.488 | **0.859** | **0.58× — CUDA genuinely SLOWER** |
+| `rs.pointcloud` | **YES** | 848×480 | 0.995 | **0.563** | 0.57× as-shipped — but see UPDATE: the cause is per-frame alloc, not CUDA |
+| `rs.pointcloud` | **YES** | 1280×720 | 1.488 | **0.859** | 0.58× as-shipped |
+
+> **UPDATE 2026-06-03 (`CUDA-ACCEL-SURFACE-AND-OPPORTUNITIES` Opp 1, `just hil-pc-zerocopy`):** the 0.57×
+> was an artifact of the kernel doing `cudaMalloc`/`cudaFree` **every frame**. Caching the device buffers
+> (mode 1) makes CUDA pointcloud **~0.32 ms — 3.3× faster than the shipped path and faster than NEON.**
+> `cudaMallocManaged` (unified memory) is *slower* than cached-device — on GB10 the cost is allocation
+> churn, not the copy. All rungs correctness-verified (max-abs-diff 0.0 vs numpy deproject).
 | `rs.align`→color | **YES** | 848×480 | **0.293–0.295** | **4.33–5.67** | **15–19× — CUDA much FASTER** (vigil's per-frame op; measured 2026-06-03, `just hil-align-bench`) |
 | depth-format conversion | YES | — | — | — | not benchmarked |
 

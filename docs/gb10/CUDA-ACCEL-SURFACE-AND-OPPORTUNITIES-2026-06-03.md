@@ -104,14 +104,37 @@ isolation is what prevents that mis-attribution.) **Caveat:** process-total CPU 
 differences; a multi-stream or much-higher-res color load is untested. Tools: `rs-gb10-gpu-pipeline.py`
 + `_pipeline_compare.py`.
 
-### Opportunity 1 (leading, lowest-risk, targets the measured cause) — managed / zero-copy memory in the existing kernels
-The CUDA kernels use **explicit `cudaMalloc`/`cudaMemcpy`** (`cuda-pointcloud.cu:93`), paying H2D+D2H
-each frame over what on GB10 is **physically the same unified RAM** — the measured cause of pointcloud
-being slower. Switching the existing allocations to **`cudaMallocManaged` / host-mapped (zero-copy)**
-memory (GB10 ATS zero-copy is known-working on this box) is a **small diff on code that already ships**
-and could rescue pointcloud *and* the conversion path without rewriting anything. This is higher-leverage
-and lower-risk than any new-op or GL effort because it attacks the proven bottleneck directly. **Do this
-first; re-run `just hil-cuda-bench` + the align bench to confirm pointcloud crosses ≥1×.**
+### Opportunity 1 — **MEASURED 2026-06-03: the bottleneck was per-frame allocation, NOT the copy**
+The CUDA pointcloud kernel does **per-frame `cudaMalloc`×3 + `cudaMemcpy` H2D/D2H + `cudaFree`×3**
+(`cuda-pointcloud.cu`). I added a compile-gated (`RS2_GB10_PC_ZEROCOPY`, default OFF = upstream-identical)
+runtime **attribution ladder** (`RS2_PC_MODE` 0/1/2) and ran it as `just hil-pc-zerocopy` (848×480, single
+depth stream, **each rung correctness-checked vs a numpy CPU deproject — all `max_abs_diff = 0.0`**):
+
+| rung (`RS2_PC_MODE`) | p50 ms (2 runs) | vs NEON | what it isolates |
+|---|---|---|---|
+| 0 baseline (shipped: malloc+memcpy+free each frame) | 1.05–1.09 | **0.5× (slower)** | reproduces the old 0.57× |
+| **1 cached-device** (alloc once, reuse; still `cudaMemcpy`) | **0.32** | **~1.4–1.7× FASTER** | **allocation churn = the real cost** |
+| 2 cached-managed (`cudaMallocManaged` once + plain memcpy + explicit sync) | 0.49–0.50 | ~equal | the copy, on coherent memory |
+| NEON baseline | 0.38–0.54 (scene-dep.) | — | CPU reference |
+
+**Conclusions (measured, not hypothesized):**
+1. **The shipped CUDA pointcloud is needlessly ~3.3× slow because it allocates and frees device memory
+   every frame** (≈180 `cudaMalloc`+`cudaFree`/sec — heavyweight synchronizing calls). **Caching the
+   buffers alone (mode 1) makes CUDA pointcloud 3.3× faster than the shipped path and faster than NEON**,
+   reversing the prior "CUDA is slower" finding. This is the fix.
+2. **GB10 unified memory does NOT rescue this op the way the hypothesis guessed.** `cudaMallocManaged`
+   (mode 2) is **slower than cached device buffers** (0.49 vs 0.32) — the `cudaMemcpy` over coherent RAM
+   is cheap, and managed memory's fault/coherence + the explicit `cudaDeviceSynchronize` cost more than
+   they save. **On GB10 the lever is eliminating allocation churn, not eliminating copies.** (Caveat:
+   mode 2 still does two *plain* memcpys for I/O marshalling; a true pool-level zero-copy on the SDK's
+   own frame buffers via cached `cudaHostRegister` is untested — but mode 1 already beats NEON, so the
+   motivation is low.)
+
+**Ship path:** mode 1 (cached-device) is the recommended GB10 setting. Source default stays mode 0 so
+`build-gb10-full` is unchanged for other tools; promoting mode 1 to the default needs a multi-instance /
+multi-thread check of the (mutex-guarded, grow-only) static buffer pool first. The same cached-buffer
+pattern should be applied to `cuda-conversion.cu` and `cuda-align.cu` (align already wins, but caching
+would widen the margin and cut its allocation overhead).
 
 ### Opportunity 2 (shipping but untested GPU path) — benchmark the GL pipeline; consider keep-on-GPU
 The GL blocks (`colorizer-gl`, `pointcloud-gl`, `align-gl`, `yuy2rgb-gl`) **ship in the production build**

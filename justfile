@@ -156,6 +156,22 @@ hil-gpu-pipeline *ARGS:
     "{{venv_python}}" "$SG/_pipeline_compare.py" "$OUT/cuda.json" "$OUT/nocuda.json"
     rm -rf "$OUT"
 
+# Pointcloud zero-copy attribution ladder (needs a build with -DRS2_GB10_PC_ZEROCOPY=1, e.g. build-gb10-full).
+# Runs baseline / cached-device / cached-managed (modes 0/1/2) + NEON, with per-rung correctness vs a
+# numpy CPU deproject. Single depth stream = SAFE. Shows WHY shipped CUDA pointcloud is slow (alloc churn).
+hil-pc-zerocopy:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    SG="{{repo_root}}/scripts/gb10"; FULL="{{hil_build_dir}}/Release"; NOCUDA="{{validation_dir}}/build-gb10-nocuda/Release"
+    echo "rung              correct   p50_ms"
+    for spec in "BASELINE:$FULL:0" "CACHED-DEV:$FULL:1" "CACHED-MANAGED:$FULL:2" "NEON:$NOCUDA:0"; do
+      IFS=: read tag dir mode <<< "$spec"
+      r=$(LD_LIBRARY_PATH="$dir" PYTHONPATH="$SG:$dir" RS2_PC_MODE="$mode" LRS_BUILD_TAG="$tag" \
+        "{{venv_python}}" "$SG/rs-gb10-pc-zerocopy.py" 2>&1 | grep -oE '"p50": [0-9.]+|"correct": (true|false)' | tr '\n' ' ')
+      printf "  %-16s %s\n" "$tag" "$r"
+    done
+    @echo "Expect: CACHED-DEV ~3x faster than BASELINE and faster than NEON (alloc churn was the cost, not the copy)."
+
 # NON-HEADLESS render verify: paint frames on $DISPLAY, x11grab the screen, prove real pixels (SAFE).
 hil-nonheadless:
     DISPLAY="${DISPLAY:-:1}" LD_LIBRARY_PATH="{{cuda_libs}}:{{hil_build_dir}}/Release" \

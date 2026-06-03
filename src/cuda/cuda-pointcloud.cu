@@ -4,6 +4,47 @@
 #include <iostream>
 #include <chrono>
 
+// --- GB10 shared-memory zero-copy experiment (opt-in; default OFF = byte-identical upstream) -------
+// Attribution ladder for "what does DGX Spark unified memory buy for the pointcloud CUDA path?".
+// Selected at runtime via RS2_PC_MODE (read once): 0=baseline (per-frame cudaMalloc+cudaMemcpy+free),
+// 1=cached device buffers (alloc once, reuse; still cudaMemcpy), 2=cached MANAGED buffers
+// (cudaMallocManaged once; host writes/reads the coherent buffer with plain memcpy, no cudaMemcpy).
+// Default when the define is compiled in but RS2_PC_MODE is unset = 0, so other tools on this build
+// are unaffected. Buffers are process-static, mutex-guarded, grow-only, sized to the current frame.
+#if defined(RS2_GB10_PC_ZEROCOPY)
+#include <mutex>
+#include <cstdlib>
+#include <cstring>
+namespace {
+    int rs2_pc_mode() {
+        static int m = -1;
+        if (m < 0) { const char* e = std::getenv("RS2_PC_MODE"); m = e ? std::atoi(e) : 0; }
+        return m;
+    }
+    struct pc_zc_buffers {
+        std::mutex mtx;
+        int cap = 0; bool managed = false;
+        float* d_points = nullptr; uint16_t* d_depth = nullptr; rs2_intrinsics* d_intrin = nullptr;
+        void free_all() {
+            if (d_points) cudaFree(d_points); if (d_depth) cudaFree(d_depth); if (d_intrin) cudaFree(d_intrin);
+            d_points = nullptr; d_depth = nullptr; d_intrin = nullptr; cap = 0;
+        }
+        void ensure(int count, bool want_managed) {
+            if (d_points && cap >= count && managed == want_managed) return;
+            free_all(); managed = want_managed;
+            auto alloc = [&](void** p, size_t bytes) {
+                return want_managed ? cudaMallocManaged(p, bytes) : cudaMalloc(p, bytes); };
+            cudaError_t r = alloc((void**)&d_points, (size_t)count * sizeof(float) * 3);
+            r = alloc((void**)&d_depth, (size_t)count * sizeof(uint16_t));
+            r = alloc((void**)&d_intrin, sizeof(rs2_intrinsics));
+            assert(r == cudaSuccess); (void)r; cap = count;
+        }
+    };
+    pc_zc_buffers& pc_zc() { static pc_zc_buffers b; return b; }
+}
+#endif
+// ---------------------------------------------------------------------------------------------------
+
 
 __device__
 float map_depth (float depth_scale, uint16_t z) {
@@ -83,6 +124,30 @@ void kernel_deproject_depth_cuda(float * points, const rs2_intrinsics* intrin, c
 void rscuda::deproject_depth_cuda(float * points, const rs2_intrinsics & intrin, const uint16_t * depth, float depth_scale)
 {
     int count = intrin.height * intrin.width;
+
+#if defined(RS2_GB10_PC_ZEROCOPY)
+    const int _mode = rs2_pc_mode();
+    if (_mode == 1 || _mode == 2) {
+        const bool managed = (_mode == 2);
+        auto& b = pc_zc();
+        std::lock_guard<std::mutex> lk(b.mtx);
+        b.ensure(count, managed);
+        const int nb = count / RS2_CUDA_THREADS_PER_BLOCK;
+        if (managed) {                                  // host write into coherent managed memory
+            std::memcpy(b.d_depth, depth, (size_t)count * sizeof(uint16_t));
+            std::memcpy(b.d_intrin, &intrin, sizeof(rs2_intrinsics));
+        } else {                                        // cached device buffers, still cudaMemcpy
+            cudaMemcpy(b.d_depth, depth, (size_t)count * sizeof(uint16_t), cudaMemcpyHostToDevice);
+            cudaMemcpy(b.d_intrin, &intrin, sizeof(rs2_intrinsics), cudaMemcpyHostToDevice);
+        }
+        kernel_deproject_depth_cuda<<<nb, RS2_CUDA_THREADS_PER_BLOCK>>>(b.d_points, b.d_intrin, b.d_depth, depth_scale);
+        cudaDeviceSynchronize();                        // explicit sync (D2H memcpy used to provide it)
+        if (managed) std::memcpy(points, b.d_points, (size_t)count * sizeof(float) * 3);
+        else cudaMemcpy(points, b.d_points, (size_t)count * sizeof(float) * 3, cudaMemcpyDeviceToHost);
+        return;
+    }
+    // _mode == 0 falls through to the unmodified baseline below
+#endif
     int numBlocks = count / RS2_CUDA_THREADS_PER_BLOCK;
     
     float *dev_points = 0;	

@@ -77,6 +77,14 @@ if(RS2_GB10_USB_TUNING)
     message(STATUS "GB10 USB multistream mitigations enabled (RS2_GB10_USB_TUNING=1)")
 endif()
 
+# GB10 / DGX Spark pointcloud shared-memory experiment (opt-in; OFF upstream). When enabled, the
+# CUDA pointcloud path gains a runtime-selectable zero-copy ladder (RS2_PC_MODE 0/1/2, default 0 =
+# unmodified). Lets us measure what unified memory buys without diverging from upstream by default.
+if(RS2_GB10_PC_ZEROCOPY)
+    target_compile_definitions(${LRS_TARGET} PRIVATE RS2_GB10_PC_ZEROCOPY=1)
+    message(STATUS "GB10 pointcloud zero-copy ladder enabled (RS2_GB10_PC_ZEROCOPY=1; RS2_PC_MODE 0/1/2)")
+endif()
+
 if(BUILD_WITH_DDS)
     message(STATUS "Building with FastDDS")
 	include(CMake/external_foonathan_memory.cmake)
