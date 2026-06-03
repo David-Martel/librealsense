@@ -207,6 +207,11 @@ fw-status *ARGS:
       LRS_RS_FW_UPDATE="{{hil_build_dir}}/Release/rs-fw-update" \
       "{{venv_python}}" "{{repo_root}}/scripts/gb10/rs-gb10-fw-update.py" {{ARGS}}
 
+# TensorRT capability probe: synthesize a small depth-filter CNN and time it (no SDK integration).
+# Characterizes GB10 NN headroom for a FUTURE learned depth-filter stage. Needs onnx in the venv + trtexec.
+trt-probe *ARGS:
+    "{{venv_python}}" "{{repo_root}}/scripts/gb10/rs-gb10-trt-probe.py" {{ARGS}}
+
 # Show the GB10 findings + open items.
 findings:
     @sed -n '1,40p' "{{repo_root}}/docs/gb10/FINDINGS-2026-06-03.md"
