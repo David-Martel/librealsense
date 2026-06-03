@@ -48,25 +48,35 @@ grep first** — which procs have a CUDA path: `src/cuda/` has `cuda-conversion.
 | `rs.colorizer` | **NO** | 1280×720 | 3.161 | 3.178 | same — no CUDA path |
 | `rs.pointcloud` | **YES** | 848×480 | 0.995 | **0.563** | **0.57× — CUDA genuinely SLOWER than CPU** |
 | `rs.pointcloud` | **YES** | 1280×720 | 1.488 | **0.859** | **0.58× — CUDA genuinely SLOWER** |
-| `rs.align` | **YES** | — | — | — | **NOT benchmarked — this is the op vigil uses every frame (untested)** |
+| `rs.align`→color | **YES** | 848×480 | **0.293–0.295** | **4.33–5.67** | **15–19× — CUDA much FASTER** (vigil's per-frame op; measured 2026-06-03, `just hil-align-bench`) |
 | depth-format conversion | YES | — | — | — | not benchmarked |
 
-**What is actually measured:** for `rs.pointcloud` (a real CUDA path), the GPU is **slower** than the
-20-core NEON+OpenMP CPU at both resolutions — the per-frame H2D/D2H + launch overhead on GB10's unified
-memory isn't amortized for this small op (same story as cv2.cuda `cvtColor` 0.5× vs `resize` 3.8×). The
-`colorize` "no benefit" is **not** a CUDA result at all — colorize simply has no CUDA implementation.
+**What is actually measured:** CUDA on GB10 is **op-dependent — not a blanket win or loss**:
+- `rs.align`(depth→color): **CUDA 15–19× FASTER** (CUDA p50 0.293–0.295 ms, rock-stable across runs;
+  CPU 4.33–5.67 ms, scene-dependent because the CPU path short-circuits zero-depth pixels). align does
+  heavy per-pixel reprojection (two intrinsics + extrinsics + scatter) that parallelizes across thousands
+  of threads, so the win dwarfs the H2D/D2H cost. **This is the load-bearing op vigil runs every frame.**
+- `rs.pointcloud`: CUDA **0.57× SLOWER** — cheap per-pixel deproject dominated by the D2H vertex-buffer
+  copy on GB10's unified memory (same story as cv2.cuda `cvtColor` 0.5× vs `resize` 3.8×).
+- `rs.colorizer`: **no CUDA path at all** — "no benefit" is not a CUDA result, just CPU-only code.
 
-**Scoped implication (do NOT over-generalize):** `pointcloud` CUDA does not help on GB10 (measured);
-`colorize` is CPU-only regardless of the flag. **But `rs.align` and the conversion path — which DO have
-CUDA kernels and which vigil's per-frame pipeline actually exercises — are UNTESTED**, so a build-wide
-"disable CUDA" recommendation is **not yet justified**. Next: benchmark `rs.align`(depth→color, dual
-stream) CUDA-vs-CPU before any CUDA-off build decision for vigil.
+**Scoped implication (corrected):** a build-wide "disable CUDA" recommendation would be **WRONG** for
+vigil — the op it actually depends on (align) is 15–19× faster with CUDA. **Keep `BUILD_WITH_CUDA=ON`
+for vigil.** pointcloud being slower is real but vigil does not pointcloud per frame; if a consumer is
+pointcloud-heavy and CPU-bound, that specific op can be steered to CPU, but the build stays CUDA-on.
+Both align runs left the controller **green with zero `-110`** (2-stream depth+color steady-state, fixed
+config) — another data point that the current unit/firmware/topology tolerates vigil's stream shape.
 
 ### Caveats (honest scope)
 - End-to-end Python-observed latency **including D2H materialization** (`get_data`/`get_vertices`) — the
   real cost for a CPU consumer like vigil; a keep-on-GPU pipeline (no D2H) was not evaluated.
-- Only `colorize` (no CUDA path) + `pointcloud` (CUDA path) measured; **`align` + conversion untested.**
-- Both builds share SIMD CPU flags, so where a CUDA path exists the comparison isolates CUDA on/off fairly.
+- align CPU time is **scene-dependent** (zero-depth short-circuit): 4.33–5.67 ms over two static-scene
+  runs → speedup 14.7–19.4×. CUDA side is idempotent (0.293/0.295). Both builds run back-to-back; camera
+  static. The *direction* benchmarked is depth→color (`rs.align(rs.stream.color)`, `kernel_depth_to_other`);
+  the reverse (color→depth, `kernel_other_to_depth`) is selectable via `LRS_ALIGN_TO=depth` but unmeasured.
+- depth-format conversion (also a CUDA path) still untested.
+- Both builds share SIMD CPU flags (verified: full vs nocuda CMakeCache differ ONLY in `BUILD_WITH_CUDA`
+  + the CUDA-arch var), so where a CUDA path exists the comparison isolates CUDA on/off fairly.
 
 ## Standardized suite (idempotent + stable)
 `just hil-soak [--display]`, `just hil-capture-playback [--display]`, `just hil-cuda-bench`. Each:

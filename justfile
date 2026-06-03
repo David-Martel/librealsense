@@ -115,6 +115,26 @@ hil-cuda-bench:
     @echo "CUDA build:"; LD_LIBRARY_PATH="{{hil_build_dir}}/Release" PYTHONPATH="{{hil_build_dir}}/Release" LRS_BUILD_TAG=CUDA "{{venv_python}}" "{{repo_root}}/scripts/gb10/rs-gb10-cuda-bench.py"
     @echo "CUDA-OFF build (build-gb10-nocuda):"; LD_LIBRARY_PATH="{{validation_dir}}/build-gb10-nocuda/Release" PYTHONPATH="{{validation_dir}}/build-gb10-nocuda/Release" LRS_BUILD_TAG=NOCUDA "{{venv_python}}" "{{repo_root}}/scripts/gb10/rs-gb10-cuda-bench.py"
 
+# rs.align CUDA-vs-CPU benchmark (depth->color, vigil's per-frame op) — runs BOTH builds back-to-back
+# on the same static scene + computes speedup. 2-stream/eyes-open: tripwire-armed, fixed config.
+# Point the camera at a STATIC rigid scene before running. `--display` to watch (needs opencv on PATH).
+hil-align-bench *ARGS:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    SG="{{repo_root}}/scripts/gb10"; OUT="$(mktemp -d /tmp/lrs-align-XXXXXX)"
+    echo ">>> CUDA build (build-gb10-full):"
+    LD_LIBRARY_PATH="{{cuda_libs}}:{{hil_build_dir}}/Release" \
+      PYTHONPATH="$SG:{{hil_build_dir}}/Release:/opt/gb10-cuda/install/opencv/lib/python3.12/site-packages" \
+      DISPLAY="${DISPLAY:-:1}" LRS_FFMPEG=/opt/gb10-cuda/install/ffmpeg/bin/ffmpeg LRS_BUILD_TAG=CUDA \
+      LRS_RESULT_JSON="$OUT/cuda.json" "{{venv_python}}" "$SG/rs-gb10-align-bench.py" {{ARGS}}
+    echo ">>> CUDA-OFF build (build-gb10-nocuda):"
+    LD_LIBRARY_PATH="{{cuda_libs}}:{{validation_dir}}/build-gb10-nocuda/Release" \
+      PYTHONPATH="$SG:{{validation_dir}}/build-gb10-nocuda/Release:/opt/gb10-cuda/install/opencv/lib/python3.12/site-packages" \
+      DISPLAY="${DISPLAY:-:1}" LRS_FFMPEG=/opt/gb10-cuda/install/ffmpeg/bin/ffmpeg LRS_BUILD_TAG=NOCUDA \
+      LRS_RESULT_JSON="$OUT/nocuda.json" "{{venv_python}}" "$SG/rs-gb10-align-bench.py" {{ARGS}}
+    "{{venv_python}}" "$SG/_align_speedup.py" "$OUT/cuda.json" "$OUT/nocuda.json"
+    rm -rf "$OUT"
+
 # NON-HEADLESS render verify: paint frames on $DISPLAY, x11grab the screen, prove real pixels (SAFE).
 hil-nonheadless:
     DISPLAY="${DISPLAY:-:1}" LD_LIBRARY_PATH="{{cuda_libs}}:{{hil_build_dir}}/Release" \

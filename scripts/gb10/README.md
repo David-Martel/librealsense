@@ -39,6 +39,7 @@ percentile stats, `--display` (non-headless on-screen render + `x11grab` proof).
 | `rs-gb10-quality-hil.py` | `just hil-quality` | NVENC encode fidelity (ffmpeg ssim/psnr/xpsnr vs lossless) + GPU-vs-CPU render + no-reference sharpness/exposure |
 | `rs-gb10-nonheadless-verify.py` | `just hil-nonheadless` | paint frames on `$DISPLAY`, `x11grab` proof that real pixels render |
 | `rs-gb10-cuda-bench.py` | `just hil-cuda-bench` | librealsense colorize+pointcloud timing; run vs `build-gb10-nocuda` to compare CUDA-vs-CPU (`LRS_BENCH_W/H` set resolution) |
+| `rs-gb10-align-bench.py` (+`_align_speedup.py`) | `just hil-align-bench` | **rs.align depth→color CUDA-vs-CPU** — the load-bearing op vigil runs every frame. Runs BOTH builds back-to-back on the same static scene + prints the speedup. **Measured 15–19× CUDA faster** (CUDA p50 ≈0.29 ms, CPU 4.3–5.7 ms). 2-stream/eyes-open: tripwire-armed, fixed config, no control-feature toggles. `LRS_ALIGN_TO=depth` for the reverse direction; `--display` to watch. |
 | `rs-gb10-soak.py`, `rs-gb10-multistream.py`, `rs-gb10-churn-test.py` | — | predecessors of the suite (kept for reference; prefer the suite) |
 
 ## Firmware
