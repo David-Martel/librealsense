@@ -90,6 +90,21 @@ hil-p7:
     LD_LIBRARY_PATH="{{hil_build_dir}}/Release" PYTHONPATH="{{hil_build_dir}}/Release" \
       RS2_GB10_REFUSE_REACQUIRE=1 "{{venv_python}}" "{{repo_root}}/scripts/gb10/rs-gb10-p7-confirm.py"
 
+# Frame/video QUALITY HIL: NVENC encode fidelity (ffmpeg ssim/psnr/xpsnr) + GPU-vs-CPU render +
+# no-reference capture sharpness/exposure. Real measured data, single color stream (SAFE).
+hil-quality:
+    LD_LIBRARY_PATH="{{cuda_libs}}:{{hil_build_dir}}/Release" \
+      PYTHONPATH="{{hil_build_dir}}/Release:/opt/gb10-cuda/install/opencv/lib/python3.12/site-packages" \
+      LRS_FFMPEG=/opt/gb10-cuda/install/ffmpeg/bin/ffmpeg \
+      "{{venv_python}}" "{{repo_root}}/scripts/gb10/rs-gb10-quality-hil.py"
+
+# NON-HEADLESS render verify: paint frames on $DISPLAY, x11grab the screen, prove real pixels (SAFE).
+hil-nonheadless:
+    DISPLAY="${DISPLAY:-:1}" LD_LIBRARY_PATH="{{cuda_libs}}:{{hil_build_dir}}/Release" \
+      PYTHONPATH="{{hil_build_dir}}/Release:/opt/gb10-cuda/install/opencv/lib/python3.12/site-packages" \
+      LRS_FFMPEG=/opt/gb10-cuda/install/ffmpeg/bin/ffmpeg \
+      "{{venv_python}}" "{{repo_root}}/scripts/gb10/rs-gb10-nonheadless-verify.py"
+
 # Advanced single-stream HIL: CUDA colorize/pointcloud + cv2.cuda + NVENC + post-proc (SAFE).
 hil-advanced:
     LD_LIBRARY_PATH="{{cuda_libs}}:{{hil_build_dir}}/Release" \
