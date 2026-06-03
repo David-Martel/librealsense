@@ -144,6 +144,12 @@ hil-stress-DANGER:
 # Misc
 # ---------------------------------------------------------------------------
 
+# Firmware status for all linked cameras vs latest 5.17.0.10 (report-only; pass --flash --image to update).
+fw-status *ARGS:
+    LD_LIBRARY_PATH="{{hil_build_dir}}/Release" PYTHONPATH="{{hil_build_dir}}/Release" \
+      LRS_RS_FW_UPDATE="{{hil_build_dir}}/Release/rs-fw-update" \
+      "{{venv_python}}" "{{repo_root}}/scripts/gb10/rs-gb10-fw-update.py" {{ARGS}}
+
 # Show the GB10 findings + open items.
 findings:
     @sed -n '1,40p' "{{repo_root}}/docs/gb10/FINDINGS-2026-06-03.md"

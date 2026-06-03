@@ -10,8 +10,29 @@ JOBS="${LRS_GB10_JOBS:-$(nproc)}"
 PYTHON_EXECUTABLE="${PYTHON_EXECUTABLE:-$(command -v python3)}"
 PYTHON_VERSION="$("$PYTHON_EXECUTABLE" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
 PYTHON_INSTALL_DIR="${LRS_GB10_PYTHON_INSTALL_DIR:-$PREFIX/lib/python${PYTHON_VERSION}/site-packages/pyrealsense2}"
+# pyrealsense2 ABI guard + venv pin (REPRODUCIBILITY). Modern CMake FindPython can silently grab a
+# different interpreter (e.g. ~/.local/bin/python3 == a 3.15 pre-release) for Development.Module even
+# when PYTHON_EXECUTABLE points at a venv 3.12 — producing a pyrealsense2.so that won't import in the
+# venv (undefined symbol _PyThreadState_UncheckedGet). Pin FindPython to THIS interpreter's prefix.
+PYTHON_PREFIX="$("$PYTHON_EXECUTABLE" -c 'import sys; print(sys.prefix)')"
+PYTHON_PRERELEASE="$("$PYTHON_EXECUTABLE" -c 'import sys; print("1" if sys.version_info.releaselevel != "final" else "0")')"
+if [[ "$PYTHON_PRERELEASE" == "1" ]]; then
+  echo "ERROR: PYTHON_EXECUTABLE=$PYTHON_EXECUTABLE is a pre-release Python ($PYTHON_VERSION); its ABI" >&2
+  echo "       differs from stable cpython and pyrealsense2 built against it will not import in a" >&2
+  echo "       stable venv. Point PYTHON_EXECUTABLE at a stable venv (e.g. a uv venv 3.12):" >&2
+  echo "       PYTHON_EXECUTABLE=/path/to/.venv/bin/python scripts/build-dgx-spark-gb10.sh" >&2
+  exit 1
+fi
 GENERATOR="${LRS_GB10_GENERATOR:-Ninja}"
-NATIVE_FLAGS="${LRS_GB10_NATIVE_FLAGS:--O3 -DNDEBUG -mcpu=native -ffunction-sections -fdata-sections}"
+# Toolchain arch: default -mcpu=native (best perf on THIS host, but binaries are host-CPU-specific and
+# GCC 13.3 silently degrades 'native' to an armv8-a baseline on Cortex-X925). Set LRS_GB10_REPRODUCIBLE=1
+# for an explicit, portable, reproducible GB10 arch (-mcpu=cortex-x925) instead of 'native'.
+if [[ "${LRS_GB10_REPRODUCIBLE:-0}" == "1" ]]; then
+  ARCH_FLAG="${LRS_GB10_ARCH:--mcpu=cortex-x925}"
+else
+  ARCH_FLAG="${LRS_GB10_ARCH:--mcpu=native}"
+fi
+NATIVE_FLAGS="${LRS_GB10_NATIVE_FLAGS:--O3 -DNDEBUG $ARCH_FLAG -ffunction-sections -fdata-sections}"
 LINK_FLAGS="${LRS_GB10_LINK_FLAGS:--Wl,--gc-sections}"
 CXX_STANDARD="${LRS_GB10_CXX_STANDARD:-20}"
 WITH_DDS="${LRS_GB10_WITH_DDS:-ON}"
@@ -193,6 +214,9 @@ configure() {
     -DBUILD_OPENNI2_BINDINGS=ON \
     -DBUILD_PYTHON_BINDINGS=ON \
     -DPYTHON_EXECUTABLE="$PYTHON_EXECUTABLE" \
+    -DPython_EXECUTABLE="$PYTHON_EXECUTABLE" \
+    -DPython_ROOT_DIR="$PYTHON_PREFIX" \
+    -DPython_FIND_VIRTUALENV=ONLY \
     -DPYTHON_INSTALL_DIR="$PYTHON_INSTALL_DIR" \
     -DBUILD_ROSBAG2=ON \
     -DBUILD_WITH_DDS="$WITH_DDS" \
@@ -260,12 +284,20 @@ PY
   "$PREFIX/bin/rs-enumerate-devices" -s || true
 }
 
+clean() {
+  # Idempotent clean: remove the build dir so the next configure is from scratch (reproducibility).
+  echo "Removing build dir: $BUILD_DIR"
+  rm -rf "$BUILD_DIR"
+}
+
 case "$MODE" in
   configure) configure ;;
   build) build ;;
   install) install_sdk ;;
   validate) validate ;;
+  clean) clean ;;
   all)
+    [[ "${LRS_GB10_FRESH:-0}" == "1" ]] && clean
     configure
     build
     install_sdk
