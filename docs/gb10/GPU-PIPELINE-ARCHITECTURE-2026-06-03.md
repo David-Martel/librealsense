@@ -14,7 +14,7 @@ stage-by-stage map. **Measured numbers are marked ✅; analysis/untested is mark
 | **2. Processing** | **align** depth→color | **CUDA 15–19× > NEON** ✅ | CUDA p50 0.29 ms vs NEON 4.3–5.7 ms | `just hil-align-bench` |
 | | **pointcloud** | **CUDA cached-device 3.3× > shipped, > NEON** ✅ | 0.32 ms (cached) vs 1.05 (baseline) vs 0.54 NEON | `just hil-pc-zerocopy` |
 | | post-proc filters (spatial/temporal/hole-fill/…) | **none today (pure scalar)** ✅ / NEON+OMP ⬜ / **learned-CNN via TensorRT** ⬜ | filters 0-accel; a 5-conv CNN filter = **0.9 ms, 37× headroom** ✅ | `rs-gb10-trt-probe.py` |
-| **3. Display / render** | colorize | **OpenGL `colorizer-gl`** (no CUDA path) ⬜ | GL ships (`BUILD_GLSL_EXTENSIONS=ON`) but **never benchmarked** | (todo: GL HIL build) |
+| **3. Display / render** | colorize | NEON CPU (GL `colorizer-gl` correct but **2.3× slower**) ✅ | GL only wins as keep-on-GPU chain; C++-only (no Python binding) | `posebench/gl/` |
 | | preview / resize | cv2.cuda ✅ (resize 3.8×) / cvtColor 0.5× ✅ | from prior cv2.cuda HIL | `just hil-advanced` |
 | **4. File write** | compressed video | **NVENC** (h264/hevc) ✅ | SSIM 0.965/0.971 @ 34–40× realtime, XPSNR ~31 dB | `just hil-quality` |
 | | raw capture | rosbag2 `.db3` = **uncompressed/CPU** (not a GPU path) | — | `just hil-capture-playback` |
@@ -58,14 +58,36 @@ means the NVENC *video* path, not the rosbag path. A fully GPU-resident chain
 `convert(CUDA)→align(CUDA)→colorize(GL)→NVENC encode` avoids host round-trips end-to-end; the GL and
 CUDA-interop arms are designed but unmeasured (need a GL-enabled HIL build).
 
+## Cached-buffer reconciliation + GL — MEASURED 2026-06-03 (update)
+- **align: ALREADY cached** — `cuda-align.cu` allocates device buffers once via `if (!_d_depth_in) …`,
+  persisting them in the `align_cuda_helper` objects stored in a per-stream-pair `aligners` map. That is
+  *why* align was already 15–19× > NEON (no per-frame churn). **No change made — it is the reference impl.**
+- **conversion: cached + measured** (gated `RS2_GB10_CONV_CACHE`/`RS2_CONV_MODE`, scoped to the one hot
+  `unpack_yuy2` YUYV→color helper; **byte-identical to baseline, max-abs-diff 0**, commit `040c49015`).
+  Kernel-only **~5× faster** in isolation (cudaMalloc/free dominated); **end-to-end** (`just`-style
+  `rs-gb10-conv-cache-bench.py`, 1280×720 color, 2 runs): mode1 **1.5–1.6 ms/frame** vs mode0 **2.1–2.15**
+  vs NEON **1.4–1.55** → caching **trims ~25–30% of the conversion-stage CPU and brings CUDA to NEON-parity**
+  (baseline CUDA was slightly *above* NEON). Modest, stable, real — most of the 5× kernel win hides in the
+  USB/DMA plumbing (as Finding A predicted), but ~0.5–0.65 ms/frame does surface. Gated OFF by default.
+- **GL pipeline: never-run path exercised (C++ only) — NOT a CPU-consumer win.** There is **no Python GL
+  binding** (`rs.gl` absent); GL is a separate C++ `librealsense2-gl.so` (`rs2_gl_*` C API). `build-gb10-full`
+  has `BUILD_GLSL_EXTENSIONS=ON` but **the GL lib is gated behind EXAMPLES/STITCHING (both OFF) so it wasn't
+  built there** — used the installed `/opt/vigil/.../librealsense2-gl.so`. On the real GPU (`GL_RENDERER=NVIDIA
+  GB10/PCIe`, GL 4.6): **`gl::colorizer` runs CORRECT** (max-diff 3/255 vs CPU) but **~2.3× SLOWER than NEON**
+  (~2.0 vs 0.87 ms, one small frame — dispatch+D2H unamortized); **`gl::pointcloud`/`gl::align` run but their
+  CPU readback is ALL-ZERO** (frames are `gpu_addon` designed for GPU-side consumption, not CPU readback) +
+  a teardown SIGSEGV. **So GL helps only as a keep-on-GPU chain (colorize→render, no D2H) — unmeasured;** for
+  a CPU consumer, CUDA align/pointcloud + NEON colorize already win. Scripts: `posebench/gl/` (+ a parent-run
+  live variant). GL context came via **GLFW on Xorg :1**, not EGL-surfaceless — headless-without-X needs an
+  EGL fix.
+
 ## Prioritized, evidence-based recommendations
-1. ✅ **Done/validated:** align CUDA (keep on); pointcloud cached-device fix (gated `RS2_GB10_PC_ZEROCOPY`,
-   `RS2_PC_MODE=1`); conversion CUDA is safe (no regression). Keep `BUILD_WITH_CUDA=ON` for vigil.
-2. **Ship the cached-buffer pattern** to `cuda-conversion.cu` + `cuda-align.cu` (same diff; cuts alloc
-   overhead). Promote pointcloud `RS2_PC_MODE=1` to default after a multi-instance/thread check of the
-   shared static pool.
-3. **Benchmark the GL pipeline** (ships but untested) — the only GPU path for colorize and a candidate
-   keep-on-GPU chain to kill residual D2H.
+1. ✅ **Done/validated:** align CUDA already-cached (keep on); pointcloud cached-device fix (`RS2_PC_MODE=1`);
+   **conversion cached** (`RS2_CONV_MODE=1`, ~NEON-parity, byte-identical); conversion CUDA safe. Keep `BUILD_WITH_CUDA=ON`.
+2. **Promote** pointcloud `RS2_PC_MODE=1` + conversion `RS2_CONV_MODE=1` to GB10-build defaults after a
+   multi-instance/thread check of the mutex-guarded static pools (both serialize concurrent calls).
+3. **GL only as keep-on-GPU:** a GL-resident colorize→render chain (no D2H) is the sole remaining GL win —
+   measure it on the proven EGL context. GL is *not* worth it for CPU consumers (colorize slower; pc/align no readback).
 4. **NEON+OpenMP the scalar filters** *if* a live consumer enables them; otherwise leave them.
 5. **TensorRT** is a future learned-filter lane (37× headroom) — needs a model, not more GPU.
 6. **NVENC cq sweep by XPSNR** for the medical file-write path.
