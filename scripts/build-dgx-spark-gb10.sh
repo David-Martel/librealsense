@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${LRS_GB10_BUILD_DIR:-/opt/vigil/build/librealsense-v2.58.1-dgx-spark-gb10}"
 PREFIX="${LRS_GB10_PREFIX:-/opt/vigil/opt/librealsense-v2.58.1-dgx-spark-gb10}"
-CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-13.2}"
+CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 CUDA_ARCH="${LRS_GB10_CUDA_ARCH:-121}"
 JOBS="${LRS_GB10_JOBS:-$(nproc)}"
 PYTHON_EXECUTABLE="${PYTHON_EXECUTABLE:-$(command -v python3)}"
@@ -19,6 +19,20 @@ WITH_OPENMP="${LRS_GB10_WITH_OPENMP:-ON}"
 WITH_IPO="${LRS_GB10_WITH_IPO:-OFF}"
 WITH_EXTERNAL_LZ4="${LRS_GB10_EXTERNAL_LZ4:-OFF}"
 FORCE_RSUSB="${LRS_GB10_FORCE_RSUSB:-ON}"
+# Enable GB10-specific USB mitigations (P2 URB pool depth + P4 watchdog rate-limit + stop settle).
+# Set LRS_GB10_USB_TUNING=0 to produce a vanilla build without the GB10 defaults baked in.
+GB10_USB_TUNING="${LRS_GB10_USB_TUNING:-1}"
+# Opt-in to building the unit-test target alongside the SDK (off by default in GB10 builds to
+# avoid requiring Catch2 unless the user explicitly wants tests).
+BUILD_UNIT_TESTS="${LRS_GB10_BUILD_UNIT_TESTS:-OFF}"
+# CUDA-enabled OpenCV prefix (GB10 build from /opt/gb10-cuda/install/opencv).
+# When the cmake config is present at <prefix>/lib/cmake/opencv4/OpenCVConfig.cmake the build
+# passes -DOpenCV_DIR pointing at that directory so the CV examples/wrappers (cv-helpers,
+# depth-quality, KinFu) link the CUDA OpenCV 4.14 instead of the stock Ubuntu 4.6.0.
+# To fall back to system OpenCV, point at a path that does not exist:
+#   LRS_GB10_OPENCV_DIR=/dev/null/no-opencv  scripts/build-dgx-spark-gb10.sh configure
+# (An empty string restores the default due to bash :- substitution semantics.)
+LRS_GB10_OPENCV_DIR="${LRS_GB10_OPENCV_DIR:-/opt/gb10-cuda/install/opencv}"
 MODE="all"
 
 usage() {
@@ -48,6 +62,22 @@ Useful environment:
   PYTHON_EXECUTABLE        Python ABI for pyrealsense2
   LRS_GB10_PYTHON_INSTALL_DIR
                            Python install dir, default under the GB10 prefix
+  LRS_GB10_USB_TUNING      Bake in GB10 USB mitigations (RS2_GB10_USB_TUNING=1),
+                           default 1 (ON). Set to 0 for a vanilla build.
+  LRS_GB10_BUILD_UNIT_TESTS
+                           Pass BUILD_UNIT_TESTS to CMake so the Catch2 unit-test
+                           targets are also built, default OFF.
+  LRS_GB10_OPENCV_DIR      Path to a CUDA-enabled OpenCV install prefix.  When the
+                           CMake config exists at <prefix>/lib/cmake/opencv4/ the
+                           build passes -DOpenCV_DIR to that directory so the CV
+                           examples and wrappers (cv-helpers, depth-quality, KinFu)
+                           link the CUDA OpenCV instead of the stock Ubuntu 4.6.0.
+                           Default: /opt/gb10-cuda/install/opencv (the GB10 CUDA
+                           media stack built by the gb10-cuda Codex session).
+                           To skip and fall back to whatever CMake finds on the
+                           system, point at a non-existent path (bash :- means
+                           empty string restores the default):
+                             LRS_GB10_OPENCV_DIR=/dev/null/no-opencv ...
 USAGE
 }
 
@@ -120,6 +150,20 @@ configure() {
     enable_legacy_ccache="OFF"
   fi
 
+  # Wire the CUDA-enabled OpenCV if the install prefix has a valid cmake config.
+  # The config file path was verified on 2026-06-03: OpenCV 4.14.0 at
+  #   /opt/gb10-cuda/install/opencv/lib/cmake/opencv4/OpenCVConfig.cmake
+  # Falls back to stock CMake OpenCV discovery when the prefix is absent or empty.
+  local opencv_args=()
+  local _opencv_cmake_dir="${LRS_GB10_OPENCV_DIR}/lib/cmake/opencv4"
+  if [[ -n "${LRS_GB10_OPENCV_DIR:-}" && -f "${_opencv_cmake_dir}/OpenCVConfig.cmake" ]]; then
+    opencv_args=(-DOpenCV_DIR="${_opencv_cmake_dir}")
+    echo "LRS_GB10: using CUDA OpenCV from ${_opencv_cmake_dir}"
+  elif [[ -n "${LRS_GB10_OPENCV_DIR:-}" ]]; then
+    echo "LRS_GB10: WARNING: LRS_GB10_OPENCV_DIR='${LRS_GB10_OPENCV_DIR}' set but" \
+         "${_opencv_cmake_dir}/OpenCVConfig.cmake not found; falling back to system OpenCV"
+  fi
+
   cmake -S "$ROOT" -B "$BUILD_DIR" "${generator_args[@]}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$PREFIX" \
@@ -156,7 +200,10 @@ configure() {
     -DENABLE_CCACHE="$enable_legacy_ccache" \
     -DENABLE_EASYLOGGINGPP_ASYNC=ON \
     -DCHECK_FOR_UPDATES=OFF \
-    "${launcher_args[@]}"
+    -DRS2_GB10_USB_TUNING="$GB10_USB_TUNING" \
+    -DBUILD_UNIT_TESTS="$BUILD_UNIT_TESTS" \
+    "${launcher_args[@]}" \
+    "${opencv_args[@]}"
 }
 
 build() {
