@@ -2,6 +2,10 @@
 // Copyright(c) 2015 RealSense, Inc. All Rights Reserved.
 
 #include "uvc-streamer.h"
+#include "../usb-tuning.h"
+// GB10 Stop-Endpoint mitigation default (P4a watchdog rate-limit) comes from
+// usb-tuning.h. With RS2_GB10_USB_TUNING undefined the watchdog path below is the
+// original unconditional reset_endpoint — byte-identical to upstream.
 
 const int UVC_PAYLOAD_MAX_HEADER_LENGTH         = 1024;
 const int DEQUEUE_MILLISECONDS_TIMEOUT          = 50;
@@ -102,9 +106,32 @@ namespace librealsense
                        if(!_running || !_frame_arrived)
                            return;
 
+#if defined(RS2_GB10_USB_TUNING) && RS2_GB10_USB_TUNING
+                       // P4a: rate-limit the watchdog's Stop-Endpoint command so a transient
+                       // stall under 3-stream saturating load does not pile onto the GB10 xHCI
+                       // control-path (the command the controller dies on). Suppress resets that
+                       // arrive faster than WATCHDOG_MIN_RESET_INTERVAL.
+                       uint64_t now_ms = static_cast<uint64_t>(
+                           std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch()).count());
+                       if(librealsense::usb_tuning::watchdog_should_reset(
+                               now_ms, _last_reset_ms, librealsense::usb_tuning::WATCHDOG_MIN_RESET_INTERVAL))
+                       {
+                           LOG_ERROR("uvc streamer watchdog triggered on endpoint: " << (int)_read_endpoint->get_address());
+                           _context.messenger->reset_endpoint(_read_endpoint, ENDPOINT_RESET_MILLISECONDS_TIMEOUT);
+                           _last_reset_ms = now_ms;
+                           _frame_arrived = false;
+                       }
+                       else
+                       {
+                           LOG_DEBUG("watchdog reset suppressed (rate-limited)");
+                       }
+#else
+                       // Upstream behavior: reset the endpoint on every watchdog trigger.
                        LOG_ERROR("uvc streamer watchdog triggered on endpoint: " << (int)_read_endpoint->get_address());
                        _context.messenger->reset_endpoint(_read_endpoint, ENDPOINT_RESET_MILLISECONDS_TIMEOUT);
                        _frame_arrived = false;
+#endif
                    });
              }, _watchdog_timeout);
 

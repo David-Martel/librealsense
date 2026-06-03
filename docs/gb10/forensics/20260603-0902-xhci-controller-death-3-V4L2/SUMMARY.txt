@@ -1,0 +1,38 @@
+GB10 xHCI controller death #3 — 2026-06-03 09:02:07 (spark-3066, controller NVDA8000:02, bus 6).
+
+*** THE KEY FINDING: this death was on the NATIVE V4L2 / kernel-uvcvideo backend, NOT RSUSB. ***
+
+BACKEND: librealsense V4L2 (FORCE_RSUSB_BACKEND=OFF, /opt/vigil/.../-gb10-v4l2). uvcvideo is the
+  sole driver; NO libusb claim, NO userspace clear_halt storm. The 86-v4l2-backend-assessment.md
+  hypothesis was that V4L2 would REDUCE the death by removing the RSUSB-specific triggers.
+  RESULT: it did NOT prevent the death.
+
+TRIGGER: dual depth+color 848x480@60 SETUP. Two kernel uvcvideo control timeouts
+  (09:01:57, 09:02:02: "usb 6-1: Failed to query (GET_CUR) UVC control 1 on unit 3: -110")
+  during the second-stream setup -> teardown Stop-Endpoint command -> HC died (09:02:07).
+  SINGLE depth 848x480@60 and SINGLE color 848x480@60 BOTH streamed CLEANLY first (59.9/59.5 fps,
+  0 gaps) on the same backend/controller. Only the DUAL setup tripped it.
+
+SIGNIFICANCE (strongest escalation evidence yet):
+  The GB10 xHCI Stop-Endpoint death (H7/P6) is reproduced on THREE independent triggers across
+  BOTH backends:
+    #1 (06-02): RSUSB, 3x 848x480@60 bulk saturation.
+    #2 (06-03 08:04): RSUSB, failed/unadvertised color profile setup.
+    #3 (06-03 09:02): V4L2 (kernel uvcvideo), dual 848x480@60 setup control timeout.
+  => The crash is NOT librealsense/RSUSB-specific. It is the NVIDIA GB10 xhci_plat_hcd
+     (ACPI NVDA8000) inability to complete a Stop-Endpoint command after ANY control-path -110,
+     with NO recovery path. ONLY an NVIDIA BSP/firmware fix (P6) can resolve it. No userspace
+     backend choice or librealsense patch prevents it.
+
+REVISED SAFE ENVELOPE (empirical, this hardware):
+  - SINGLE high-rate stream (depth OR color 848x480@60): OK on both backends.
+  - DUAL 848x480@60: NOT safe (killed NVDA8000:02). The 06-02 "1-2 streams rock-solid" claim
+    does NOT generalize to dual 848x480@60 + rapid start/stop cycling.
+  - 3-stream: lethal (established 06-02).
+
+CONTROLLERS NOW DEAD this boot: NVDA8000:00 (#2), NVDA8000:02 (#3). Reboot required to recover
+  both + the camera. Other controllers (NVDA8000:01/03/04, NVDA8001:00) untouched.
+
+HARNESS GAP (to fix): the sweep did NOT abort when the dual entry threw a control-timeout
+  exception (it proceeded to the next entry into the dying controller). An SDK control-timeout/
+  device-disconnect exception must halt the sweep, not only the journal tripwire.

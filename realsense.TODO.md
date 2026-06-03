@@ -8,6 +8,25 @@ measured, side-by-side optimized SDK build that preserves the known-good
 `/usr/local` install while exposing more SDK tools, examples, wrappers, and
 accelerated processing paths from an isolated prefix.
 
+## 2026-06-03 Update — controller-death root cause + corrections
+
+> See **[`docs/gb10/FINDINGS-2026-06-03.md`](docs/gb10/FINDINGS-2026-06-03.md)** and
+> [`docs/gb10/analysis/`](docs/gb10/analysis/) for the full investigation.
+
+- **The xHCI "controller death" is an NVIDIA GB10 silicon/firmware defect, reproduced 3× across BOTH the RSUSB
+  and native V4L2 backends.** The `xhci_plat_hcd` (ACPI `NVDA8000`) cannot complete a Stop-Endpoint command after
+  any control-path `-110` timeout, with no recovery (→ reboot). **Not fixable in librealsense** — file with NVIDIA.
+- **Empirical safe envelope is SINGLE high-rate stream only.** Dual 848×480@60 killed a controller (2026-06-03);
+  3-stream is lethal. The earlier "1–2 streams rock-solid" note does NOT hold for dual@60 + start/stop cycling.
+- **Mitigations**: opt-in `RS2_GB10_USB_TUNING` patches P2 (deeper URB pool), P3 (usbfs advisory), P4 (gentler
+  stop) reduce the *trigger* only; statically validated, not HIL-validated. **P1 eager-uvcvideo-detach and the
+  udev-unbind approach were DROPPED — contraindicated** (the unbind can itself wedge the GB10 controller).
+- **CUDA OpenCV 4.14 + NVENC** (from `/opt/gb10-cuda/install`) wired into the GB10 build; `CUDA_HOME` default
+  corrected to `/usr/local/cuda` (was the nonexistent `/usr/local/cuda-13.2`).
+- **Corrections to the claims below**: device firmware is **5.13.0.55** (not `5.17.0.10`, which is not a public
+  release); actual CUDA Toolkit is **13.0** (not 13.2). Runtime "enumeration instability" was the primary defect,
+  now root-caused to USB-2.0 dock topology + the GB10 xHCI fragility.
+
 ## Local Findings
 
 - Current local SDK source is `v2.58.1` at commit

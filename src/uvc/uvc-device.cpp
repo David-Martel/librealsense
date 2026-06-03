@@ -4,8 +4,16 @@
 #include "uvc-device.h"
 #include "uvc-parser.h"
 #include "uvc-streamer.h"
+#include "../usb-tuning.h"
 
 #include <rsutils/string/from.h>
+#include <cstdlib>
+#include <thread>
+#include <chrono>
+// GB10 Stop-Endpoint mitigation defaults (P2 URB depth, P4b inter-stop settle) are
+// defined once in usb-tuning.h so the GB10-vs-upstream values cannot drift across
+// translation units. When RS2_GB10_USB_TUNING is undefined they are the stock
+// upstream values and the code below reduces to the original behavior.
 
 #define UVC_AE_MODE_D0_MANUAL   ( 1 << 0 )
 #define UVC_AE_MODE_D1_AUTO     ( 1 << 1 )
@@ -65,6 +73,17 @@ namespace librealsense
 
         std::shared_ptr<uvc_device> create_rsuvc_device(uvc_device_info info)
         {
+            // P2: resolve per-stream URB pool depth. Deeper pools thicken the bulk
+            // pipeline on GB10 where 3 concurrent saturating streams can starve the xHCI
+            // control path. Upstream (RS2_GB10_USB_TUNING undefined) this is the stock 2
+            // with no getenv call, so device creation is byte-identical to before.
+            uint8_t rc = librealsense::usb_tuning::DEFAULT_USB_REQUEST_COUNT;
+#if defined(RS2_GB10_USB_TUNING) && RS2_GB10_USB_TUNING
+            if (const char* env_rc = std::getenv("RS2_USB_REQUEST_COUNT"))
+                rc = librealsense::usb_tuning::resolve_usb_request_count(rc, env_rc);
+            LOG_DEBUG("create_rsuvc_device: usb_request_count=" << (int)rc);
+#endif
+
             auto devices = usb_enumerator::query_devices_info();
             for (auto&& usb_info : devices)
             {
@@ -73,7 +92,7 @@ namespace librealsense
 
                 auto dev = usb_enumerator::create_usb_device(usb_info);
                 if(dev)
-                    return std::make_shared<rs_uvc_device>(dev, info);
+                    return std::make_shared<rs_uvc_device>(dev, info, rc);
             }
 
             return nullptr;
@@ -152,8 +171,28 @@ namespace librealsense
         {
             check_connection();
 
+            // P4b: space out the cancel/clear_halt burst across streams to reduce the
+            // pile-up of Stop-Endpoint commands that can kill the GB10 xHCI controller.
+            // Upstream (RS2_GB10_USB_TUNING undefined) this is the original tight loop with
+            // no getenv and no sleep — byte-identical to before.
+#if defined(RS2_GB10_USB_TUNING) && RS2_GB10_USB_TUNING
+            int settle = librealsense::usb_tuning::DEFAULT_STOP_SETTLE_MS;
+            if (const char* env_settle = std::getenv("RS2_USB_STOP_SETTLE_MS"))
+                settle = librealsense::usb_tuning::resolve_stop_settle_ms(env_settle, settle);
+            for(std::size_t i = 0; i < _streamers.size(); ++i)
+            {
+                // Only settle after a streamer we actually stopped: on a multi-profile
+                // teardown later close() calls hit already-stopped streamers (no-op stop()),
+                // so skipping those avoids spurious latency.
+                const bool was_running = _streamers[i]->running();
+                _streamers[i]->stop();
+                if(settle > 0 && was_running && i + 1 < _streamers.size())
+                    std::this_thread::sleep_for(std::chrono::milliseconds(settle));
+            }
+#else
             for(auto&& s : _streamers)
                 s->stop();
+#endif
 
             auto elem = std::find_if(_streams.begin(), _streams.end(), [&](const profile_and_callback &pac) {
                 return (pac.profile == profile && (pac.callback));
