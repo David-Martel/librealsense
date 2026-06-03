@@ -66,9 +66,12 @@ a `hud_lines()` overlay for on-screen real-time telemetry, and `telemetry.jsonl`
 ## Staged implementation plan (what's proven vs what remains)
 - **Phase 0 — gates ✅ DONE** (this turn): every stage proven in isolation; modules written (`depth_lift`,
   `inference_config.build_pose_model`, EGL renderer, NVENC, `telemetry`).
-- **Phase 1 — integrate (next):** single-process runner wiring capture→infer→render→telemetry; **single-stream
-  first** (depth-only sanity), then **add color (2-stream = eyes-open)** with the `hil_common` tripwire armed and
-  **short** runs; HUD on screen; JSONL out. Deliverable: `posebench/run_testbed.py`.
+- **Phase 1 — integrate ✅ DONE + LIVE-PROVEN:** `posebench/run_testbed.py` (async capture→infer→render→
+  telemetry, every stage wrapped) — synthetic dry-run (29.7 fps, real 3D skeleton, NVENC `testbed.mp4`), then
+  **live on hardware:** (1) depth-only single-stream 15s = 446 frames @ 29.7 fps, controller GREEN; (2) **full
+  rgbd 2-stream pose pipeline 12s = live keypoint inference GPU p50 16.0 ms (327 inferences) + 3D lift + render,
+  end-to-end p50 7.8 ms, controller GREEN (zero -110/HC-died).** The full capture→inference→3D-lift→GPU-render
+  chain runs live, controller-safe, async (infer 57 fps capacity decoupled from 30 fps capture/render).
 - **Phase 2 — optimize with evidence:** use the telemetry to find the real bottleneck (likely infer); try the
   240×424 fast path (85 fps) under render load; cached-buffer pointcloud bg; pinned-memory H2D; thread vs
   process for infer.
