@@ -20,16 +20,22 @@ human must confirm which camera is in the rack" — that warning was correct and
 
 ### Why this matters — it recontextualizes every recent "survival" result
 The recent finding "dual/quad/churn/soak survive on the clean USB-3 bus with **zero `-110`**" was
-attributed (carefully, as preliminary) to topology + mitigations. **It is now confounded by a third,
-larger camera-side variable: a different unit on newer firmware.** The most parsimonious model that
-fits ALL the data:
+attributed (carefully, as preliminary) to topology + mitigations. **Between the death runs and the
+survival runs, FOUR variables changed at once and NONE is isolated:** (a) camera unit, (b) firmware
+(5.13.0.55→5.15.1.55), (c) topology (USB-2/dock → clean USB-3), (d) the opt-in mitigations
+(`RS2_GB10_USB_TUNING=1`, P2/P3/P4/P7 — active in the survival runs). What IS settled:
 - The GB10 xHCI **Stop-Endpoint-after-`-110` defect is real** (incident #3 proved it on the in-kernel
-  V4L2 path — that stands and the NVIDIA escalation is unaffected).
-- The **trigger** — the `-110` control-transfer storm — was produced by the **death-era camera's
-  firmware 5.13.0.55** (an old D400 firmware with known UVC control errata), aggravated by the USB-2/
-  dock topology.
-- The **current camera's firmware 5.15.1.55 produces zero `-110`** on the clean USB-3 link, so the
-  Stop-Endpoint is never issued in the error state, so the controller never dies.
+  V4L2 path — that stands; the NVIDIA escalation is unaffected).
+- The survival runs produced **zero `-110`**, so the Stop-Endpoint is never issued in the error state.
+
+**What is NOT settled — the trigger of the `-110` storm.** Two live hypotheses, and they cannot be
+separated from the current data because firmware and topology moved together:
+- **H-firmware:** the old FW 5.13.0.55 emitted the `-110`s; FW 5.15.1.55 does not.
+- **H-topology:** the marginal USB-2/dock link emitted the `-110`s; firmware was incidental.
+The mitigations (d) are a further uncontrolled variable: they are **code-proven additive/gated**
+(byte-identical upstream when off — §2) but that is **not** the same as "they had no effect on the
+survival" — that empirical claim was never isolated either. **Do not let "firmware" or "topology" or
+"the patches" quietly become the presumed cause.**
 
 **Consequence:** the recent soaks do **NOT** demonstrate the death-era camera/firmware is now safe.
 They demonstrate that *this* unit on *this* firmware on *this* topology does not produce the trigger.
@@ -37,10 +43,12 @@ The conservative single-stream envelope for the OLD firmware/units stays; and **
 ≥5.15 (the device-firmware TODO) is now a leading candidate for the actual trigger fix**, not just a
 nice-to-have. The honest stability claim: "no `-110` observed with FW 5.15.1.55 on a clean USB-3 bus."
 
-**To actually attribute cause** (future HIL, hardware-gated): run the same non-headless soak on the
-**death-era unit/firmware (5.13.0.55)** if it can be located, on the clean bus — if it produces `-110`
-where 5.15.1.55 does not, firmware is confirmed as the trigger. Until then, camera/firmware is an
-**uncontrolled variable** in all post-reboot results.
+**To actually attribute cause** (future HIL, hardware-gated) you need a **2×2, not one cell**: old
+unit/FW vs new unit/FW × clean USB-3 vs USB-2 link. One cell ("old unit on clean bus") alone cannot
+separate H-firmware from H-topology. If the old FW emits `-110` on the clean bus where the new FW does
+not → firmware confirmed; if the new FW emits `-110` on a USB-2 link → topology confirmed; both could
+contribute. Until that matrix is run, **camera/firmware AND topology AND the mitigations are all
+uncontrolled** in every post-reboot result.
 
 ## 2. David-Martel fork vs upstream `realsenseai/librealsense`
 
