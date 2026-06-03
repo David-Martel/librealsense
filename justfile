@@ -135,6 +135,27 @@ hil-align-bench *ARGS:
     "{{venv_python}}" "$SG/_align_speedup.py" "$OUT/cuda.json" "$OUT/nocuda.json"
     rm -rf "$OUT"
 
+# End-to-end GPU pipeline throughput (Finding A): USB-ingest+conversion -> align -> [colorize].
+# Runs BOTH builds back-to-back + prints whether per-frame CUDA color conversion offloads the decode
+# off the CPU or is a regression vs NEON. 2-stream/eyes-open: tripwire-armed, fixed config, static scene.
+# `--colorize` adds the render stage; `--display` to watch. Default 1280x720x30 (stresses conversion).
+hil-gpu-pipeline *ARGS:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    SG="{{repo_root}}/scripts/gb10"; OUT="$(mktemp -d /tmp/lrs-pipe-XXXXXX)"
+    echo ">>> CUDA build (build-gb10-full):"
+    LD_LIBRARY_PATH="{{cuda_libs}}:{{hil_build_dir}}/Release" \
+      PYTHONPATH="$SG:{{hil_build_dir}}/Release:/opt/gb10-cuda/install/opencv/lib/python3.12/site-packages" \
+      DISPLAY="${DISPLAY:-:1}" LRS_FFMPEG=/opt/gb10-cuda/install/ffmpeg/bin/ffmpeg LRS_BUILD_TAG=CUDA \
+      LRS_RESULT_JSON="$OUT/cuda.json" "{{venv_python}}" "$SG/rs-gb10-gpu-pipeline.py" {{ARGS}}
+    echo ">>> CUDA-OFF build (build-gb10-nocuda):"
+    LD_LIBRARY_PATH="{{cuda_libs}}:{{validation_dir}}/build-gb10-nocuda/Release" \
+      PYTHONPATH="$SG:{{validation_dir}}/build-gb10-nocuda/Release:/opt/gb10-cuda/install/opencv/lib/python3.12/site-packages" \
+      DISPLAY="${DISPLAY:-:1}" LRS_FFMPEG=/opt/gb10-cuda/install/ffmpeg/bin/ffmpeg LRS_BUILD_TAG=NOCUDA \
+      LRS_RESULT_JSON="$OUT/nocuda.json" "{{venv_python}}" "$SG/rs-gb10-gpu-pipeline.py" {{ARGS}}
+    "{{venv_python}}" "$SG/_pipeline_compare.py" "$OUT/cuda.json" "$OUT/nocuda.json"
+    rm -rf "$OUT"
+
 # NON-HEADLESS render verify: paint frames on $DISPLAY, x11grab the screen, prove real pixels (SAFE).
 hil-nonheadless:
     DISPLAY="${DISPLAY:-:1}" LD_LIBRARY_PATH="{{cuda_libs}}:{{hil_build_dir}}/Release" \

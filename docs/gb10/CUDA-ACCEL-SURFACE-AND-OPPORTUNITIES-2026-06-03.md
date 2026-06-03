@@ -89,14 +89,20 @@ op** — which is why pointcloud silently runs its measured-**slower** (0.57×) 
 An op is a *real* opportunity only if it is (a) on a live consumer's hot path **and** (b) costly per
 frame. Ranked accordingly:
 
-### Finding A (named, unmeasured, suspected regression) — per-frame color conversion on CUDA
-`color-formats-converter.cpp` gates YUYV/UYVY→RGB on the same coarse `is_gpu_available()`, so in the
-CUDA build the **color decode runs CUDA on every color frame**. Color is on vigil's *guaranteed* hot
-path (unlike pointcloud, which a depth-only consumer never touches). By the exact D2H-bound logic that
-made pointcloud 0.57×, this conversion **could be a silent per-frame regression shipping right now.**
-It cannot be isolated like `align.process()` (the converter fires inside frame delivery), so measuring
-it needs an **end-to-end full-vs-nocuda color-throughput / frame-cadence comparison** — a small new
-task, flagged here as *unmeasured-but-suspected*, not yet quantified.
+### Finding A — per-frame color conversion on CUDA — **MEASURED 2026-06-03: NOT a regression**
+`color-formats-converter.cpp` gates YUYV/UYVY→RGB on the coarse `is_gpu_available()`, so in the CUDA
+build the color decode runs CUDA on every color frame. The worry: by the D2H-bound logic that made
+pointcloud 0.57×, this could be a silent per-frame regression on vigil's guaranteed hot path.
+**Tested** (`just hil-gpu-pipeline --convert-only`, color-only single stream so align can't swamp the
+signal, CPU-ms/frame from `/proc/self/stat`, 1280×720×30, both builds back-to-back, static scene):
+**CUDA 2.00 ms/frame vs NEON 2.03 ms/frame — CPU-equivalent (±2%, within noise); both sustained 29.96/30 fps.**
+→ **No regression.** The conversion is small enough that neither path is a bottleneck; the D2H penalty
+does not manifest at this resolution/rate. (The earlier *full*-pipeline run showed CUDA 62% lower
+CPU/frame — that is **entirely `align`**, not conversion: `color_access` p50 was identical 0.023 vs
+0.024 ms on both builds, and the CPU delta equalled the measured align saving. The `--convert-only`
+isolation is what prevents that mis-attribution.) **Caveat:** process-total CPU floors out sub-ms
+differences; a multi-stream or much-higher-res color load is untested. Tools: `rs-gb10-gpu-pipeline.py`
++ `_pipeline_compare.py`.
 
 ### Opportunity 1 (leading, lowest-risk, targets the measured cause) — managed / zero-copy memory in the existing kernels
 The CUDA kernels use **explicit `cudaMalloc`/`cudaMemcpy`** (`cuda-pointcloud.cu:93`), paying H2D+D2H
