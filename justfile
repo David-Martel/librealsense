@@ -98,6 +98,23 @@ hil-quality:
       LRS_FFMPEG=/opt/gb10-cuda/install/ffmpeg/bin/ffmpeg \
       "{{venv_python}}" "{{repo_root}}/scripts/gb10/rs-gb10-quality-hil.py"
 
+# --- standardized HIL suite (hil_common.py + rs-gb10-hil-suite.py): idempotent + tripwire-guarded ---
+hil_env := "LD_LIBRARY_PATH=" + cuda_libs + ":" + hil_build_dir + "/Release PYTHONPATH=" + repo_root + "/scripts/gb10:" + hil_build_dir + "/Release:/opt/gb10-cuda/install/opencv/lib/python3.12/site-packages LRS_FFMPEG=/opt/gb10-cuda/install/ffmpeg/bin/ffmpeg"
+
+# Long-soak (phased single->dual->churn->quad + control-feature exercise). DANGER: eyes-open multi-stream.
+# `just hil-soak` headless full; `just hil-soak --display` watch on screen; `--scale 0.3` shorter.
+hil-soak *ARGS:
+    {{hil_env}} DISPLAY="${DISPLAY:-:1}" "{{venv_python}}" "{{repo_root}}/scripts/gb10/rs-gb10-hil-suite.py" soak {{ARGS}}
+
+# Capture->playback stress: record a rosbag2 .db3, replay real-time + max-speed, verify integrity (SAFE-ish).
+hil-capture-playback *ARGS:
+    {{hil_env}} DISPLAY="${DISPLAY:-:1}" "{{venv_python}}" "{{repo_root}}/scripts/gb10/rs-gb10-hil-suite.py" capture-playback {{ARGS}}
+
+# librealsense CUDA-op benchmark (colorize+pointcloud) — run against both builds to compare; needs build-gb10-nocuda.
+hil-cuda-bench:
+    @echo "CUDA build:"; LD_LIBRARY_PATH="{{hil_build_dir}}/Release" PYTHONPATH="{{hil_build_dir}}/Release" LRS_BUILD_TAG=CUDA "{{venv_python}}" "{{repo_root}}/scripts/gb10/rs-gb10-cuda-bench.py"
+    @echo "CUDA-OFF build (build-gb10-nocuda):"; LD_LIBRARY_PATH="{{validation_dir}}/build-gb10-nocuda/Release" PYTHONPATH="{{validation_dir}}/build-gb10-nocuda/Release" LRS_BUILD_TAG=NOCUDA "{{venv_python}}" "{{repo_root}}/scripts/gb10/rs-gb10-cuda-bench.py"
+
 # NON-HEADLESS render verify: paint frames on $DISPLAY, x11grab the screen, prove real pixels (SAFE).
 hil-nonheadless:
     DISPLAY="${DISPLAY:-:1}" LD_LIBRARY_PATH="{{cuda_libs}}:{{hil_build_dir}}/Release" \
