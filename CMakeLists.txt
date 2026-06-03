@@ -85,6 +85,15 @@ if(RS2_GB10_PC_ZEROCOPY)
     message(STATUS "GB10 pointcloud zero-copy ladder enabled (RS2_GB10_PC_ZEROCOPY=1; RS2_PC_MODE 0/1/2)")
 endif()
 
+# GB10 / DGX Spark YUYV->color cached-buffer experiment (opt-in; OFF upstream). When enabled, the
+# CUDA unpack_yuy2 path gains a runtime-selectable alloc strategy (RS2_CONV_MODE 0/1, default 0 =
+# unmodified per-frame malloc). Mode 1 caches device buffers process-static across frames; kernels
+# and memcpy are byte-identical in both modes.
+if(RS2_GB10_CONV_CACHE)
+    target_compile_definitions(${LRS_TARGET} PRIVATE RS2_GB10_CONV_CACHE=1)
+    message(STATUS "GB10 conversion cached-buffer ladder enabled (RS2_GB10_CONV_CACHE=1; RS2_CONV_MODE 0/1)")
+endif()
+
 if(BUILD_WITH_DDS)
     message(STATUS "Building with FastDDS")
 	include(CMake/external_foonathan_memory.cmake)

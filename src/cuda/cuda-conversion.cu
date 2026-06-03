@@ -6,6 +6,58 @@
 #include <iostream>
 #include <iomanip>
 #include "rscuda_utils.cuh"
+
+// --- GB10 conversion cached-buffer experiment (opt-in; default OFF = byte-identical upstream) ------
+// Attribution ladder for "what does eliminating per-frame cudaMalloc/cudaFree buy on the color
+// YUYV->BGR8/RGB8 path?"  Selected at runtime via RS2_CONV_MODE (read once at first call):
+//   0 = baseline (per-frame cudaMalloc+cudaMemcpy+free, the shipped path, DEFAULT)
+//   1 = cached device buffers (alloc once per resolution, reuse across frames; still cudaMemcpy)
+// Kernel bodies, numBlocks, and cudaStreamSynchronize are unchanged in both modes — only the
+// alloc/free strategy differs, so outputs are byte-identical (max-abs-diff == 0).
+// Two independent byte capacities (src_cap, dst_cap) handle the format-dependent output size:
+//   src is always superPix*4 bytes; dst is n*size bytes where size ∈ {2,3,4} per format.
+// Buffers are process-static, mutex-guarded, grow-only (realloc when bytes exceed cap).
+#if defined(RS2_GB10_CONV_CACHE)
+#include <mutex>
+#include <cstdlib>
+namespace {
+    int rs2_conv_mode() {
+        static int m = -1;
+        if (m < 0) { const char* e = std::getenv("RS2_CONV_MODE"); m = e ? std::atoi(e) : 0; }
+        return m;
+    }
+    struct conv_cache_buffers {
+        std::mutex mtx;
+        size_t src_cap = 0; // bytes allocated for d_src
+        size_t dst_cap = 0; // bytes allocated for d_dst (format-dependent)
+        uint8_t* d_src = nullptr;
+        uint8_t* d_dst = nullptr;
+        ~conv_cache_buffers() {
+            // Release on process exit (grow-only during operation; freed by OS anyway, but
+            // explicit cudaFree avoids CUDA shutdown warnings in checked builds).
+            if (d_src) cudaFree(d_src);
+            if (d_dst) cudaFree(d_dst);
+        }
+        // Grow-only: reallocate only when the new byte count exceeds current capacity.
+        void ensure_src(size_t bytes) {
+            if (d_src && src_cap >= bytes) return;
+            if (d_src) cudaFree(d_src);
+            cudaError_t r = cudaMalloc((void**)&d_src, bytes);
+            assert(r == cudaSuccess); (void)r;
+            src_cap = bytes;
+        }
+        void ensure_dst(size_t bytes) {
+            if (d_dst && dst_cap >= bytes) return;
+            if (d_dst) cudaFree(d_dst);
+            cudaError_t r = cudaMalloc((void**)&d_dst, bytes);
+            assert(r == cudaSuccess); (void)r;
+            dst_cap = bytes;
+        }
+    };
+    conv_cache_buffers& conv_cache() { static conv_cache_buffers b; return b; }
+}
+#endif // RS2_GB10_CONV_CACHE
+// ---------------------------------------------------------------------------------------------------
 /*
 // conversion to Y8 is currently not available in the API
 __global__ void kernel_unpack_yuy2_y8_cuda(const uint8_t * src, uint8_t *dst, int superPixCount)
@@ -261,14 +313,70 @@ void rscuda::unpack_yuy2_cuda_helper(const uint8_t* h_src, uint8_t* h_dst, int n
 
         // How many super pixels do we have?
     int superPix = n / 2;
+
+    // Determine output bytes-per-pixel for this format (needed by both paths)
+    int size;
+    switch (format) {
+    case RS2_FORMAT_Y16:   size = 2; break;
+    case RS2_FORMAT_RGB8:  size = 3; break;
+    case RS2_FORMAT_BGR8:  size = 3; break;
+    case RS2_FORMAT_RGBA8: size = 4; break;
+    case RS2_FORMAT_BGRA8: size = 4; break;
+    default: assert(false); size = 0; break;
+    }
+
+    int numBlocks = superPix / RS2_CUDA_THREADS_PER_BLOCK;
+
+#if defined(RS2_GB10_CONV_CACHE)
+    if (rs2_conv_mode() == 1) {
+        // mode 1: cached device buffers, alloc-once grow-only; H2D+kernel+D2H unchanged.
+        const size_t src_bytes = (size_t)superPix * 4 * sizeof(uint8_t);
+        const size_t dst_bytes = (size_t)n * (size_t)size * sizeof(uint8_t);
+        auto& b = conv_cache();
+        std::lock_guard<std::mutex> lk(b.mtx);
+        b.ensure_src(src_bytes);
+        b.ensure_dst(dst_bytes);
+
+        cudaError_t result = cudaMemcpy(b.d_src, h_src, src_bytes, cudaMemcpyHostToDevice);
+        assert(result == cudaSuccess);
+
+        switch (format) {
+        case RS2_FORMAT_Y16:
+            kernel_unpack_yuy2_y16_cuda << <numBlocks, RS2_CUDA_THREADS_PER_BLOCK >> > (b.d_src, b.d_dst, superPix);
+            break;
+        case RS2_FORMAT_RGB8:
+            kernel_unpack_yuy2_rgb8_cuda << <numBlocks, RS2_CUDA_THREADS_PER_BLOCK >> > (b.d_src, b.d_dst, superPix);
+            break;
+        case RS2_FORMAT_BGR8:
+            kernel_unpack_yuy2_bgr8_cuda << <numBlocks, RS2_CUDA_THREADS_PER_BLOCK >> > (b.d_src, b.d_dst, superPix);
+            break;
+        case RS2_FORMAT_RGBA8:
+            kernel_unpack_yuy2_rgba8_cuda << <numBlocks, RS2_CUDA_THREADS_PER_BLOCK >> > (b.d_src, b.d_dst, superPix);
+            break;
+        case RS2_FORMAT_BGRA8:
+            kernel_unpack_yuy2_bgra8_cuda << <numBlocks, RS2_CUDA_THREADS_PER_BLOCK >> > (b.d_src, b.d_dst, superPix);
+            break;
+        default:
+            assert(false);
+        }
+        result = cudaGetLastError();
+        assert(result == cudaSuccess);
+
+        cudaStreamSynchronize(0);
+
+        result = cudaMemcpy(h_dst, b.d_dst, dst_bytes, cudaMemcpyDeviceToHost);
+        assert(result == cudaSuccess);
+        return;
+    }
+    // mode 0 (or unrecognized) falls through to the unmodified baseline below
+#endif // RS2_GB10_CONV_CACHE
+
+    // ---- Baseline: unmodified upstream path (mode 0, or RS2_GB10_CONV_CACHE not compiled) ----
     std::shared_ptr<uint8_t> d_dst;
     std::shared_ptr<uint8_t> d_src = alloc_dev<uint8_t>(superPix * 4);
 
     auto result = cudaMemcpy(d_src.get(), h_src, superPix * sizeof(uint8_t) * 4, cudaMemcpyHostToDevice);
     assert(result == cudaSuccess);
-
-    int numBlocks = superPix / RS2_CUDA_THREADS_PER_BLOCK;
-    int size;
 
     switch (format)
     {
@@ -280,27 +388,22 @@ void rscuda::unpack_yuy2_cuda_helper(const uint8_t* h_src, uint8_t* h_dst, int n
             break;
         */
     case RS2_FORMAT_Y16:
-        size = 2;
         d_dst = alloc_dev<uint8_t>(n * size);
         kernel_unpack_yuy2_y16_cuda << <numBlocks, RS2_CUDA_THREADS_PER_BLOCK >> > (d_src.get(), d_dst.get(), superPix);
         break;
     case RS2_FORMAT_RGB8:
-        size = 3;
         d_dst = alloc_dev<uint8_t>(n * size);
         kernel_unpack_yuy2_rgb8_cuda << <numBlocks, RS2_CUDA_THREADS_PER_BLOCK >> > (d_src.get(), d_dst.get(), superPix);
         break;
     case RS2_FORMAT_BGR8:
-        size = 3;
         d_dst = alloc_dev<uint8_t>(n * size);
         kernel_unpack_yuy2_bgr8_cuda << <numBlocks, RS2_CUDA_THREADS_PER_BLOCK >> > (d_src.get(), d_dst.get(), superPix);
         break;
     case RS2_FORMAT_RGBA8:
-        size = 4;
         d_dst = alloc_dev<uint8_t>(n * size);
         kernel_unpack_yuy2_rgba8_cuda << <numBlocks, RS2_CUDA_THREADS_PER_BLOCK >> > (d_src.get(), d_dst.get(), superPix);
         break;
     case RS2_FORMAT_BGRA8:
-        size = 4;
         d_dst = alloc_dev<uint8_t>(n * size);
         kernel_unpack_yuy2_bgra8_cuda << <numBlocks, RS2_CUDA_THREADS_PER_BLOCK >> > (d_src.get(), d_dst.get(), superPix);
         break;
