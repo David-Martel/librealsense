@@ -63,6 +63,20 @@ include(third-party/CMakeLists.txt)
 
 target_link_libraries( ${LRS_TARGET} PUBLIC rsutils )
 
+# GB10 / DGX Spark RSUSB multistream mitigations (P2 deeper URB pool, P4 gentler stop).
+# Opt-in and OFF upstream: when RS2_GB10_USB_TUNING is unset the backend keeps the
+# stock defaults (request_count=2, no stop-settle, watchdog resets every trigger).
+# The GB10 build profile passes -DRS2_GB10_USB_TUNING=1 to bake the GB10 defaults in.
+# This bridges the CMake cache variable into an actual compiler preprocessor define
+# on the realsense2 target so src/usb-tuning.h consumers see it.
+if(RS2_GB10_USB_TUNING)
+    # Hardcode =1 (not =${RS2_GB10_USB_TUNING}): CMake truthy values like ON/YES/TRUE would
+    # otherwise become a C identifier the preprocessor evaluates to 0, silently disabling the
+    # mitigations. The if() already gates on CMake truthiness, so any truthy value means "on".
+    target_compile_definitions(${LRS_TARGET} PRIVATE RS2_GB10_USB_TUNING=1)
+    message(STATUS "GB10 USB multistream mitigations enabled (RS2_GB10_USB_TUNING=1)")
+endif()
+
 if(BUILD_WITH_DDS)
     message(STATUS "Building with FastDDS")
 	include(CMake/external_foonathan_memory.cmake)

@@ -3,7 +3,42 @@
 
 #include "device-libusb.h"
 #include "types.h"
+#include "../usb-tuning.h"
 
+#include <fstream>
+#include <mutex>   // Required for std::once_flag and std::call_once.
+
+namespace
+{
+    // P3 advisory: warn once per process if /sys/module/usbcore/parameters/usbfs_memory_mb
+    // is below the threshold recommended for D400 high-bandwidth multistream on the RSUSB
+    // (libusb) backend.  On NVIDIA DGX Spark / GB10 the default 16 MB budget causes
+    // control-path starvation under three concurrent saturating bulk streams.  We only
+    // read the sysfs value — never write it (config must stay inspectable / versioned).
+    //
+    // Gated behind RS2_GB10_USB_TUNING so it is fully opt-in: a stock upstream build is
+    // unchanged (no sysfs read, no log line) on machines that have not opted into the
+    // GB10 tuning profile.
+    void check_usbfs_memory_mb_once()
+    {
+#if defined(__linux__) && defined(RS2_GB10_USB_TUNING) && RS2_GB10_USB_TUNING
+        static std::once_flag s_checked;
+        std::call_once( s_checked, []()
+        {
+            std::ifstream f( "/sys/module/usbcore/parameters/usbfs_memory_mb" );
+            long current_mb = 0;
+            if( f >> current_mb )
+            {
+                auto msg = librealsense::usb_tuning::usbfs_memory_advice( current_mb, 256 );
+                if( !msg.empty() )
+                    LOG_WARNING( msg );
+            }
+            // If the file is missing or unreadable (e.g. usbcore built-in, non-Linux VM),
+            // extraction fails and we silently skip — no warning, no throw.
+        } );
+#endif  // __linux__ && RS2_GB10_USB_TUNING
+    }
+} // anonymous namespace
 
 namespace librealsense
 {
@@ -12,6 +47,9 @@ namespace librealsense
         usb_device_libusb::usb_device_libusb(libusb_device* device, const libusb_device_descriptor& desc, const usb_device_info& info, std::shared_ptr<usb_context> context) :
                 _device(device), _usb_device_descriptor(desc), _info(info), _context(context)
         {
+            // Advisory preflight: emit a one-time LOG_WARNING if usbfs_memory_mb is too low.
+            check_usbfs_memory_mb_once();
+
             usb_descriptor ud = {desc.bLength, desc.bDescriptorType, std::vector<uint8_t>(desc.bLength)};
             memcpy(ud.data.data(), &desc, desc.bLength);
             _descriptors.push_back(ud);

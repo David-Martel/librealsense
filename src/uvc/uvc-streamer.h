@@ -50,6 +50,11 @@ namespace librealsense
             bool _frame_arrived = false;
             bool _publish_frames = true;
 
+            // P4a: timestamp (ms, steady clock) of the last watchdog endpoint reset.
+            // Serialized by _action_dispatcher (watchdog runs inside invoke), so a
+            // plain uint64_t is sufficient — no atomic needed.
+            uint64_t _last_reset_ms = 0;
+
             int64_t _watchdog_timeout;
             uvc_streamer_context _context;
 
