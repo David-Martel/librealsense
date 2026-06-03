@@ -325,7 +325,32 @@ Doc 50 Stage 4. The device reports **`5.13.0.55`** (old). Plan: `5.13.0.55 → 5
 
 ---
 
-## 8. New SDK safety guard — refuse a profile not in the advertised set (R8 / "P7")
+## 8. New SDK safety guard — P7
+
+> **CORRECTION 2026-06-03 (re-forensicated death #2; supersedes the original R8 framing below).**
+> The original P7 here was an **advertised-profile membership guard**, blamed for controller-death #2.
+> Re-reading the death-#2 SDK log + cached `rs-enumerate` (no hardware touched) **disproves that causation**:
+> the requested `Color 848×480@60 BGR8` **resolved fine** to the native `YUYV @60`
+> (`formats-converter.cpp:234/277`; the D435 advertises `Color 848x480 RGB8 @ 60/30/15/6 Hz`), and the link
+> was clean **USB-3.2**. Death #2 was **churn**: the deprecated harness destroyed+recreated the whole
+> `rs2::context`/pipeline between depth and color, releasing the device to kernel uvcvideo, which re-probed
+> control endpoints → `-110` storm → lethal Stop-Endpoint; the controller was already `NO_DEVICE` before the
+> color profile was issued. **The membership guard would never have fired.**
+>
+> **The implemented P7 is therefore the *device re-acquire guard*, not a membership guard.** It catches the
+> verified mechanism — a mid-session re-acquire of the same physical device (the context-recreation/churn
+> signature) — *before* the control storm: pure `resolve_reacquire_action`/`reacquire_advice` in
+> `src/usb-tuning.h` (TDD-unit-tested), wired at one call site in `src/libusb/device-libusb.cpp`
+> (per-process per-device acquire counter keyed by USB bus-port `unique_id`). Opt-in via `RS2_GB10_USB_TUNING`
+> (byte-identical upstream); **advisory `WARN` by default**, hard-`REFUSE` only via `RS2_GB10_REFUSE_REACQUIRE=1`;
+> it never auto-detaches uvcvideo (the contraindicated P1/P5). The safe pattern it steers callers toward is
+> *session-stable ownership*: hold one context per process and reconfigure via `rs2::config`.
+>
+> The membership guard below is **demoted to a low-priority "never issue an unadvertised config" nicety** —
+> correct in principle (and `sensor::open()`/`config::resolve()` already reject truly-unadvertised configs),
+> but **not** what killed the controller. Original text retained below for the record.
+
+### 8(orig). Refuse a profile not in the advertised set (R8 — demoted)
 
 This is the one genuinely **new SDK-level guard** (additive to doc 85's P1–P6; call it
 **P7**). Per the task framing, requesting a configuration the D435 does **not advertise**
@@ -334,7 +359,8 @@ contributed to controller-death #2. (**Attribution note:** the "caused controlle
 causation is the task author's / `rs-gb10-hil.sh` header's framing — see the hil rewrite
 rationale (a) — I have **not** read the raw `20260602-2159-xhci-controller-death/` artifacts
 to verify that specific causal chain myself. The guard is sound on first principles
-regardless: never issue a config the device didn't advertise.)
+regardless: never issue a config the device didn't advertise.) **[See the correction above —
+this causal claim was later disproven; 848×480@60 BGR8 resolved fine to native YUYV.]**
 
 - **(a) what + where:** in the config-resolution path, **before** committing a stream config,
   validate every requested (stream, format, resolution, fps) tuple against the device's

@@ -1,5 +1,26 @@
 GB10 xHCI controller death #2 — 2026-06-03 08:04:09 (spark-3066, NVDA8000:00)
 
+*** CORRECTION 2026-06-03 (re-forensicated; supersedes the TRIGGER/SIGNIFICANCE text below) ***
+  The "failed/unadvertised color profile" framing below is WRONG. Verified from the SDK debug
+  log + cached rs-enumerate (no hardware touched):
+   - The profile was ADVERTISED and RESOLVED FINE: formats-converter.cpp:234 "Requested: Color
+     848x480 BGR8 @60" -> :277 "Resolved to: Color 848x480 YUYV @60"; rs-enumerate lists
+     "Color 848x480 RGB8 @ 60/30/15/6 Hz". A membership/advertised-set guard would NOT fire.
+   - The link was clean USB-3.2 ("Usb Type Descriptor: 3.2", port 2-1-2) on every enumeration
+     incl. two healthchecks ~40 min prior. A USB-2/link-health gate would NOT fire either.
+   - REAL MECHANISM (link-speed-independent): the deprecated harness rs-gb10-validate-patched.py
+     DESTROYED + RECREATED the whole rs2::context+pipeline between depth and color
+     (context.cpp:41 "loading defaults" reappears 08:03:43). That released the device to kernel
+     uvcvideo, which re-bound and RE-PROBED UVC controls -> -110 storm 08:03:48-08:03:59 ->
+     lethal Stop-Endpoint -> HC died 08:04:09. color open() then hit RS2_USB_STATUS_NO_DEVICE
+     (handle-libusb.h:53) -> "acquire_power failed: failed to set power state": the controller
+     was ALREADY DEAD before the color profile was issued. The profile is a red herring.
+   - Pre-emptive guard implemented for this (the churn, not the profile): P7 device re-acquire
+     guard, src/usb-tuning.h resolve_reacquire_action + src/libusb/device-libusb.cpp. Hold ONE
+     context per process; reconfigure via rs2::config. The SIGNIFICANCE note below is still
+     correct that the GB10 dies on ANY control-path -110 followed by a Stop-Endpoint.
+*** end correction ***
+
 TRIGGER (distinct from 2026-06-02 incident #1):
   Incident #1 (06-02): 3x 848x480@60 concurrent bulk streams -> bandwidth/control starvation.
   Incident #2 (06-03, THIS): a COLOR profile setup that failed to resolve
