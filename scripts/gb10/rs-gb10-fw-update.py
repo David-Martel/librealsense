@@ -12,6 +12,17 @@ pre-flights per camera: USB-3 link (refuse USB-2), controller GREEN (no recent H
 backs up the current firmware first. Download signed images from Intel/RealSense
 (https://dev.realsenseai.com/docs/firmware-releases-d400/ ; file `Signed_Image_UVC_5_17_0_10.bin`).
 
+DOWNGRADE — VERIFIED FROM librealsense SOURCE (src/fw-update/fw-update-device.cpp):
+  * The HOST does NO version check — `rs-fw-update -f`/SDK `update()` streams ANY signed image
+    block-by-block (:205-247). So the host tool will *attempt* a downgrade; this wrapper's
+    --allow-downgrade guard is what stops it host-side.
+  * The DEVICE enforces anti-rollback in DFU mode: it reports `dfu_is_locked` + `fw_highest_version`
+    ("highest ever installed"); a LOCKED unit rejects an image not higher than that and the SDK
+    throws "Device is locked for update. Use firmware version higher than: <highest>" (:242).
+  => Production D435 units ship DFU-LOCKED: downgrade is BLOCKED by the device (forward-only).
+     Only an UNLOCKED/dev unit accepts a downgrade. A unit's lock state is only readable after it
+     enters DFU mode (`rs-fw-update` detach) — not checked here (report mode does not touch DFU).
+
 Usage:
   rs-gb10-fw-update.py                       # report all cameras' fw vs target (dry-run)
   rs-gb10-fw-update.py --flash --image <Signed_Image_UVC_5_17_0_10.bin>   # flash (gated)

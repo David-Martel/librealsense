@@ -44,7 +44,16 @@ percentile stats, `--display` (non-headless on-screen render + `x11grab` proof).
 ## Firmware
 | tool | what |
 |------|------|
-| `rs-gb10-fw-update.py` | reports every linked camera's firmware vs the **latest D400 production firmware 5.17.0.10**; gated flash with `--flash --image <Signed_Image_UVC_5_17_0_10.bin>` (download from <https://dev.realsenseai.com/docs/firmware-releases-d400/>). **Safety:** refuses USB-2 links (brick risk), refuses on a dead controller, backs up current fw first, dry-run by default. **Context:** the death-era camera ran old FW 5.13.0.55; updating forward is a candidate `-110`-trigger fix (see `docs/gb10/FORK-VS-UPSTREAM-AND-CAMERA-FIRMWARE`). |
+| `rs-gb10-fw-update.py` (`just fw-status`) | reports every linked camera's firmware vs the **latest D400 production firmware 5.17.0.10**; gated flash with `--flash --image <Signed_Image_UVC_5_17_0_10.bin>` (download from <https://dev.realsenseai.com/docs/firmware-releases-d400/>). **Safety:** refuses USB-2 links (brick risk), refuses on a dead controller, **refuses a downgrade** (parses image version) without `--allow-downgrade`, backs up current fw first, dry-run by default. **Context:** the death-era camera ran old FW 5.13.0.55; updating forward is a *candidate* (unconfirmed) `-110`-trigger fix (see `docs/gb10/FORK-VS-UPSTREAM-AND-CAMERA-FIRMWARE`). |
+
+**Firmware downgrade — verified from `src/fw-update/fw-update-device.cpp`:** the **host** does no version
+check (`rs-fw-update -f` streams any signed image), but the **device** enforces anti-rollback in DFU mode
+(`dfu_is_locked` + `fw_highest_version`); a **DFU-locked** unit rejects anything not *higher* than the
+highest-ever-installed (throws "Device is locked for update… use firmware version higher than: …",
+`:242`). **Production D435s ship locked → downgrade is forward-only / blocked by the device;** only an
+unlocked/dev unit can be downgraded. Consequence: the 2×2 firmware-attribution test likely **cannot** put
+the current (locked) unit back on 5.13.0.55 — it needs the original old unit. **Current decision: HOLD on
+firmware (stay on 5.15.1.55); do not flash** while benchmarking/robustness/ROS2-integration work proceeds.
 
 ## Safety model (read before HIL)
 - **Single-stream** (depth or color alone) is the conservative-safe envelope for production-critical use.
