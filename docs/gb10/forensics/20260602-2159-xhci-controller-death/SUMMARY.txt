@@ -1,0 +1,5 @@
+## D435 stress-induced xHCI controller death — 2026-06-02 21:59
+controller=NVDA8000:00 (owns usb1 empty + usb2 camera-only)
+trigger=stress entry 1: depth+color+IR all 848x480@60 concurrent (rs-gb10-stress-matrix.py)
+sequence: failed to set power state -> UVC control -110 (ETIMEDOUT) storm -> 'Not enough bandwidth for altsetting 0' -> 'Host halt failed -110' -> 'HC died' -> device gone
+software recovery: unbind/rebind xhci-hcd FAILED (-110); reboot required

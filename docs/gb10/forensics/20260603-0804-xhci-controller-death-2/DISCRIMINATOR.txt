@@ -1,0 +1,14 @@
+Jun 03 08:03:48 spark-3066 kernel: usb 2-1: Failed to query (SET_CUR) UVC control 5 on unit 7: -110 (exp. 1).
+Jun 03 08:03:48 spark-3066 kernel: usb 2-1: Failed to query (GET_DEF) UVC control 20 on unit 1: -110 (exp. 10).
+Jun 03 08:03:48 spark-3066 kernel: usb 2-1: UVC non compliance: permanently disabling control 981ae2 (Region of Interest Auto Ctrls), due to error -110
+Jun 03 08:03:54 spark-3066 kernel: usb 2-1: Failed to query (GET_CUR) UVC control 4 on unit 2: -110 (exp. 2).
+Jun 03 08:03:54 spark-3066 kernel: usb 2-1: Failed to query (GET_INFO) UVC control 11 on unit 7: -110 (exp. 1).
+Jun 03 08:03:59 spark-3066 kernel: usb 2-1: Failed to query (GET_DEF) UVC control 20 on unit 1: -110 (exp. 10).
+Jun 03 08:03:59 spark-3066 kernel: usb 2-1: Failed to query (GET_INFO) UVC control 2 on unit 6: -110 (exp. 1).
+Jun 03 08:04:09 spark-3066 kernel: xhci-hcd NVDA8000:00: xHCI host not responding to stop endpoint command
+Jun 03 08:04:09 spark-3066 kernel: xhci-hcd NVDA8000:00: Host halt failed, -110
+Jun 03 08:04:09 spark-3066 kernel: xhci-hcd NVDA8000:00: xHCI host controller not responding, assume dead
+Jun 03 08:04:09 spark-3066 kernel: xhci-hcd NVDA8000:00: HC died; cleaning up
+Jun 03 08:04:09 spark-3066 kernel: usb 2-1: USB disconnect, device number 2
+Jun 03 08:04:09 spark-3066 kernel: usb 2-1: Failed to query (GET_INFO) UVC control 3 on unit 6: -110 (exp. 1).
+Jun 03 08:04:09 spark-3066 kernel: usb 2-1: Failed to query (GET_CUR) UVC control 4 on unit 2: -110 (exp. 2).

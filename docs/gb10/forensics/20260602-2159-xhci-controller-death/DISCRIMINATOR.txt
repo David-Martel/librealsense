@@ -1,0 +1,24 @@
+## Discriminator analysis — uvcvideo -110 control-transfer timeouts (2026-06-02)
+
+Signal: kernel "usb 2-1: Failed to query (...) UVC control ... -110 (ETIMEDOUT)"
+
+  3-stream crash run (depth+color+IR 848x480@60) : 6 occurrences, then
+                                                   "xHCI host not responding to stop
+                                                   endpoint command" -> Host halt failed
+                                                   -110 -> HC died.
+  Sustained run (1-2 streams, hd15/vga30/stress)  : 0 occurrences, 0 stop-endpoint, 0 HC died.
+  Healthcheck visible runs x4 (1 stream)          : 0 / 0 / 0 / 0.
+
+Interpretation:
+- uvcvideo is bound to non-streamed interfaces in ALL runs (1.1/1.3/1.4 seen) -> contention
+  context is constant, therefore NOT the differentiator.
+- The -110 control-transfer timeout storm appears ONLY at 3 concurrent streams and is the
+  precursor to controller death. Mechanism = control-transfer (EP0) starvation under
+  concurrent 3-stream bulk load + start-time control burst -> an endpoint left in a state
+  the GB10 xHCI cannot Stop -> stop-endpoint command times out -> Host halt fails -> HC died.
+- Proximate fatal step (xHCI fails to stop endpoint / halt) is an NVIDIA Tegra xHCI
+  robustness defect; the TRIGGER (3-stream control storm) is influenceable by librealsense.
+
+NOT YET ISOLATED (needs post-reboot guarded ramp):
+- whether 3 streams at LOWER resolution also crash (i.e., is it stream-count or aggregate
+  bandwidth), and whether staggered/serialized starts or a uvcvideo blacklist prevent it.

@@ -1,0 +1,6 @@
+Jun 03 09:01:57 spark-3066 kernel: usb 6-1: Failed to query (GET_CUR) UVC control 1 on unit 3: -110 (exp. 1024).
+Jun 03 09:02:02 spark-3066 kernel: usb 6-1: Failed to query (GET_CUR) UVC control 1 on unit 3: -110 (exp. 1024).
+Jun 03 09:02:07 spark-3066 kernel: xhci-hcd NVDA8000:02: xHCI host not responding to stop endpoint command
+Jun 03 09:02:07 spark-3066 kernel: xhci-hcd NVDA8000:02: Host halt failed, -110
+Jun 03 09:02:07 spark-3066 kernel: xhci-hcd NVDA8000:02: HC died; cleaning up
+Jun 03 09:02:07 spark-3066 kernel: usb 6-1: USB disconnect, device number 10

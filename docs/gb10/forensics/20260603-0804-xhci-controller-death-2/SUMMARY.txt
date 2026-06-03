@@ -1,0 +1,25 @@
+GB10 xHCI controller death #2 — 2026-06-03 08:04:09 (spark-3066, NVDA8000:00)
+
+TRIGGER (distinct from 2026-06-02 incident #1):
+  Incident #1 (06-02): 3x 848x480@60 concurrent bulk streams -> bandwidth/control starvation.
+  Incident #2 (06-03, THIS): a COLOR profile setup that failed to resolve
+    ("failed to set power state", color 848x480@60 BGR8) during rs-gb10-validate-patched.py,
+    issued a -110 control-transfer storm DURING SETUP (08:03:48-08:03:59), then the
+    pipeline teardown's Stop-Endpoint command timed out -> HC died (08:04:09).
+
+SIGNIFICANCE:
+  Confirms the GB10 Stop-Endpoint death (H7/P6) fires on ANY control-path failure,
+  not only bandwidth saturation. A failed profile setup is sufficient. This STRENGTHENS
+  the NVIDIA escalation: the controller cannot survive a Stop-Endpoint command after a
+  control-transfer error from any cause, with no recovery path (reboot required).
+
+PATCHED BUILD: RS2_GB10_USB_TUNING=1 (P2 deeper URB + P4 gentler stop + P3 usbfs advisory).
+  Patch contribution to THIS death: UNCONFIRMED but unlikely — for a single stream the P4
+  close() path is byte-identical to upstream (settle applies only between streamers). The
+  death came from color setup failure + its teardown, a path the userspace mitigations do
+  not (and cannot) address.
+
+CONTROL: single_depth_848x480@60 streamed cleanly first (59.89 fps, 0 gaps) on the SAME
+  patched build -> no regression on the valid single-stream path.
+
+RECOVERY: reboot required (HC died, GB10 has no xhci re-init path — see ANALYSIS 8.5).
