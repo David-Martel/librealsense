@@ -53,6 +53,29 @@ int main()
     assert( resolve_stop_settle_ms( "5000", 50 ) == 1000 );   // above ceiling -> clamp to MAX(1000)
     assert( resolve_stop_settle_ms( "x", 50 ) == 50 );        // non-numeric -> builtin default
 
+    // P7: is_dangerous_reacquire -- (live_count_before, total_acquired_before)
+    assert( is_dangerous_reacquire( 0, 0 ) == false );  // first ever acquire of this device
+    assert( is_dangerous_reacquire( 1, 1 ) == false );  // 2nd concurrent sensor, prior still live
+    assert( is_dangerous_reacquire( 2, 3 ) == false );  // more concurrent live handles -> normal session
+    assert( is_dangerous_reacquire( 0, 1 ) == true );   // fully released then acquired again -> churn
+    assert( is_dangerous_reacquire( 0, 5 ) == true );   // repeated churn cycles
+
+    // P7: resolve_reacquire_action -- (dangerous_reacquire, gb10_enabled, refuse_opt_in)
+    assert( resolve_reacquire_action( false, true,  false ) == reacquire_action::allow );  // not dangerous -> allow
+    assert( resolve_reacquire_action( false, true,  true  ) == reacquire_action::allow );  // not dangerous -> allow
+    assert( resolve_reacquire_action( true,  false, false ) == reacquire_action::allow );  // upstream disabled -> no-op
+    assert( resolve_reacquire_action( true,  false, true  ) == reacquire_action::allow );  // upstream disabled -> no-op
+    assert( resolve_reacquire_action( true,  true,  false ) == reacquire_action::warn );   // dangerous -> advisory warn
+    assert( resolve_reacquire_action( true,  true,  true  ) == reacquire_action::refuse ); // refuse opt-in -> hard fail
+
+    // P7: reacquire_advice -- names the device and the remediation
+    {
+        std::string msg = reacquire_advice( "2-1", 2 );
+        assert( !msg.empty() );
+        assert( msg.find( "2-1" ) != std::string::npos );       // names the offending device
+        assert( msg.find( "context" ) != std::string::npos );   // tells the caller to hold one context
+    }
+
     printf( "ALL_ASSERTIONS_PASSED\n" );
     return 0;
 }

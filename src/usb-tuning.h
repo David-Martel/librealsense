@@ -18,6 +18,7 @@
 //   P2 - configurable URB pool depth   : resolve_usb_request_count()
 //   P3 - usbfs_memory_mb preflight      : usbfs_memory_advice()
 //   P4 - gentler stop (watchdog + delay): watchdog_should_reset(), resolve_stop_settle_ms()
+//   P7 - device re-acquire guard        : resolve_reacquire_action(), reacquire_advice()
 //
 // Each tunable takes a compile-time builtin_default (raised in the GB10 build
 // profile, left at the conservative upstream value otherwise) plus an optional
@@ -118,6 +119,77 @@ inline int resolve_stop_settle_ms( const char* env_value, int builtin_default )
     if( chosen < MIN_STOP_SETTLE_MS ) chosen = MIN_STOP_SETTLE_MS;
     if( chosen > MAX_STOP_SETTLE_MS ) chosen = MAX_STOP_SETTLE_MS;
     return static_cast< int >( chosen );
+}
+
+// P7: mid-session device re-acquire guard.
+//
+// Controller-death #2 was NOT a bad profile or a bad link (the requested profile
+// resolved to a native one, and the link was USB-3.2). It was *churn*: an app that
+// destroyed and recreated its rs2::context/pipeline between streams released the
+// device back to the kernel uvcvideo driver, which immediately re-probed the UVC
+// control endpoints. On the GB10 xHCI that control-probe storm provokes a
+// Stop-Endpoint the controller cannot survive (HC died, reboot required).
+//
+// The safe pattern is to hold ONE context/pipeline for the process lifetime and
+// reconfigure via rs2::config instead of tearing it down. This guard DETECTS a
+// re-acquire of the SAME physical device after a full release -- the churn signature.
+// Note it fires at re-acquire (construction), which is AFTER the prior release that
+// already handed the device to uvcvideo; so on a single churn it detects rather than
+// prevents. Its real value is (a) an advisory that steers the developer to session-stable
+// ownership, and (b) halting a repeated stop/recreate LOOP early (REFUSE stops the next
+// cycle from releasing again). It is purely a decision: the call site only logs (WARN)
+// or throws (REFUSE); it never touches the kernel binding (auto-detaching uvcvideo is
+// the contraindicated P1/P5 that wedges the controller). RSUSB-only: the V4L2 production
+// backend never constructs usb_device_libusb and does not hit this path.
+enum class reacquire_action
+{
+    allow,   // first acquire, or guard disabled -> proceed silently
+    warn,    // GB10 re-acquire -> advisory log, proceed (default policy)
+    refuse,  // GB10 re-acquire with explicit opt-in -> hard fail before EP0 traffic
+};
+
+// Is this acquisition the dangerous churn re-acquire? The RSUSB backend constructs a
+// fresh usb_device_libusb PER SENSOR (depth, color, ...) within one legitimate session,
+// all keyed by the device's USB bus-port id and all alive concurrently -- so "has it ever
+// been constructed" cries wolf on the 2nd sensor. The lethal pattern (controller-death #2)
+// is a FULL release -- every live handle for the device destroyed (live_count fell to 0)
+// -- followed by a re-acquire. So it is dangerous only when there are zero live handles
+// AND the device was acquired at least once before.
+//  - live_count_before:     live usb_device_libusb instances for this device id, just
+//                           before this construction (0 means fully released).
+//  - total_acquired_before: how many times this device was successfully acquired before.
+inline bool is_dangerous_reacquire( int live_count_before, int total_acquired_before )
+{
+    return live_count_before == 0 && total_acquired_before > 0;
+}
+
+// Decide what to do for an acquisition.
+//  - dangerous_reacquire: from is_dangerous_reacquire().
+//  - gb10_enabled: pass GB10_TUNING_ENABLED; false upstream makes this a no-op.
+//  - refuse_opt_in: escalate warn->refuse only when the operator asks for it
+//    (RS2_GB10_REFUSE_REACQUIRE) -- default stays advisory so a valid app is never
+//    broken by the guard.
+inline reacquire_action resolve_reacquire_action( bool dangerous_reacquire, bool gb10_enabled, bool refuse_opt_in )
+{
+    if( !gb10_enabled || !dangerous_reacquire )
+        return reacquire_action::allow;
+    return refuse_opt_in ? reacquire_action::refuse : reacquire_action::warn;
+}
+
+// Human-readable remediation for a dangerous re-acquire, naming the device and the
+// fix (hold a single context). device_id is whatever stable id the call site has
+// (USB bus-port path / unique id).
+inline std::string reacquire_advice( const std::string& device_id, int prior_acquire_count )
+{
+    std::ostringstream os;
+    os << "RealSense device " << device_id << " re-acquired (" << ( prior_acquire_count + 1 )
+       << "x) within this process. On the GB10 xHCI this releases the device to the kernel "
+       << "uvcvideo driver, which re-probes UVC control endpoints and can wedge the USB host "
+       << "controller (controller-death #2). Hold a single rs2::context/pipeline for the "
+       << "process lifetime and reconfigure via rs2::config instead of destroying and "
+       << "recreating it. Set RS2_GB10_REFUSE_REACQUIRE=1 to hard-fail the re-acquire instead "
+       << "of warning.";
+    return os.str();
 }
 
 }} // namespace librealsense::usb_tuning
