@@ -1,25 +1,28 @@
 # GB10 librealsense fork — Hardening & Optimization Proposals (2026-06-05)
 
-**Status (updated 2026-06-05, master `f38fd3471`):** several P0/P1 items have since LANDED and were
-**live-validated controller-GREEN**; the rest remain proposed next steps.
+**Status (updated 2026-06-05, master `0a959dbc4`):** most P0/P1 items have LANDED and were
+**live-validated controller-GREEN**; the remainder are either deferred-with-rationale (can't pass a safe
+validation gate) or reclassified (needs consumer adoption).
 
 | item | what | status | commit / validation |
 |------|------|--------|---------------------|
-| **single-opener lock** | flock-per-device, refcounted — prevents the 2-PROCESS open (the #1 controller-death cause) | ✅ **DONE** | `08c0360cb` — Test A: 2nd process queues, never simultaneous, no leak/spin; Test B: same-process depth+color OK |
+| **single-opener lock** | flock-per-device, refcounted — prevents the 2-PROCESS open (the #1 controller-death cause); + **RAII release-on-throw guard** (fix self-lockout on ctor `bad_alloc`) | ✅ **DONE** | `08c0360cb` + `c818dd0eb` — Test A queues (never simultaneous), Test B depth+color OK, re-validated after the RAII fix |
 | **H1** | SAFE-STOP: relocate the read-endpoint `clear_halt` out of the post-stop teardown window into the settled start window | ✅ **DONE** | `f38fd3471` — 3× single-stream stop→start, frames resume each cycle, GREEN |
-| **H2 (F6)** | NDEBUG-safe `~usb_context` (interrupt + wake before join — no teardown hang on vigil's restart) | ✅ **DONE** | `8a08572e0` — compile-verified |
+| **H2 (F6)** | NDEBUG-safe `~usb_context` (interrupt + wake before join — no teardown hang on vigil's restart) | ✅ **DONE** | `8a08572e0` |
 | **H5 (F5)** | `_active` → `std::atomic<bool>` (event-thread/dtor data race) | ✅ **DONE** | `8a08572e0` |
 | (audit) | libusb error path: `errno`→`sts` classification, null-guard event-thread cb, catch-by-ref P7 reason | ✅ **DONE** | `ed0903a1a` |
-| **H3** | Teardown/health watchdog: detect a wedging controller, fail fast not hang | ⬜ **next** | OFFLINE unit + 2-STREAM HIL |
-| **H4** | Reconfigure-WITHOUT-`stop()` recovery (re-`config`, not destroy/recreate) — directly targets vigil's `restart_pipeline` | ⬜ **next (P1, high value)** | OFFLINE design + 2-STREAM HIL |
-| **H6 (F8)** | Bound the 100 ms URB-drain stacking across N streams on close | ⬜ next | OFFLINE + 2-STREAM HIL |
-| **H7 / H8** | Per-frame align-alloc reduction / USB-thread↔CUDA affinity pinning | ⬜ next (perf — **likely Finding-A-marginal; bench before building**) | OFFLINE bench (needs a number) |
+| **H3** | wedge-watchdog: **policy** (detector + teardown-deadline helpers, unit-tested) + **conservative wiring** (detect + LOG a WEDGING controller for tripwire/forensics) | ✅ **DONE (detect)** | policy `3d50a492f` (`just test-fast` PASS); wiring `468f7a9f7` (normal stream = 0 false-trips, GREEN). **Back-off action deferred** ↓ |
+| **H7 / H8** | align per-frame alloc / USB↔CUDA affinity pinning | ✅ **DONE — measured NO-GO** | `0a959dbc4` — align already caches (0 cudaMalloc/frame; churn = 1.6–1.8% of budget); affinity = no reproducible jitter win. `just bench-h7h8` |
+| **H3 back-off** | *act* on a wedge: back off the reset instead of just logging | ⬜ deferred (rationale) | can't pass a gate without inducing a real wedge (= the controller death) + false-positive back-off would suppress a legit transient reset |
+| **H4** | Reconfigure-WITHOUT-`stop()` recovery | 🔄 **reclassified — needs consumer adoption** | as a new API it only helps vigil if vigil (READ-ONLY) adopts it; the *transparent* equivalent (harden the SDK's own recovery) is H3, now landed. Revisit if a consumer opts in |
+| **lock fail-fast** | abort the 2nd opener instead of waiting-its-turn | ⬜ next (refinement) | current behavior is SAFE (never simultaneous); needs defeating the enumerator catch+re-enumerate to fail fast |
+| **H6 (F8)** | bound the 100 ms URB-drain stacking across N streams on close | ⬜ next | OFFLINE + 2-STREAM HIL |
 | **H9 (F10)** | gl-lane dtor / `atexit` shutdown (static-teardown GL UAF) | ⬜ next (P2 — test-bed/posebench only, not vigil) | OFFLINE + 1-STREAM HIL |
-| **H10** | Re-acquire state-machine hardening (P7 counter robustness) | ⬜ next | OFFLINE unit |
-| **lock fail-fast** | a variant that *aborts* the 2nd opener instead of queueing (clearer footgun UX) | ⬜ next (refinement) | needs defeating the enumerator swallow+retry |
+| **H10** | re-acquire state-machine hardening (P7 counter robustness) | ⬜ next | OFFLINE unit |
 
 **Original framing (still valid):** static reading of the GB10 code paths + the reliability audit, ranked by
-consumer relevance. The two highest-value items (H1 + the single-opener lock) are now landed + HIL-proven.
+consumer relevance. All of the high-value, safely-validatable hardening is now landed + HIL-proven; what
+remains is either un-validatable-without-controller-risk (H3 back-off, H6) or needs a consumer (H4).
 
 **Framing:** the primary consumer (`vigil-spark`, see `vigil-spark-integration.md`) is
 **unavoidably 2-stream** (color 640×480 bgr8@30 + depth 640×480 z16@30, one camera, one
