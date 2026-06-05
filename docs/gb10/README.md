@@ -26,6 +26,8 @@ Living/current docs have no date suffix.
 
 | doc | topic | status |
 |---|---|---|
+| [accel-validation](accel-validation-2026-06-05.md) | **CURRENT — live CUDA-vs-CPU validation:** pointcloud **1.8×** (cached pools flipped it from 0.57× regression to a win), align 15–19×, keep-on-GPU render 3.43ms no-D2H = meaningful; colorize/conversion = honest parity. + enhanced non-headless live PASS + reliability-fix status | current |
+| [reliability-audit](reliability-audit-2026-06-05.md) | **CURRENT — libusb error/recovery-path audit** (10 findings; 3 fixes applied: errno→sts classification, null-guard event-thread cb, catch-by-ref P7 reason) + 6 prioritized camera-HIL reliability tests | current |
 | [FINDINGS](FINDINGS-2026-06-03.md) | xHCI controller-death root cause (NVIDIA Stop-Endpoint defect) + P2/P3/P4/P7 mitigations | historical snapshot — root cause current; open items see ENHANCEMENT-TARGETS |
 | [HIL-RESULTS](HIL-RESULTS-2026-06-03.md), [HIL-MULTISTREAM](HIL-MULTISTREAM-2026-06-03.md) | single/multi-stream HIL survival envelope (eyes-open vs safe) | historical snapshot |
 | [HIL-SOAK-AND-ACCEL](HIL-SOAK-AND-ACCEL-2026-06-03.md) | long-soak + **per-op CUDA reality** (align 15-19×; pointcloud cached 3.3×; conversion neutral) | historical snapshot |
