@@ -5,9 +5,10 @@
 **Scope:** `realsense2_camera` (realsense-ros ~4.58) depth-only start on GB10 / DGX-Spark (ARM64),
 GB10 SDK `librealsense2 2.58.1`, D435 firmware **5.15.1.55**.
 
-> **The analysis below was offline/static. It has since been CONFIRMED by live HIL — see the
-> VERIFIED RESULT box.** Where the body still says "PENDING-HIL", read it as the pre-test framing;
-> the hypothesis (H1) held.
+> **The analysis below was offline/static. The minimal config it proposed is now HIL-VERIFIED to
+> stream cleanly — see the VERIFIED RESULT box.** That validates the *fix*, not conclusively the
+> *mechanism*: the run is consistent with H1 but did not isolate it (see the box's caveat). Where the
+> body still says "PENDING-HIL", read it as the pre-test framing.
 
 ---
 
@@ -24,12 +25,21 @@ depth-XU control pushed) **streams cleanly on GB10**:
 | `index 768 / 0x0300` | **2 benign startup warnings**, `EAGAIN` ("Resource temporarily unavailable, number: 11") — the SDK rides through them |
 | Controller | **GREEN** before and after (no `HC died`); camera stayed @ 5000M USB3; `/dev/video*` released cleanly |
 
-**H1 confirmed.** The stock node's depth-start failure was the contradictory **manual `depth_module.exposure=8500`
-write over the depth XU while auto-exposure is enabled** (the unwrapped `param_set_option` callback, fired by
-`rs_launch.py`'s declared default). Leaving AE on and not pushing a manual depth-XU value turns the prior **fatal**
-`0x0300` "Hardware Error" into the harmless `EAGAIN` warnings above. idx768 still fires once/twice at init (the
-node's AE-enable / HDR-disable still touches the XU) but no longer fatally. Deployable depth-only ROS2 path proven;
-Kilted rebuild (§ plan) is now an *enhancement* (wrap the callback / change defaults upstream), not a blocker.
+**Consistent with H1 — but the mechanism is NOT isolated.** The minimal config streams; that proves the *fix*,
+not the *root cause*. Three caveats keep this short of "H1 confirmed":
+1. **idx768 still fired** (twice). `rs_launch.py` still declares `depth_module.exposure=8500`, so the supposedly-fatal
+   manual-exposure-under-AE write may well still be happening — yet it streamed. So "removing that write is what fixed
+   it" is not what the evidence shows; at most the write now returns `EAGAIN` instead of failing.
+2. **The control selector is not observable** — the libusb layer logs only the index (768), never `wValue`. So
+   "these two idx768 warnings are different/benign ones" is indistinguishable from "the same writes, now `EAGAIN` for
+   an unrelated reason (controller state / timing)."
+3. **`initial_reset:=false` is a co-suspect.** The minimal config also dropped the startup `hardware_reset` — a
+   control-path stressor on a fragile xHCI that fits the earlier failure at least as well as H1. The run changed ~5
+   params at once vs an earlier, differently-configured failure; it was not a controlled A/B.
+
+What IS established: **the depth-only minimal config (AE on, no manual depth-XU push, no initial_reset) reliably
+streams on GB10.** The deployable path is proven. Pinning the exact culprit (single-variable A/B: re-introduce only
+`exposure:=8500`, then only `initial_reset:=true`) and the Kilted rebuild are follow-on *enhancements*, not blockers.
 
 ---
 

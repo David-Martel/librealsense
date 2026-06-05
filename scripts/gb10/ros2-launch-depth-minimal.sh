@@ -7,14 +7,14 @@
 #   release. The previously-FATAL control_transfer index 768 (0x0300) is reduced to 2 benign startup
 #   EAGAIN warnings ("Resource temporarily unavailable, number: 11"). Log: ros2-depth-minimal-*.log.
 #
-# ROOT CAUSE (confirmed, see docs/gb10/ros2-stream-start-analysis.md):
+# LIKELY CAUSE (consistent with H1 but NOT isolated — see docs/gb10/ros2-stream-start-analysis.md):
 # index 768 (0x0300) == the D4xx DEPTH EXTENSION UNIT (depth_xu, unit 3, iface 0 — src/ds/ds-private.h:70).
-# The stock node fails depth-start because rs_launch.py declares depth_module.exposure=8500, which the
-# UNWRAPPED parameter callback (sensor_params.cpp:71-74) writes as a MANUAL depth-XU exposure
-# (RS2_OPTION_EXPOSURE / DS5_EXPOSURE) WHILE auto-exposure is enabled — a contradictory depth-XU write the
-# D435 fw 5.15.1.55 rejects fatally. THE FIX: leave AUTO-EXPOSURE ON and do NOT push any manual depth-XU
-# control (exposure / emitter / preset / sync / json / reset). idx768 still fires once or twice at init
-# (the node's AE-enable / HDR-disable touches the XU) but now returns EAGAIN, which the SDK rides through.
+# The leading hypothesis is that the stock node's MANUAL depth-XU exposure write (rs_launch.py declares
+# depth_module.exposure=8500 → unwrapped param callback, sensor_params.cpp:71-74) WHILE auto-exposure is on
+# is what the D435 fw 5.15.1.55 rejected. CAVEAT: this run is not proof — idx768 still fired (the SDK now
+# rides the EAGAIN), the selector isn't logged, and this config ALSO disables initial_reset (a co-suspect).
+# WHAT'S PROVEN: this minimal set (AE ON, no manual depth-XU control, no initial_reset) reliably streams.
+# To pin the culprit, A/B one variable at a time (re-add only exposure:=8500; then only initial_reset:=true).
 #
 # SAFE-USE (the one-camera rule still applies):
 #   RUN SERIALLY, SINGLE-PROCESS, no concurrent heavy load (xHCI controller death is load-induced).
