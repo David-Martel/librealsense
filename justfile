@@ -72,6 +72,11 @@ test-unit:
 # All no-hardware tests.
 test: test-fast test-unit
 
+# Unit-test the CUDA cached pools (pointcloud + conversion): byte-identical mode0-vs-mode1 + grow-only
+# buffer correctness across a resolution sequence + mode selection. NO camera (needs the GPU).
+test-cached:
+    bash "{{repo_root}}/scripts/gb10/test-cached-pools.sh"
+
 # Smoke-test the rendering/display tools (compile sweep + offline self-test + CLI contract).
 # `just smoke-display` = offline only; `just smoke-display --live` adds a short on-screen validation.
 smoke-display *ARGS:
