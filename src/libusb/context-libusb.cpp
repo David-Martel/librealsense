@@ -66,9 +66,22 @@ namespace librealsense
         {
             if (_list)
                 libusb_free_device_list(_list, true);
-            assert(_handler_requests == 0); // we need the last libusb_close to trigger an event to stop the event thread
+            assert(_handler_requests == 0); // clean path: the last libusb_close stops the event thread
             if (_event_handler.joinable())
+            {
+#if defined(RS2_GB10_USB_TUNING)
+                // F6 (GB10 teardown-deadlock guard): if a handle outlived the context (_handler_requests
+                // != 0 — e.g. vigil's restart_pipeline tearing the context down mid-error), the event
+                // thread is still spinning in libusb_handle_events_completed and a bare join() HANGS
+                // teardown forever under -DNDEBUG (the assert above is compiled out). Force the thread
+                // out: set the kill flag AND wake the blocking call — the flag alone won't interrupt a
+                // thread already inside libusb_handle_events_completed. (libusb >= 1.0.21; host is 1.0.27.)
+                _kill_handler_thread = 1;
+                if (_ctx)
+                    libusb_interrupt_event_handler(_ctx);
+#endif
                 _event_handler.join();
+            }
             if (_ctx)
                 libusb_exit(_ctx);
         }
