@@ -172,12 +172,15 @@ hil-pc-zerocopy:
     done
     @echo "Expect: CACHED-DEV ~3x faster than BASELINE and faster than NEON (alloc churn was the cost, not the copy)."
 
-# NON-HEADLESS render verify: paint frames on $DISPLAY, x11grab the screen, prove real pixels (SAFE).
-hil-nonheadless:
+# NON-HEADLESS display + LIVE-VIDEO validation on the MAIN display: renders the live stream to an
+# on-screen window, x11grabs it, and PASS/FAILs on non-blank + displayed==captured (SSIM) + live (frames
+# change) + framerate + recorded NVENC clip + controller-green. Standardized/idempotent (timestamped
+# artifacts, tripwire). Default single COLOR stream (SAFE); `--depth` colorized depth; `--rgbd` (eyes-open).
+hil-nonheadless *ARGS:
     DISPLAY="${DISPLAY:-:1}" LD_LIBRARY_PATH="{{cuda_libs}}:{{hil_build_dir}}/Release" \
-      PYTHONPATH="{{hil_build_dir}}/Release:/opt/gb10-cuda/install/opencv/lib/python3.12/site-packages" \
+      PYTHONPATH="{{repo_root}}/scripts/gb10:{{hil_build_dir}}/Release:/opt/gb10-cuda/install/opencv/lib/python3.12/site-packages" \
       LRS_FFMPEG=/opt/gb10-cuda/install/ffmpeg/bin/ffmpeg \
-      "{{venv_python}}" "{{repo_root}}/scripts/gb10/rs-gb10-nonheadless-verify.py"
+      "{{venv_python}}" "{{repo_root}}/scripts/gb10/rs-gb10-nonheadless-verify.py" {{ARGS}}
 
 # Advanced single-stream HIL: CUDA colorize/pointcloud + cv2.cuda + NVENC + post-proc (SAFE).
 hil-advanced:
