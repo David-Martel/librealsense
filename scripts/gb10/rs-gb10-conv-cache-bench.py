@@ -45,7 +45,9 @@ import sys
 import time
 import argparse
 
-VENV_PYTHON = os.path.expanduser("~/realsense-gb10-validation/.venv/bin/python")
+VENV_PYTHON = os.environ.get(
+    "LRS_VENV", os.path.expanduser("~/realsense-gb10-validation/.venv/bin/python")
+)
 BUILD_ROOT   = os.path.expanduser("~/realsense-gb10-validation")
 SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
 GPU_PIPELINE = os.path.join(SCRIPT_DIR, "rs-gb10-gpu-pipeline.py")

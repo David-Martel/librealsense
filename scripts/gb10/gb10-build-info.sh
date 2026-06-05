@@ -11,7 +11,7 @@ REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 BUILD="${1:-$HOME/realsense-gb10-validation/build-gb10-full}"
 OUT="${2:-$BUILD/BUILD_PROVENANCE.json}"
 CACHE="$BUILD/CMakeCache.txt"
-cd "$REPO"
+cd "$REPO" || { echo "ERROR: cannot cd to repo root: $REPO" >&2; exit 1; }
 
 opt() { grep -m1 "^$1[:=]" "$CACHE" 2>/dev/null | sed 's/^[^=]*=//' || true; }
 gd=$(git describe --tags --always --dirty 2>/dev/null || echo unknown)

@@ -81,7 +81,7 @@ fi
 
 # Probe input duration (seconds, float) via ffprobe-compatible -v quiet output.
 # ffmpeg -i exits 1 (no output file specified) — || true prevents pipefail abort.
-INPUT_DURATION=$(("$FFMPEG" -hide_banner -i "$INPUT" 2>&1 || true) | \
+INPUT_DURATION=$( ("$FFMPEG" -hide_banner -i "$INPUT" 2>&1 || true) | \
     grep Duration | sed 's/.*Duration: \([0-9:\.]*\).*/\1/' | \
     awk -F: '{ print ($1*3600)+($2*60)+$3 }')
 INPUT_SIZE=$(stat -c%s "$INPUT")

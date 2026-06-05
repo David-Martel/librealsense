@@ -3,13 +3,17 @@
 # new system/user needs, with PASS/WARN/FAIL, so problems are self-diagnosable. Does NOT open the
 # camera (only checks USB presence). Run via `just gb10-doctor`.
 set -uo pipefail
-VENV="${LRS_VENV:-$HOME/realsense-gb10-validation/.venv/bin/python}"
-FULL="$HOME/realsense-gb10-validation/build-gb10-full/Release"
-OPENCV=/opt/gb10-cuda/install/opencv
-FFLIB=/opt/gb10-cuda/install/ffmpeg/lib
+SG="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=scripts/gb10/gb10-env.sh
+source "$SG/gb10-env.sh"   # single source of truth: tag-aware LRS_VENV/LRS_BUILD_RELEASE/LRS_PY_TAG/opencv/ffmpeg
+VENV="$LRS_VENV"
+FULL="$LRS_BUILD_RELEASE"
+OPENCV="$LRS_OPENCV_BASE"
+FFLIB="$LRS_FFMPEG_BASE/lib"
+PYVER="${LRS_PY_TAG#python}"        # ABI this build/venv targets (3.12 / 3.13 / 3.14), from LRS_PY_TAG
 SDK=/opt/vigil/opt/librealsense-v2.58.1-dgx-spark-gb10
 CUDA="${CUDA_HOME:-/usr/local/cuda}"
-REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+REPO="$(cd "$SG/../.." && pwd)"
 
 fails=0; warns=0
 P() { printf '  \033[32m[PASS]\033[0m %s\n' "$1"; }
@@ -19,13 +23,13 @@ F() { printf '  \033[31m[FAIL]\033[0m %s\n' "$1"; fails=$((fails+1)); }
 echo "==================== GB10 RealSense doctor ===================="
 
 echo "-- toolchain & runtime --"
-[ -x "$VENV" ] && { v=$("$VENV" -c 'import sys;print("%d.%d"%sys.version_info[:2])'); [ "$v" = 3.12 ] && P "venv python $v" || W "venv python is $v (expected 3.12 for the cpython-312 pyrealsense2)"; } || F "venv python missing ($VENV)"
+[ -x "$VENV" ] && { v=$("$VENV" -c 'import sys;print("%d.%d"%sys.version_info[:2])'); [ "$v" = "$PYVER" ] && P "venv python $v (LRS_PY_TAG=$LRS_PY_TAG)" || W "venv python is $v (expected $PYVER for LRS_PY_TAG=$LRS_PY_TAG)"; } || F "venv python missing ($VENV)"
 [ -x "$CUDA/bin/nvcc" ] && P "CUDA $("$CUDA/bin/nvcc" --version | grep -oE 'release [0-9.]+' | awk '{print $2}')" || W "nvcc not found at $CUDA/bin (CUDA builds need it)"
 command -v gcc >/dev/null && P "gcc $(gcc -dumpfullversion)" || F "gcc missing"
 
 echo "-- librealsense GB10 build --"
-SO="$FULL/pyrealsense2.cpython-312-aarch64-linux-gnu.so"
-if [ -e "$SO" ]; then
+SO="$(compgen -G "$FULL/pyrealsense2.cpython-*-aarch64-linux-gnu.so" 2>/dev/null | head -1 || true)"
+if [ -n "$SO" ] && [ -e "$SO" ]; then
   if LD_LIBRARY_PATH="$FULL" PYTHONPATH="$FULL" "$VENV" -c "import pyrealsense2 as r;assert r.__version__" 2>/dev/null; then
     P "pyrealsense2 imports ($(LD_LIBRARY_PATH=$FULL PYTHONPATH=$FULL "$VENV" -c 'import pyrealsense2 as r;print(r.__version__)' 2>/dev/null))"
   else F "pyrealsense2 present but fails to import (ABI mismatch? check venv python version)"; fi
@@ -34,7 +38,7 @@ else F "build-gb10-full pyrealsense2 missing — run scripts/build-dgx-spark-gb1
 
 echo "-- cv2 / opencv / ffmpeg (display + quality tools) --"
 if [ -d "$OPENCV/lib" ] && [ -d "$FFLIB" ]; then
-  if LD_LIBRARY_PATH="$OPENCV/lib:$FFLIB" PYTHONPATH="$OPENCV/lib/python3.12/site-packages" "$VENV" -c "import cv2" 2>/dev/null; then
+  if LD_LIBRARY_PATH="$OPENCV/lib:$FFLIB" PYTHONPATH="$OPENCV/lib/$LRS_PY_TAG/site-packages" "$VENV" -c "import cv2" 2>/dev/null; then
     P "cv2 imports (opencv/lib + ffmpeg/lib on LD_LIBRARY_PATH)"
   else F "cv2 import fails — need BOTH $OPENCV/lib AND $FFLIB on LD_LIBRARY_PATH (libswresample.so.6)"; fi
 else W "gb10-cuda opencv/ffmpeg not at /opt/gb10-cuda/install (display/quality tools unavailable)"; fi
