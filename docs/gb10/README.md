@@ -26,19 +26,28 @@ to the per-frame-malloc baseline. `rs.align` is already cached upstream (no flag
 | [QUALITY-RESULTS](QUALITY-RESULTS-2026-06-03.md) | NVENC encode fidelity (SSIM/XPSNR) |
 | [POSE-PIPELINE-TESTBED-PLAN](POSE-PIPELINE-TESTBED-PLAN-2026-06-03.md) | RealSense→3D-pose→render test bed — **live-proven on hardware** |
 | [FORK-VS-UPSTREAM-AND-CAMERA-FIRMWARE](FORK-VS-UPSTREAM-AND-CAMERA-FIRMWARE-2026-06-03.md) | fork-vs-upstream diff + firmware (downgrade device-blocked; HOLD 5.15.1.55) |
+| [ROS2-GL-PINNED-FINDINGS](ROS2-GL-PINNED-FINDINGS-2026-06-05.md) | parallel-agent results: ROS2 Jazzy builds vs GB10 SDK; keep-on-GPU GL measured win; pinned-mem DROPPED (harmful on coherent memory); py3.13/3.14 re-target plan |
+| [ENHANCEMENT-TARGETS](ENHANCEMENT-TARGETS-2026-06-05.md) | graded open items — R1-R4+P1+U3 all DONE; remaining: P2 filters, P3 depth-format cache, P4 async, O1/O2/O3 ROS2/py |
 | [nvidia-escalation/](nvidia-escalation/) | drafted NVIDIA bug report for the xHCI defect |
 
 ## Tooling — `../../scripts/gb10/` (driven by the repo-root `justfile`; run `just`)
 Build: `just build` / `build-hil`. Tests (no HW): `just test`. HIL (needs D435 on USB-3): `just hil-*`.
 Key benchmarks: `hil-align-bench`, `hil-cuda-bench`, `hil-pc-zerocopy`, `hil-gpu-pipeline [--convert-only]`,
-`rs-gb10-conv-cache-bench.py`, `hil-quality`, `trt-probe`. Firmware status: `just fw-status`. See
-[`../../scripts/gb10/README.md`](../../scripts/gb10/README.md) for every tool + its safety class.
+`rs-gb10-conv-cache-bench.py`, `hil-quality`, `trt-probe`. Firmware status: `just fw-status`.
+Additional recipes (all no-camera where noted):
+- `just test-cached` — CUDA cached-pool byte-identity tests (GPU, no camera; R4)
+- `just gb10-doctor` — one-command runtime preflight: toolchain, pyrealsense2, cv2/opencv/ffmpeg, CUDA, GL SDK, DISPLAY, NVENC, controller health, camera+USB-3 (U3)
+- `just hil-keepongpu` — P1 keep-on-GPU depth viewer: `gl::colorizer` output stays a GL texture, drawn straight to screen (no D2H); R2 teardown-order fixed
+- `just build-info [build_dir]` — emit/inspect `BUILD_PROVENANCE.json` (git tag+commit, actual compile options, toolchain, `.so` sha, reproduce command)
+- `just build-tag` — current source state (`git describe --tags --dirty`; current: `v2.58.1-gb10.1-4-g935294c5c`)
+See [`../../scripts/gb10/README.md`](../../scripts/gb10/README.md) for every tool + its safety class.
 
 ## Build provenance & reproducibility
 Every GB10 build records exactly how it was made so it can be reproduced on another system, and so you
 can verify a binary reflects the latest source.
-- **Tag:** the source tree is tagged `v2.58.1-gb10.1` (upstream 2.58.1 + the David-Martel GB10 build). `just
-  build-tag` (= `git describe --tags --dirty`) shows the current state (a `-dirty`/`-N-g<sha>` suffix means
+- **Tag:** the source tree is tagged `v2.58.1-gb10.1` (upstream 2.58.1 + the David-Martel GB10 build). Current
+  head: `v2.58.1-gb10.1-4-g935294c5c` (4 commits ahead of the tag). `just build-tag`
+  (= `git describe --tags --dirty`) shows the current state (a `-dirty`/`-N-g<sha>` suffix means
   uncommitted/ahead of the tag).
 - **Manifest:** `just build-info [build_dir]` writes `BUILD_PROVENANCE.json` next to the binary, capturing the
   git describe+commit, the **actual** compile options (read from the build's `CMakeCache.txt` — `RS2_GB10_*`,

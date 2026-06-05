@@ -15,9 +15,9 @@ the doc that measured them. Updated 2026-06-05 @ master f1abbcb8c.
 ## Performance (measured or high-surface)
 | # | target | evidence | expected | effort |
 |---|--------|----------|----------|--------|
-| P1 | Keep-on-GPU colorize→render — **✅ DONE** | live viewer `rs-gb10-keepongpu-viewer.cpp` (`just hil-keepongpu`): live depth → `gl::colorizer` (GL texture) → drawn straight to the on-screen window, **NO D2H** | **Verified live: `GL_RENDERER=NVIDIA GB10/PCIe`, 28fps, render p50 3.5ms/frame, controller GREEN, clean teardown (R2).** Avoids the D2H the cv2 path pays (~3ms@720p). | DONE |
+| P1 | Keep-on-GPU colorize→render — **✅ DONE (+ enhanced)** | live viewer `rs-gb10-keepongpu-viewer.cpp` (`just hil-keepongpu`): live depth → `gl::colorizer` (GL texture) → drawn straight to the on-screen window, **NO D2H**. Enhanced: **`--record` NVENC GPU-to-disk** + rich per-frame telemetry (ts/domain/exposure/fps/render-p50) + `--stream color`. | **Verified live: NVIDIA GB10/PCIe, render p50 3.4ms, NVENC mp4 written, live auto-exposure metadata, controller GREEN, clean teardown (R2) even with record.** | DONE |
 | P2 | **Scalar post-proc filters have ZERO acceleration** | spatial 499L, temporal 282L, hole-filling 103L, decimation/disparity/threshold — 0 NEON/OMP/CUDA hits | NEON+OpenMP (cross-platform, no GPU copy) — only if a live consumer enables them (opt-in) | M, gated on consumer need |
-| P3 | **depth-format conversion CUDA path untested** | gated on same `is_gpu_available()`; never benchmarked | likely neutral (like color conversion) — measure to confirm, then cache like the others | S |
+| P3 | depth-format conversion CUDA path — **✅ MEASURED, don't cache** | `bench_depth_format_cuda.cu`: Y8I (both-IR) is the hot per-frame path (Y12I is cold/calibration); both have the same per-frame `cudaMalloc` churn as YUYV | caching would save ~57–65% kernel-level (~140–283µs/call) BUT end-to-end is expected plumbing-bound/neutral (Finding A) — **verdict: don't cache**; the real lever for depth latency is keep-on-GPU/async (P1/P4), not per-helper caching | DONE |
 | P4 | **No async pipelining** (single synchronous call per frame) | pinned-mem experiment showed copies aren't the bottleneck; sync IS | double-buffer + CUDA streams to overlap H2D(N+1)/compute(N) — bigger restructure, real for high-fps multi-op | L |
 
 ## Usability
