@@ -241,6 +241,11 @@ build-info build_dir=hil_build_dir:
 build-tag:
     @git -C "{{repo_root}}" describe --tags --always --dirty
 
+# Environment doctor: check every GB10 runtime prerequisite (toolchain, pyrealsense2, cv2 libs, CUDA,
+# display, GL SDK, NVENC, controller health, camera presence) with PASS/WARN/FAIL. Does NOT open the camera.
+gb10-doctor:
+    bash "{{repo_root}}/scripts/gb10/gb10-doctor.sh"
+
 # Show the GB10 findings + open items.
 findings:
     @sed -n '1,40p' "{{repo_root}}/docs/gb10/FINDINGS-2026-06-03.md"

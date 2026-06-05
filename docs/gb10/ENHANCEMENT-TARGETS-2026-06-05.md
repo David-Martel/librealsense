@@ -25,7 +25,7 @@ the doc that measured them. Updated 2026-06-05 @ master f1abbcb8c.
 |---|--------|----------|-----|--------|
 | U1 | **Cached-bench mode label cosmetics** — reports `pc_mode: "0"` when the compiled default is now 1 (env unset) | `rs-gb10-pc-zerocopy.py` env-default label | report "(compiled default)" when env unset | XS |
 | U2 | **ABI trap** (FindPython grabbing 3.15) | — | **already mitigated** (build script ABI guard, lines 13-19) | DONE |
-| U3 | one-command GB10 setup / `just` doctor target (env + opencv + venv checks) | scattered env in justfile recipes | a `just gb10-doctor` preflight | S |
+| U3 | one-command GB10 environment doctor — **✅ DONE** | `scripts/gb10/gb10-doctor.sh` (`just gb10-doctor`) | PASS/WARN/FAIL over toolchain, pyrealsense2 import, cv2 (opencv+ffmpeg libs), CUDA, GL SDK, DISPLAY, NVENC, controller health, camera + USB-3 — no device opened. Robust to `set -o pipefail`+`grep -q` SIGPIPE. HEALTHY. | DONE |
 
 ## Other / integration
 | # | target | evidence | effort |
