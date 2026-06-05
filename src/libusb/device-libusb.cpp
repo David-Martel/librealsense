@@ -10,6 +10,13 @@
 #include <unordered_map>   // P7 re-acquire guard: per-process device acquire counter.
 #include <stdexcept>       // P7 re-acquire guard: std::runtime_error on REFUSE.
 #include <cstdlib>         // P7 re-acquire guard: std::getenv for the refuse opt-in.
+#if defined(RS2_GB10_USB_TUNING) && RS2_GB10_USB_TUNING && (defined(__linux__) || defined(__APPLE__))
+#include <cctype>          // single-opener guard: sanitize the device id into a lockfile name.
+#include <sys/file.h>      // single-opener guard: flock() — cross-process exclusive device lock.
+#include <fcntl.h>         // single-opener guard: open() the lockfile.
+#include <unistd.h>        // single-opener guard: close().
+#define RS2_GB10_SINGLE_OPENER_LOCK 1
+#endif
 
 namespace
 {
@@ -58,6 +65,12 @@ namespace
     std::mutex& reacquire_mutex() { static std::mutex m; return m; }
     std::unordered_map< std::string, int >& reacquire_live()  { static std::unordered_map< std::string, int > m; return m; }
     std::unordered_map< std::string, int >& reacquire_total() { static std::unordered_map< std::string, int > m; return m; }
+
+#if defined(RS2_GB10_SINGLE_OPENER_LOCK)
+    // Forward declarations (defined below) — used by commit/release_device_acquire above their definition.
+    void acquire_single_opener_locked( const std::string& device_id );
+    void release_single_opener_locked( const std::string& device_id ) noexcept;
+#endif
 
     // Read-only decision at construction start. May throw (REFUSE) — which aborts the
     // construction before any commit, keeping the live/total counters balanced.
@@ -109,6 +122,10 @@ namespace
         auto& live = reacquire_live()[device_id];
         if( live > 0 )
             --live;
+#if defined(RS2_GB10_SINGLE_OPENER_LOCK)
+        // Release the cross-process flock once the LAST sensor of this device closes in this process.
+        release_single_opener_locked( device_id );
+#endif
     }
 
     // Stable per-device key: USB bus-port path, falling back to the descriptor serial.
@@ -116,6 +133,79 @@ namespace
     {
         return info.unique_id.empty() ? info.serial : info.unique_id;
     }
+
+    // --- Single-opener cross-process lock (H1 companion) -----------------------------------------
+    // Prevents the prohibited 2-PROCESS open of one physical device — the #1 GB10 xHCI controller-death
+    // cause (two libusb_open()s on the same camera => a -110 storm that wedges the controller => reboot).
+    // A single process legitimately opens the device's multiple sensors (depth, color); that is refcounted
+    // on a DEDICATED counter (device_lock_refcount — NOT reacquire_live, which isn't bumped until commit,
+    // late in the ctor, so it would let a concurrent second sensor re-flock). ONE flock is held per device
+    // per process; a DIFFERENT process's flock(LOCK_EX|LOCK_NB) gets EAGAIN — we throw (the enumerator
+    // swallows it and retries, queueing the 2nd process until this one closes — so the two never open
+    // simultaneously). flock auto-releases when the holding process dies (no stale lock after a crash,
+    // unlike a PID-file). Acquired BEFORE libusb_ref_device() so a conflict leaks no ref across retries.
+#if defined(RS2_GB10_SINGLE_OPENER_LOCK)
+    std::unordered_map< std::string, int >& device_lock_fd()       { static std::unordered_map< std::string, int > m; return m; }
+    std::unordered_map< std::string, int >& device_lock_refcount() { static std::unordered_map< std::string, int > m; return m; }
+
+    std::string single_opener_lockfile( const std::string& device_id )
+    {
+        std::string s = "/tmp/librealsense-gb10-dev-";
+        for( char c : device_id )
+            s += ( std::isalnum( static_cast<unsigned char>(c) ) ? c : '_' );
+        return s + ".lock";
+    }
+
+    // Caller MUST hold reacquire_mutex(). Acquire the cross-process flock on the FIRST sensor of this
+    // device in this process; refcount on the rest. Throws (without leaving any state) if another PROCESS
+    // holds the device. The refcount bump and the flock are atomic under the mutex (no second-sensor race).
+    void acquire_single_opener_locked( const std::string& device_id )
+    {
+        int& rc = device_lock_refcount()[device_id];
+        if( rc > 0 ) { ++rc; return; }   // already held by THIS process (another sensor) — refcount only
+        const std::string path = single_opener_lockfile( device_id );
+        int fd = ::open( path.c_str(), O_RDWR | O_CREAT, 0666 );
+        if( fd < 0 )
+        {
+            // Best-effort: if the lockfile can't be created (e.g. /tmp not writable) do NOT block a
+            // legitimate single opener — degrade to no cross-process lock (still refcount so release balances).
+            LOG_WARNING( "single-opener guard: cannot open lockfile " << path << " — proceeding without the cross-process lock" );
+            rc = 1;
+            return;
+        }
+        if( ::flock( fd, LOCK_EX | LOCK_NB ) != 0 )
+        {
+            ::close( fd );   // rc NOT bumped, no fd stored => a refused/retried open leaks nothing
+            const std::string msg = "RealSense device " + device_id + " is already open in another process; "
+                "the GB10 single-opener guard refused this open to avoid a 2-process xHCI controller wedge "
+                "(close the other process, or unset RS2_GB10_USB_TUNING).";
+            LOG_ERROR( msg );
+            throw std::runtime_error( msg );
+        }
+        device_lock_fd()[device_id] = fd;
+        rc = 1;
+    }
+
+    // Caller MUST hold reacquire_mutex(). Drop one ref; release the flock when this process's LAST sensor
+    // of the device closes. noexcept (destructor path).
+    void release_single_opener_locked( const std::string& device_id ) noexcept
+    {
+        auto rit = device_lock_refcount().find( device_id );
+        if( rit == device_lock_refcount().end() || rit->second <= 0 )
+            return;
+        if( --rit->second == 0 )
+        {
+            auto it = device_lock_fd().find( device_id );
+            if( it != device_lock_fd().end() )
+            {
+                ::flock( it->second, LOCK_UN );
+                ::close( it->second );
+                device_lock_fd().erase( it );
+            }
+            device_lock_refcount().erase( rit );
+        }
+    }
+#endif  // RS2_GB10_SINGLE_OPENER_LOCK
 #endif  // RS2_GB10_USB_TUNING
 } // anonymous namespace
 
@@ -133,6 +223,17 @@ namespace librealsense
             // churn) before doing any work. May throw under RS2_GB10_REFUSE_REACQUIRE.
 #if defined(RS2_GB10_USB_TUNING) && RS2_GB10_USB_TUNING
             check_device_reacquire( reacquire_device_id( info ) );
+#endif
+#if defined(RS2_GB10_SINGLE_OPENER_LOCK)
+            // Single-opener cross-process lock — acquired here, BEFORE libusb_ref_device() and the
+            // descriptor work below, so that on a conflict (another process holds the device) the throw
+            // leaks nothing: the enumeration path is RETRIED by create_usb_device() on a swallowed throw,
+            // and acquiring after the ref would leak one libusb_ref per retry. Held for the device's
+            // lifetime (released in the destructor when this process's last sensor of the device closes).
+            {
+                std::lock_guard< std::mutex > lock( reacquire_mutex() );
+                acquire_single_opener_locked( reacquire_device_id( info ) );
+            }
 #endif
 
             usb_descriptor ud = {desc.bLength, desc.bDescriptorType, std::vector<uint8_t>(desc.bLength)};
