@@ -114,6 +114,20 @@ namespace librealsense
                        uint64_t now_ms = static_cast<uint64_t>(
                            std::chrono::duration_cast<std::chrono::milliseconds>(
                                std::chrono::steady_clock::now().time_since_epoch()).count());
+
+                       // H3: a watchdog fire = a frame-arrival stall (what a -110 storm produces). Record
+                       // it; if stalls keep arriving in a short window despite the rate-limited resets, the
+                       // controller is WEDGING — the resets are not helping and may be finishing the kill.
+                       // Surface it loudly (the HIL tripwire / forensics watch for this) so a failing
+                       // controller is diagnosable. (Backing off the reset on a wedge is the follow-up
+                       // survivability action; it needs a safe wedge-repro to validate, so not done here.)
+                       _wedge_tracker.record_timeout(static_cast<double>(now_ms));
+                       if(_wedge_tracker.is_wedging(static_cast<double>(now_ms)))
+                           LOG_ERROR("GB10 controller WEDGING: " << _wedge_tracker.count_in_window(static_cast<double>(now_ms))
+                                     << " stalls within " << librealsense::usb_tuning::DEFAULT_WEDGE_WINDOW_MS
+                                     << " ms on endpoint " << (int)_read_endpoint->get_address()
+                                     << " — the resets are not recovering it; the controller may be failing.");
+
                        if(librealsense::usb_tuning::watchdog_should_reset(
                                now_ms, _last_reset_ms, librealsense::usb_tuning::WATCHDOG_MIN_RESET_INTERVAL))
                        {

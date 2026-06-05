@@ -4,6 +4,7 @@
 #pragma once
 #include "uvc-types.h"
 #include "uvc-device.h"
+#include "../usb-tuning.h"   // H3: usb_tuning::wedge_tracker (controller-wedge detection)
 
 #include "stdio.h"
 #include "stdlib.h"
@@ -54,6 +55,15 @@ namespace librealsense
             // Serialized by _action_dispatcher (watchdog runs inside invoke), so a
             // plain uint64_t is sufficient — no atomic needed.
             uint64_t _last_reset_ms = 0;
+
+#if defined(RS2_GB10_USB_TUNING) && RS2_GB10_USB_TUNING
+            // H3: tracks watchdog-fire (stall) bursts to detect a WEDGING controller — i.e. one whose
+            // stalls keep coming despite the rate-limited resets (the failing-controller signature).
+            // Same _action_dispatcher serialization as _last_reset_ms, so no atomic needed. Detect +
+            // LOG only for now (forensic/tripwire visibility); the back-off action is a follow-up that
+            // needs a safe wedge-repro to validate.
+            usb_tuning::wedge_tracker _wedge_tracker;
+#endif
 
             int64_t _watchdog_timeout;
             uvc_streamer_context _context;
