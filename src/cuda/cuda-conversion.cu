@@ -20,11 +20,19 @@
 #if defined(RS2_GB10_CONV_CACHE)
 #include <mutex>
 #include <cstdlib>
+#include <stdexcept>
+#include <string>
 namespace {
     int rs2_conv_mode() {
         static int m = -1;
         if (m < 0) { const char* e = std::getenv("RS2_CONV_MODE"); m = e ? std::atoi(e) : 1; }  // default 1 = cached (promoted)
         return m;
+    }
+    // Checked CUDA errors: -DNDEBUG strips asserts in the Release/GB10 build, so a failed cudaMalloc/
+    // cudaMemcpy on the now-default cached path would go unchecked (silent corruption). Throw instead.
+    inline void cuda_or_throw(cudaError_t r, const char* what) {
+        if (r != cudaSuccess)
+            throw std::runtime_error(std::string("GB10 conversion CUDA failure (") + what + "): " + cudaGetErrorString(r));
     }
     struct conv_cache_buffers {
         std::mutex mtx;
@@ -41,15 +49,13 @@ namespace {
         void ensure_src(size_t bytes) {
             if (d_src && src_cap >= bytes) return;
             if (d_src) cudaFree(d_src);
-            cudaError_t r = cudaMalloc((void**)&d_src, bytes);
-            assert(r == cudaSuccess); (void)r;
+            cuda_or_throw(cudaMalloc((void**)&d_src, bytes), "alloc d_src");
             src_cap = bytes;
         }
         void ensure_dst(size_t bytes) {
             if (d_dst && dst_cap >= bytes) return;
             if (d_dst) cudaFree(d_dst);
-            cudaError_t r = cudaMalloc((void**)&d_dst, bytes);
-            assert(r == cudaSuccess); (void)r;
+            cuda_or_throw(cudaMalloc((void**)&d_dst, bytes), "alloc d_dst");
             dst_cap = bytes;
         }
     };
@@ -336,8 +342,7 @@ void rscuda::unpack_yuy2_cuda_helper(const uint8_t* h_src, uint8_t* h_dst, int n
         b.ensure_src(src_bytes);
         b.ensure_dst(dst_bytes);
 
-        cudaError_t result = cudaMemcpy(b.d_src, h_src, src_bytes, cudaMemcpyHostToDevice);
-        assert(result == cudaSuccess);
+        cuda_or_throw(cudaMemcpy(b.d_src, h_src, src_bytes, cudaMemcpyHostToDevice), "H2D src");
 
         switch (format) {
         case RS2_FORMAT_Y16:
@@ -356,15 +361,11 @@ void rscuda::unpack_yuy2_cuda_helper(const uint8_t* h_src, uint8_t* h_dst, int n
             kernel_unpack_yuy2_bgra8_cuda << <numBlocks, RS2_CUDA_THREADS_PER_BLOCK >> > (b.d_src, b.d_dst, superPix);
             break;
         default:
-            assert(false);
+            throw std::runtime_error("GB10 conversion: unsupported format in cached unpack_yuy2");
         }
-        result = cudaGetLastError();
-        assert(result == cudaSuccess);
-
-        cudaStreamSynchronize(0);
-
-        result = cudaMemcpy(h_dst, b.d_dst, dst_bytes, cudaMemcpyDeviceToHost);
-        assert(result == cudaSuccess);
+        cuda_or_throw(cudaGetLastError(), "kernel launch");
+        cuda_or_throw(cudaStreamSynchronize(0), "sync");
+        cuda_or_throw(cudaMemcpy(h_dst, b.d_dst, dst_bytes, cudaMemcpyDeviceToHost), "D2H dst");
         return;
     }
     // mode 0 (or unrecognized) falls through to the unmodified baseline below

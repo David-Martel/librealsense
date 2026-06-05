@@ -15,11 +15,20 @@
 #include <mutex>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
+#include <string>
 namespace {
     int rs2_pc_mode() {
         static int m = -1;
         if (m < 0) { const char* e = std::getenv("RS2_PC_MODE"); m = e ? std::atoi(e) : 1; }  // default 1 = cached-device (promoted)
         return m;
+    }
+    // Checked CUDA error handling: asserts are stripped by -DNDEBUG in the Release/GB10 build, so a
+    // failed cudaMalloc/cudaMemcpy would go UNCHECKED on the now-default cached path (silent corruption).
+    // Throw instead so the failure is visible; happy path is unchanged.
+    inline void cuda_or_throw(cudaError_t r, const char* what) {
+        if (r != cudaSuccess)
+            throw std::runtime_error(std::string("GB10 pointcloud CUDA failure (") + what + "): " + cudaGetErrorString(r));
     }
     struct pc_zc_buffers {
         std::mutex mtx;
@@ -34,10 +43,10 @@ namespace {
             free_all(); managed = want_managed;
             auto alloc = [&](void** p, size_t bytes) {
                 return want_managed ? cudaMallocManaged(p, bytes) : cudaMalloc(p, bytes); };
-            cudaError_t r = alloc((void**)&d_points, (size_t)count * sizeof(float) * 3);
-            r = alloc((void**)&d_depth, (size_t)count * sizeof(uint16_t));
-            r = alloc((void**)&d_intrin, sizeof(rs2_intrinsics));
-            assert(r == cudaSuccess); (void)r; cap = count;
+            cuda_or_throw(alloc((void**)&d_points, (size_t)count * sizeof(float) * 3), "alloc d_points");
+            cuda_or_throw(alloc((void**)&d_depth, (size_t)count * sizeof(uint16_t)), "alloc d_depth");
+            cuda_or_throw(alloc((void**)&d_intrin, sizeof(rs2_intrinsics)), "alloc d_intrin");
+            cap = count;
         }
     };
     pc_zc_buffers& pc_zc() { static pc_zc_buffers b; return b; }
@@ -137,13 +146,14 @@ void rscuda::deproject_depth_cuda(float * points, const rs2_intrinsics & intrin,
             std::memcpy(b.d_depth, depth, (size_t)count * sizeof(uint16_t));
             std::memcpy(b.d_intrin, &intrin, sizeof(rs2_intrinsics));
         } else {                                        // cached device buffers, still cudaMemcpy
-            cudaMemcpy(b.d_depth, depth, (size_t)count * sizeof(uint16_t), cudaMemcpyHostToDevice);
-            cudaMemcpy(b.d_intrin, &intrin, sizeof(rs2_intrinsics), cudaMemcpyHostToDevice);
+            cuda_or_throw(cudaMemcpy(b.d_depth, depth, (size_t)count * sizeof(uint16_t), cudaMemcpyHostToDevice), "H2D depth");
+            cuda_or_throw(cudaMemcpy(b.d_intrin, &intrin, sizeof(rs2_intrinsics), cudaMemcpyHostToDevice), "H2D intrin");
         }
         kernel_deproject_depth_cuda<<<nb, RS2_CUDA_THREADS_PER_BLOCK>>>(b.d_points, b.d_intrin, b.d_depth, depth_scale);
-        cudaDeviceSynchronize();                        // explicit sync (D2H memcpy used to provide it)
+        cuda_or_throw(cudaGetLastError(), "kernel launch");
+        cuda_or_throw(cudaDeviceSynchronize(), "sync");  // explicit sync (D2H memcpy used to provide it)
         if (managed) std::memcpy(points, b.d_points, (size_t)count * sizeof(float) * 3);
-        else cudaMemcpy(points, b.d_points, (size_t)count * sizeof(float) * 3, cudaMemcpyDeviceToHost);
+        else cuda_or_throw(cudaMemcpy(points, b.d_points, (size_t)count * sizeof(float) * 3, cudaMemcpyDeviceToHost), "D2H points");
         return;
     }
     // _mode == 0 falls through to the unmodified baseline below
