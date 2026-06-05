@@ -120,9 +120,12 @@ namespace librealsense
                     {
                         return std::make_shared<usb_device_libusb>(device, desc, info, ctx);
                     }
-                    catch (std::exception e)
+                    catch (const std::exception& e)
                     {
-                        LOG_WARNING("failed to create usb device at index: %d" << idx);
+                        // Catch by const-ref (catch-by-value sliced the exception and dropped what()).
+                        // Surface the real reason — e.g. the GB10 P7 re-acquire REFUSE message — instead
+                        // of the previous broken printf-style format string that never substituted idx.
+                        LOG_WARNING("failed to create usb device at index: " << (int)idx << ", error: " << e.what());
                     }
                 }
                 else

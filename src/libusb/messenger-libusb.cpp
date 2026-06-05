@@ -90,7 +90,10 @@ namespace librealsense
                 req->set_active(false);
                 std::string strerr = strerror(errno);
                 LOG_WARNING("usb_request_queue returned error, endpoint: " << (int)request->get_endpoint()->get_address() << " error: " << strerr << ", number: " << (int)errno);
-                return libusb_status_to_rs(errno);
+                // libusb_submit_transfer returns a LIBUSB_ERROR_* code in 'sts'; classify that, not
+                // the POSIX errno (which libusb does not contractually set, so libusb_status_to_rs(errno)
+                // almost always degraded to RS2_USB_STATUS_OTHER and lost NO_DEVICE/TIMEOUT/BUSY).
+                return libusb_status_to_rs(sts);
             }
             return RS2_USB_STATUS_SUCCESS;
         }
@@ -103,7 +106,9 @@ namespace librealsense
             {
                 std::string strerr = strerror(errno);
                 LOG_WARNING("usb_request_cancel returned error, endpoint: " << (int)request->get_endpoint()->get_address() << " error: " << strerr << ", number: " << (int)errno);
-                return libusb_status_to_rs(errno);
+                // Classify the LIBUSB_ERROR_* code from libusb_cancel_transfer, not the POSIX errno
+                // (see submit_request above): errno is not set by libusb on this path.
+                return libusb_status_to_rs(sts);
             }
             return RS2_USB_STATUS_SUCCESS;
         }

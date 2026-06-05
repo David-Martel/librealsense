@@ -19,7 +19,13 @@ namespace librealsense
                 if(response)
                 {
                     auto cb = response->get_callback();
-                    cb->callback(response);
+                    // get_callback() returns an empty shared_ptr until set_callback() runs (and the
+                    // request may complete/cancel on the libusb event thread before/around that). The
+                    // inner usb_request_callback already null-checks its std::function, but cb itself
+                    // can be null here — dereferencing it would crash the event thread on the error/
+                    // teardown path. Guard it.
+                    if(cb)
+                        cb->callback(response);
                 }
             }            
         }
