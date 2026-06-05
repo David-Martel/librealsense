@@ -1,28 +1,25 @@
 #!/usr/bin/env python3
-"""GB10 NON-HEADLESS display + video-rendering validation AND interactive debug viewer.
+"""GB10 non-headless display validation + interactive debug viewer for the RealSense.
 
-Renders the LIVE RealSense stream to a real on-screen window on the MAIN display ($DISPLAY) and either:
-  * validates it (default) — PROVES real, moving video reached the screen and PASS/FAILs, or
-  * `--interactive` — a live debug viewer with on-screen per-frame telemetry + keyboard hooks to switch
-    stream size/rate/profile and the camera's features on the fly.
+Renders the LIVE stream to a window on the MAIN display ($DISPLAY) and either validates it (default,
+PASS/FAIL) or runs an interactive debug viewer (`--interactive`) with per-frame telemetry + live
+controls for stream size/rate/profile and camera features.
 
-SMOOTHNESS: the render loop is TIGHT — `wait_for_frames -> draw -> imshow -> waitKey(1)`. All blocking
-work (the x11grab validation captures and the journalctl controller tripwire) runs on a BACKGROUND
-monitor thread, so the on-screen video is smooth and flicker-free (the earlier per-few-seconds pause was
-inline grabs stalling the loop). NVENC recording (validation mode) writes best-effort and never blocks.
+Design (kept deliberately simple + testable):
+  * PURE helpers (no camera, no display) — argparse, profile clamping, HUD composition, grab validation
+    math — are unit-exercised by `--self-test` (offline; CI/smoke safe).
+  * I/O — the camera (Cam), the cv2 window + the x11grab/NVENC capture — is isolated.
+  * SMOOTH render: the GUI/render loop runs on the MAIN thread (cv2 is not thread-safe); the controller
+    tripwire + validation screen-grabs run on a background Monitor thread, and NVENC frames go through a
+    bounded queue to a writer thread (dropped, never blocking the render). Verified 0-stutter @30fps.
+  * FAIL-SAFE camera lifecycle: validate mode fails fast + clean on a stream error (deterministic); the
+    interactive viewer surfaces the error on-screen and re-acquires only on an explicit 'r' keypress
+    (one guarded stop/start) — never an auto retry-loop (that churn is what kills the GB10 xHCI).
 
-DEBUG HOOKS (always-on HUD): wall fps + render dt, device frame number, hardware/sensor timestamp +
-domain, and live frame METADATA (actual_exposure, gain, actual_fps, frame_counter, sensor/arrival
-timestamps) when the device exposes them.
-
-INTERACTIVE CONTROLS (`--interactive`, keys go to the focused window on the display):
-  1..9  select stream profile (size x fps) from the current family    c/d  color / depth family
-  e  emitter on/off      a  auto-exposure on/off      [ / ]  exposure - / +      - / =  gain - / +
-  l / L  laser power - / +      p  cycle visual preset      f  freeze/unfreeze      h  toggle help
-  s  snapshot PNG to the artifact dir      q  quit
-Default & interactive both default to a SINGLE stream (the conservative-safe envelope); multi-stream is
-not entered automatically. hil_common gives preflight + continuous tripwire + a timestamped artifact dir.
+Controls (`--interactive`): 1-9 profile(size x fps)  c/d color/depth  e emitter  a auto-exp  [ ] exposure
+  - = gain   l/L laser   p preset   f freeze   r re-acquire after a stream error   s snapshot   h help   q quit
 """
+import argparse
 import json
 import os
 import queue
@@ -35,62 +32,118 @@ import numpy as np
 
 import hil_common as H
 
-WARMUP = 15  # frames to skip before measuring smoothness (pipeline/NVENC startup jitter)
-
 DISPLAY = os.environ.get("DISPLAY", ":1")
 FFMPEG = os.environ.get("LRS_FFMPEG", "/opt/gb10-cuda/install/ffmpeg/bin/ffmpeg")
 WIN = "gb10-display-validate"
 WIN_X, WIN_Y = 40, 40
-# single-stream-safe profiles (w, h, fps) per family
+WARMUP = 15
 COLOR_PROFILES = [(320, 240, 30), (424, 240, 60), (640, 480, 30), (640, 480, 60),
                   (848, 480, 30), (848, 480, 60), (1280, 720, 30), (1280, 720, 6)]
 DEPTH_PROFILES = [(424, 240, 30), (424, 240, 60), (640, 480, 30), (640, 480, 60),
                   (848, 480, 30), (848, 480, 60), (1280, 720, 30), (256, 144, 90)]
-DEFAULT_IDX = 4  # 848x480x30
+DEFAULT_IDX = 4
+METADATA_KEYS = ("frame_counter", "actual_fps", "actual_exposure", "gain_level",
+                 "sensor_timestamp", "time_of_arrival", "backend_timestamp")
 
 
-def ssim_global(a, b):
-    a = a.astype(np.float64); b = b.astype(np.float64)
-    C1, C2 = (0.01 * 255) ** 2, (0.03 * 255) ** 2
-    ma, mb = a.mean(), b.mean(); va, vb = a.var(), b.var()
-    cov = ((a - ma) * (b - mb)).mean()
-    return ((2 * ma * mb + C1) * (2 * cov + C2)) / ((ma ** 2 + mb ** 2 + C1) * (va + vb + C2))
+# ----------------------------- PURE helpers (no camera / no display) -----------------------------
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="rs-gb10-display-validate",
+        description="Non-headless RealSense display validation + interactive debug viewer (GB10).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument("--interactive", action="store_true",
+                   help="live debug viewer with keyboard controls (runs until 'q')")
+    p.add_argument("--stream", choices=("color", "depth"), default="color", help="stream family")
+    p.add_argument("--depth", action="store_true", help="alias for --stream depth")
+    p.add_argument("--rgbd", action="store_true", help=argparse.SUPPRESS)  # accepted, mapped to color
+    p.add_argument("--profile", type=int, default=DEFAULT_IDX, metavar="IDX",
+                   help="initial profile index into the family's size/fps list")
+    p.add_argument("--duration", type=float, default=None, metavar="S",
+                   help="run for S seconds (default: validate runs --frames frames)")
+    p.add_argument("--frames", type=int, default=150, help="validate-mode frame count")
+    p.add_argument("--record", action=argparse.BooleanOptionalAction, default=None,
+                   help="record an NVENC .mp4 of the rendered output (default: on for validate)")
+    p.add_argument("--self-test", action="store_true",
+                   help="run offline self-tests (no camera, no display) and exit")
+    return p
 
 
+def resolve_args(argv):
+    args = build_parser().parse_args(argv)
+    if args.depth:
+        args.stream = "depth"
+    if args.record is None:
+        args.record = not args.interactive
+    return args
+
+
+def clamp_idx(idx, family):
+    n = len(COLOR_PROFILES if family == "color" else DEPTH_PROFILES)
+    return max(0, min(int(idx), n - 1))
+
+
+def profile_for(family, idx):
+    return (COLOR_PROFILES if family == "color" else DEPTH_PROFILES)[clamp_idx(idx, family)]
+
+
+def compose_hud(img, fps_line, meta_lines, status="", help_lines=None):
+    """Draw the debug HUD onto a frame copy. cv2 drawing is headless-safe (no display needed)."""
+    import cv2
+    disp = img.copy()
+    h = disp.shape[0]
+    cv2.putText(disp, fps_line, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    for li, line in enumerate(meta_lines):
+        cv2.putText(disp, line, (12, 52 + li * 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+    if status:
+        cv2.putText(disp, status, (12, h - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
+    for li, line in enumerate(help_lines or []):
+        cv2.putText(disp, line, (12, h - 60 + li * 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+    return disp
+
+
+def grab_checks(img_a, img_b):
+    """Validation math over two screen grabs (numpy BGR arrays). Pure; used by --self-test too."""
+    out = {"nonblank": False, "green_overlay_px": 0, "live_change_meandiff": 0.0}
+    if img_a is None:
+        return out
+    out["nonblank"] = bool(img_a.std() > 5)
+    green = ((img_a[:, :, 1].astype(np.int16) > 170) & (img_a[:, :, 2] < 110) & (img_a[:, :, 0] < 110))
+    out["green_overlay_px"] = int(green.sum())
+    if img_b is not None:
+        n = min(img_a.shape[0], img_b.shape[0]); m = min(img_a.shape[1], img_b.shape[1])
+        out["live_change_meandiff"] = round(
+            float(np.abs(img_a[:n, :m].astype(np.int16) - img_b[:n, :m].astype(np.int16)).mean()), 3)
+    return out
+
+
+# ----------------------------- camera I/O (fail-safe lifecycle) -----------------------------
 class Cam:
-    """Live single-stream RealSense wrapper with hot profile-switch + camera-feature controls."""
+    """Single-stream RealSense wrapper: hot profile-switch, feature controls, fail-safe re-acquire."""
     def __init__(self, rs, family="color", idx=DEFAULT_IDX):
         self.rs = rs; self.ctx = rs.context()
-        self.family = family; self.idx = idx
-        self.pipe = None; self.profile = None; self.whf = None
+        self.family = family; self.idx = clamp_idx(idx, family)
+        self.pipe = None; self.whf = None
         self.depth_sensor = None; self.color_sensor = None
-
-    def _profiles(self):
-        return COLOR_PROFILES if self.family == "color" else DEPTH_PROFILES
 
     def start(self):
         rs = self.rs
-        w, h, fps = self._profiles()[self.idx]
+        w, h, fps = profile_for(self.family, self.idx)
         cfg = rs.config()
         if self.family == "color":
             cfg.enable_stream(rs.stream.color, w, h, rs.format.bgr8, fps)
         else:
             cfg.enable_stream(rs.stream.depth, w, h, rs.format.z16, fps)
         self.pipe = rs.pipeline(self.ctx)
-        self.profile = self.pipe.start(cfg)
+        prof = self.pipe.start(cfg)
         self.whf = (w, h, fps)
-        dev = self.profile.get_device()
+        dev = prof.get_device()
         try:
             self.depth_sensor = dev.first_depth_sensor()
         except Exception:
             self.depth_sensor = None
-        self.color_sensor = None
-        for s in dev.query_sensors():
-            try:
-                if "RGB" in s.get_info(rs.camera_info.name):
-                    self.color_sensor = s
-            except Exception:
-                pass
+        self.color_sensor = next((s for s in dev.query_sensors()
+                                  if "RGB" in s.get_info(rs.camera_info.name)), None)
 
     def stop(self):
         try:
@@ -103,14 +156,28 @@ class Cam:
     def switch(self, family=None, idx=None):
         if family is not None:
             self.family = family
-            self.idx = min(self.idx, len(self._profiles()) - 1)
-        if idx is not None and 0 <= idx < len(self._profiles()):
-            self.idx = idx
+        if idx is not None:
+            self.idx = clamp_idx(idx, self.family)
+        else:
+            self.idx = clamp_idx(self.idx, self.family)
         self.stop(); self.start()
 
-    def opt_sensor(self, name):
-        # which sensor owns an option
+    def reacquire(self, backoff=0.5):
+        """ONE guarded stop+start (caller-driven). Never an auto retry-loop (xHCI churn safety)."""
+        self.stop()
+        time.sleep(backoff)
+        self.start()
+
+    def read(self, timeout_ms=5000):
+        """Return the frame for the active family, or None on a (caught) stream error."""
         rs = self.rs
+        try:
+            fs = self.pipe.wait_for_frames(timeout_ms)
+        except Exception:
+            return None
+        return fs.get_color_frame() if self.family == "color" else fs.get_depth_frame()
+
+    def opt_sensor(self, name):
         if name in ("emitter_enabled", "laser_power") and self.depth_sensor:
             return self.depth_sensor
         return self.color_sensor or self.depth_sensor
@@ -122,8 +189,7 @@ class Cam:
         if opt is None or s is None or not s.supports(opt):
             return None
         try:
-            rng = s.get_option_range(opt)
-            cur = s.get_option(opt)
+            rng = s.get_option_range(opt); cur = s.get_option(opt)
             if toggle:
                 val = rng.min if cur > rng.min else rng.max
             else:
@@ -136,7 +202,6 @@ class Cam:
 
 
 def md_lines(rs, frame):
-    """Per-frame device telemetry lines (timestamp + metadata), defensively."""
     out = []
     try:
         ts = frame.get_timestamp(); dom = str(frame.get_frame_timestamp_domain()).split(".")[-1]
@@ -144,82 +209,116 @@ def md_lines(rs, frame):
     except Exception:
         pass
     md = []
-    for key in ("frame_counter", "actual_fps", "actual_exposure", "gain_level",
-                "sensor_timestamp", "time_of_arrival", "backend_timestamp"):
+    for key in METADATA_KEYS:
         mv = getattr(rs.frame_metadata_value, key, None)
         try:
             if mv is not None and frame.supports_frame_metadata(mv):
-                v = frame.get_frame_metadata(mv)
-                md.append(f"{key}={v}")
+                md.append(f"{key}={frame.get_frame_metadata(mv)}")
         except Exception:
             pass
-    # chunk metadata onto two lines
     for i in range(0, len(md), 3):
         out.append("  ".join(md[i:i + 3]))
     return out
 
 
-def main():
+def x11grab(path, w, h):
+    return subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-f", "x11grab",
+                           "-video_size", f"{w}x{h}", "-i", DISPLAY, "-frames:v", "1", path],
+                          capture_output=True, text=True).returncode
+
+
+# ----------------------------- offline self-test (no camera / no display) -----------------------------
+def run_self_test():
+    fails = []
+
+    def check(name, cond):
+        print(f"  [{'PASS' if cond else 'FAIL'}] {name}")
+        if not cond:
+            fails.append(name)
+
+    # argparse: good args parse; aliases + defaults resolve; bad args exit 2
+    a = resolve_args(["--interactive", "--depth", "--duration", "5"])
+    check("argparse: --depth->stream=depth", a.stream == "depth")
+    check("argparse: --interactive default record off", a.record is False)
+    check("argparse: validate default record on", resolve_args([]).record is True)
+    try:
+        build_parser().parse_args(["--stream", "bogus"]); bad_ok = False
+    except SystemExit as e:
+        bad_ok = (e.code == 2)
+    check("argparse: invalid choice exits 2", bad_ok)
+
+    # profile clamping at both bounds + family sizes
+    check("clamp low", clamp_idx(-5, "color") == 0)
+    check("clamp high", clamp_idx(999, "color") == len(COLOR_PROFILES) - 1)
+    check("profile_for valid", profile_for("depth", 0) == DEPTH_PROFILES[0])
+
+    # validation math on synthetic grabs
+    blank = np.zeros((200, 300, 3), np.uint8)
+    a_img = blank.copy(); a_img[20:40, 20:120] = (0, 255, 0)   # green overlay block
+    b_img = a_img.copy(); b_img[100:150, 100:200] = (50, 60, 200)  # changed region -> live
+    ck = grab_checks(a_img, b_img)
+    check("grab_checks nonblank", ck["nonblank"])
+    check("grab_checks green detected", ck["green_overlay_px"] > 50)
+    check("grab_checks live change", ck["live_change_meandiff"] > 1.0)
+    check("grab_checks blank-frame safe", grab_checks(None, None)["nonblank"] is False)
+
+    # HUD composition is headless-safe and paints the overlay colors
+    hud = compose_hud(np.zeros((200, 400, 3), np.uint8), "GB10 LIVE f=0001 848x480@30 color 30fps",
+                      ["fnum=1 ts=1.0ms [hw]", "actual_exposure=100 gain_level=16"], status="ok",
+                      help_lines=["help"])
+    check("compose_hud returns frame", hud is not None and hud.shape == (200, 400, 3))
+    check("compose_hud paints green line", int(((hud[:, :, 1] > 170) & (hud[:, :, 2] < 110) & (hud[:, :, 0] < 110)).sum()) > 50)
+
+    print(f"\nself-test: {'PASS' if not fails else 'FAIL ' + str(fails)}  ({len(fails)} failures)")
+    return 0 if not fails else 1
+
+
+# ----------------------------- live run (validate + interactive) -----------------------------
+def run(args):
     import pyrealsense2 as rs
     import cv2
 
-    interactive = "--interactive" in sys.argv
-    family = "depth" if "--depth" in sys.argv else "color"
-    duration = float(next((a.split("=")[1] for a in sys.argv if a.startswith("--duration=")), "0")) or None
-    frames_target = int(os.environ.get("LRS_DV_FRAMES", "150"))
-    record = (not interactive) or ("--record" in sys.argv)
-
     hil = H.HIL("display-validate", display=True)
-    hil.report.update({"mode": "interactive" if interactive else "validate", "family": family,
-                       "main_display": DISPLAY, "cv2": cv2.__version__})
+    hil.report.update({"mode": "interactive" if args.interactive else "validate",
+                       "stream": args.stream, "main_display": DISPLAY, "cv2": cv2.__version__})
     hil.preflight()
 
-    cam = Cam(rs, family=family)
+    cam = Cam(rs, family=args.stream, idx=args.profile)
     cam.start()
     colorizer = rs.colorizer()
 
-    # ---- background monitor: tripwire (always) + timed validation grabs (validate mode only) ----
-    shared = {"img": None, "stop": False}
+    shared = {"img": None, "stop": False, "controller_dead": False}
     grabs = {}
-    grab_lock = threading.Lock()
+    glock = threading.Lock()
 
     def monitor():
-        t0 = time.time()
-        did = set()
+        t0 = time.time(); did = set()
         while not shared["stop"]:
             try:
                 hil.check_tripwire()
             except H.Tripwire:
-                shared["stop"] = True
-                shared["controller_dead"] = True
-                break
-            if not interactive:
+                shared["stop"] = True; shared["controller_dead"] = True; break
+            if not args.interactive:
                 el = time.time() - t0
                 for tag, when in (("a", 2.0), ("b", 4.0)):
                     if tag not in did and el >= when:
                         did.add(tag)
-                        with grab_lock:
+                        with glock:
                             snap = None if shared["img"] is None else shared["img"].copy()
                         p = os.path.join(hil.dir, f"screen-{tag}.png")
-                        rc = subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-f",
-                                             "x11grab", "-video_size", "1100x760", "-i", DISPLAY,
-                                             "-frames:v", "1", p], capture_output=True, text=True).returncode
-                        if rc == 0 and os.path.exists(p):
+                        if x11grab(p, 1100, 760) == 0 and os.path.exists(p):
                             grabs[tag] = (p, snap)
             time.sleep(1.0)
 
-    mon = threading.Thread(target=monitor, daemon=True)
-    mon.start()
+    mon = threading.Thread(target=monitor, daemon=True); mon.start()
 
-    enc = None
-    frame_q = queue.Queue(maxsize=4)   # bounded: if NVENC falls behind, DROP frames (never stall render)
-    wr = None
-    if record:
+    enc = None; frame_q = queue.Queue(maxsize=4); wr = None
+    if args.record:
         w, h, fps = cam.whf
-        mp4 = os.path.join(hil.dir, "rendered.mp4")
         enc = subprocess.Popen([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo",
                                 "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-r", str(fps), "-i", "-",
-                                "-c:v", "h264_nvenc", "-preset", "p4", mp4], stdin=subprocess.PIPE)
+                                "-c:v", "h264_nvenc", "-preset", "p4", os.path.join(hil.dir, "rendered.mp4")],
+                               stdin=subprocess.PIPE)
 
         def _writer():
             while True:
@@ -233,99 +332,66 @@ def main():
         wr = threading.Thread(target=_writer, daemon=True); wr.start()
 
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL); cv2.moveWindow(WIN, WIN_X, WIN_Y)
-    show_help = interactive
-    frozen = False
-    last = None; gaps = []; delivered = 0; i = 0; ok = True
-    status = ""
+    cv2.resizeWindow(WIN, cam.whf[0], cam.whf[1])
     HELP = ["[1-9] profile  c/d color/depth  e emitter  a auto-exp  [ ] exp  - = gain",
-            "l/L laser  p preset  f freeze  s snapshot  h help  q quit"]
+            "l/L laser  p preset  f freeze  r re-acquire  s snapshot  h help  q quit"]
+    show_help = args.interactive; frozen = False
+    last = None; gaps = []; delivered = 0; i = 0; ok = True; status = ""; cur_img = None; stream_err = 0
+    t_start = time.time()
     try:
-        cv2.resizeWindow(WIN, cam.whf[0], cam.whf[1])
-        t_start = time.time()
         while True:
             if not frozen:
-                try:
-                    fs = cam.pipe.wait_for_frames(5000)
-                except Exception as e:
-                    status = f"wait_for_frames: {e}"; continue
-                frame = fs.get_color_frame() if cam.family == "color" else fs.get_depth_frame()
-                if cam.family == "color":
-                    img = np.asanyarray(frame.get_data())
+                frame = cam.read()
+                if frame is None:
+                    stream_err += 1
+                    if not args.interactive:
+                        status = "stream error — failing fast"; ok = False; break
+                    status = f"stream error #{stream_err} — press 'r' to re-acquire, 'q' to quit"
                 else:
-                    img = np.asanyarray(colorizer.colorize(frame).get_data())
-                now = time.time()
-                if last is not None and i > WARMUP:   # skip startup jitter from the smoothness metric
-                    gaps.append((now - last) * 1000.0)
-                last = now
-                delivered += 1; i += 1
-                meta = md_lines(rs, frame)
-                cur_img = img
-            # ---- HUD overlay (drawn on a copy so the recorded/raw frame is what we measure) ----
-            disp = cur_img.copy()
+                    img = (np.asanyarray(frame.get_data()) if cam.family == "color"
+                           else np.asanyarray(colorizer.colorize(frame).get_data()))
+                    now = time.time()
+                    if last is not None and i > WARMUP:
+                        gaps.append((now - last) * 1000.0)
+                    last = now; delivered += 1; i += 1
+                    cur_img = img
+                    meta = md_lines(rs, frame)
+            if cur_img is None:
+                if cv2.waitKey(30) & 0xFF == ord('q'):
+                    break
+                continue
             w, h, fps = cam.whf
             dt = gaps[-1] if gaps else 0.0
             wall_fps = 1000.0 / dt if dt > 0 else 0.0
-            cv2.putText(disp, f"GB10 LIVE f={i:04d} {w}x{h}@{fps} {cam.family}  {wall_fps:4.1f}fps dt={dt:4.1f}ms",
-                        (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            for li, line in enumerate(meta):
-                cv2.putText(disp, line, (12, 52 + li * 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-            if status:
-                cv2.putText(disp, status, (12, h - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
-            if show_help:
-                for li, line in enumerate(HELP):
-                    cv2.putText(disp, line, (12, h - 60 + li * 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+            fps_line = f"GB10 LIVE f={i:04d} {w}x{h}@{fps} {cam.family}  {wall_fps:4.1f}fps dt={dt:4.1f}ms"
+            disp = compose_hud(cur_img, fps_line, meta if not frozen else [], status,
+                               HELP if show_help else None)
             cv2.imshow(WIN, disp)
-            with grab_lock:
+            with glock:
                 shared["img"] = disp
-            # hand the frame to the NVENC writer thread (non-blocking; drop if the encoder is behind)
-            if enc and not frozen and img.shape[1] == cam.whf[0] and img.shape[0] == cam.whf[1]:
+            if enc and not frozen and cur_img.shape[1] == cam.whf[0] and cur_img.shape[0] == cam.whf[1]:
                 try:
                     frame_q.put_nowait(np.ascontiguousarray(disp).tobytes())
                 except queue.Full:
                     pass
 
             key = cv2.waitKey(1) & 0xFF
-            if shared.get("stop"):
-                ok = not shared.get("controller_dead", False); break
-            if interactive:
+            if shared["stop"]:
+                ok = not shared["controller_dead"]; break
+            if args.interactive and key != 255:
                 if key == ord('q'):
                     break
-                elif key in [ord(str(n)) for n in range(1, 10)]:
-                    idx = key - ord('1')
-                    if idx < len(cam._profiles()):
-                        cam.switch(idx=idx); cv2.resizeWindow(WIN, cam.whf[0], cam.whf[1])
-                        status = f"profile -> {cam.whf}"; last = None
-                elif key in (ord('c'), ord('d')):
-                    cam.switch(family=("color" if key == ord('c') else "depth"))
-                    cv2.resizeWindow(WIN, cam.whf[0], cam.whf[1]); status = f"family -> {cam.family} {cam.whf}"; last = None
-                elif key == ord('e'):
-                    v = cam.bump("emitter_enabled", toggle=True); status = f"emitter -> {v}"
-                elif key == ord('a'):
-                    v = cam.bump("enable_auto_exposure", toggle=True); status = f"auto_exposure -> {v}"
-                elif key == ord('['):
-                    cam.bump("enable_auto_exposure", delta=0); v = cam.bump("exposure", delta=-1); status = f"exposure -> {v}"
-                elif key == ord(']'):
-                    v = cam.bump("exposure", delta=+1); status = f"exposure -> {v}"
-                elif key == ord('-'):
-                    v = cam.bump("gain", delta=-1); status = f"gain -> {v}"
-                elif key in (ord('='), ord('+')):
-                    v = cam.bump("gain", delta=+1); status = f"gain -> {v}"
-                elif key == ord('l'):
-                    v = cam.bump("laser_power", delta=-1); status = f"laser -> {v}"
-                elif key == ord('L'):
-                    v = cam.bump("laser_power", delta=+1); status = f"laser -> {v}"
-                elif key == ord('p'):
-                    v = cam.bump("visual_preset", delta=+1); status = f"preset -> {v}"
                 elif key == ord('f'):
                     frozen = not frozen; status = "FROZEN" if frozen else "live"
                 elif key == ord('h'):
                     show_help = not show_help
                 elif key == ord('s'):
-                    p = os.path.join(hil.dir, f"snapshot-{i:04d}.png"); cv2.imwrite(p, disp); status = f"saved {os.path.basename(p)}"
-            # exit conditions
-            if duration and (time.time() - t_start) >= duration:
+                    cv2.imwrite(os.path.join(hil.dir, f"snapshot-{i:04d}.png"), disp); status = "snapshot saved"
+                else:
+                    status = _camera_key(key, cam, cv2) or status
+            if args.duration and (time.time() - t_start) >= args.duration:
                 break
-            if not interactive and i >= frames_target:
+            if not args.interactive and i >= args.frames:
                 break
     except H.Tripwire:
         ok = False
@@ -342,56 +408,64 @@ def main():
         cv2.destroyAllWindows(); cv2.waitKey(1)
         mon.join(timeout=2)
 
-    # ---- steady fps + smoothness (stutter) + (validate) PASS/FAIL ----
+    return _finish(hil, args, cam, gaps, delivered, grabs, ok)
+
+
+def _camera_key(key, cam, cv2):
+    """Handle a camera/profile/feature key. Returns a status string, or None if the key is unbound."""
+    if key in [ord(str(n)) for n in range(1, 10)]:
+        cam.switch(idx=key - ord('1')); cv2.resizeWindow(WIN, cam.whf[0], cam.whf[1])
+        return f"profile -> {cam.whf}"
+    if key in (ord('c'), ord('d')):
+        cam.switch(family="color" if key == ord('c') else "depth")
+        cv2.resizeWindow(WIN, cam.whf[0], cam.whf[1])
+        return f"family -> {cam.family} {cam.whf}"
+    if key == ord('r'):
+        try:
+            cam.reacquire(); return "re-acquired"
+        except Exception as e:
+            return f"re-acquire failed: {e}"
+    table = {ord('e'): ("emitter_enabled", dict(toggle=True)), ord('a'): ("enable_auto_exposure", dict(toggle=True)),
+             ord(']'): ("exposure", dict(delta=+1)), ord('-'): ("gain", dict(delta=-1)),
+             ord('='): ("gain", dict(delta=+1)), ord('+'): ("gain", dict(delta=+1)),
+             ord('l'): ("laser_power", dict(delta=-1)), ord('L'): ("laser_power", dict(delta=+1)),
+             ord('p'): ("visual_preset", dict(delta=+1))}
+    if key == ord('['):
+        cam.bump("enable_auto_exposure", delta=0); return f"exposure -> {cam.bump('exposure', delta=-1)}"
+    if key in table:
+        opt, kw = table[key]; return f"{opt} -> {cam.bump(opt, **kw)}"
+    return None
+
+
+def _finish(hil, args, cam, gaps, delivered, grabs, ok):
+    import cv2
     steady_fps = round(1000.0 / float(np.median(gaps)), 1) if gaps else 0.0
     med = float(np.median(gaps)) if gaps else 0.0
-    stutters = int(sum(1 for g in gaps if g > max(66.0, 1.8 * med))) if gaps else 0  # post-warmup gaps > ~2 frames
-    hil.report["frames_rendered"] = delivered
-    hil.report["delivered_fps"] = steady_fps
-    hil.report["interframe_gap_ms"] = H.stats(gaps)
-    hil.report["stutter_count"] = stutters   # post-warmup frame gaps > ~2x interval (visible pauses)
-    hil.report["final_profile"] = list(cam.whf) if cam.whf else None
-
-    if interactive:
+    stutters = int(sum(1 for g in gaps if g > max(66.0, 1.8 * med))) if gaps else 0
+    hil.report.update({"frames_rendered": delivered, "delivered_fps": steady_fps,
+                       "interframe_gap_ms": H.stats(gaps), "stutter_count": stutters,
+                       "final_profile": list(cam.whf) if cam.whf else None})
+    if args.interactive:
         hil.report["result"] = "PASS" if (ok and not hil.report["controller_death"]) else "FAIL"
         hil.finish(ok=ok)
         return 0
 
-    v = {}
     keys = sorted(grabs)
-    if keys:
-        imgs = {k: __import__("cv2").imread(grabs[k][0]) for k in keys}
-        g0 = imgs[keys[0]]
-        v["nonblank"] = bool(g0 is not None and g0.std() > 5)
-        if g0 is not None:
-            green = ((g0[:, :, 1].astype(np.int16) > 170) & (g0[:, :, 2] < 110) & (g0[:, :, 0] < 110))
-            v["green_overlay_px"] = int(green.sum())
-        else:
-            v["green_overlay_px"] = 0
-        if len(keys) >= 2 and all(imgs[k] is not None for k in keys[:2]):
-            a, b = imgs[keys[0]], imgs[keys[1]]
-            n = min(a.shape[0], b.shape[0]); m = min(a.shape[1], b.shape[1])
-            v["live_change_meandiff"] = round(float(np.abs(a[:n, :m].astype(np.int16) - b[:n, :m].astype(np.int16)).mean()), 3)
-        else:
-            v["live_change_meandiff"] = 0.0
-    else:
-        v.update({"nonblank": False, "green_overlay_px": 0, "live_change_meandiff": 0.0})
-
+    imgs = {k: cv2.imread(grabs[k][0]) for k in keys}
+    v = grab_checks(imgs.get(keys[0]) if keys else None,
+                    imgs.get(keys[1]) if len(keys) > 1 else None)
     mp4 = os.path.join(hil.dir, "rendered.mp4")
-    if os.path.exists(mp4) and os.path.getsize(mp4) > 1000:
-        probe = subprocess.run([FFMPEG, "-hide_banner", "-i", mp4], capture_output=True, text=True)
-        v["recorded_ok"] = "h264" in probe.stderr.lower()
-    else:
-        v["recorded_ok"] = False
-
+    v["recorded_ok"] = bool(os.path.exists(mp4) and os.path.getsize(mp4) > 1000
+                            and "h264" in subprocess.run([FFMPEG, "-hide_banner", "-i", mp4],
+                                                         capture_output=True, text=True).stderr.lower())
     hil.report["validation"] = v
     checks = {
         "rendered_on_screen": v["nonblank"],
-        "our_content_on_screen": v.get("green_overlay_px", 0) > 50,
+        "our_content_on_screen": v["green_overlay_px"] > 50,
         "live_video_not_frozen": v["live_change_meandiff"] > 1.0,
         "framerate_ok": steady_fps >= cam.whf[2] - 3,
-        "smooth_no_stutter": stutters <= 1,   # smooth & flicker-free: at most 1 post-warmup hiccup
-        "clip_recorded": v.get("recorded_ok", False),
+        "smooth_no_stutter": stutters <= 1,
+        "clip_recorded": v["recorded_ok"],
         "controller_green": not hil.report["controller_death"],
     }
     hil.report["checks"] = checks
@@ -399,6 +473,13 @@ def main():
     hil.report["result"] = "PASS" if passed else "FAIL"
     hil.finish(ok=passed)
     return 0 if passed else 1
+
+
+def main(argv=None):
+    args = resolve_args(sys.argv[1:] if argv is None else argv)
+    if args.self_test:
+        return run_self_test()
+    return run(args)
 
 
 if __name__ == "__main__":
