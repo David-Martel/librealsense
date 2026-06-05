@@ -351,8 +351,10 @@ int main(int argc, char** argv) {
     }
 
     int rc = 0;
+    bool gl_inited = false;   // guard teardown: only shut the GL lane down if init_processing() actually ran
     try {
         rs2::gl::init_processing(win, /*use_glsl=*/true);   // share the library GL context with our window
+        gl_inited = true;
 
         rs2::pipeline pipe; rs2::config cfg;
         if (color_mode) {
@@ -544,8 +546,10 @@ int main(int argc, char** argv) {
     // static GL destructors fire against a dead context: the exact R2 SIGSEGV, on every error
     // exit.) On the error path the local FfmpegPipe has already drained during stack unwind,
     // so the ffmpeg-before-GL ordering still holds.
-    rs2::gl::shutdown_processing();
-    printf("rs2::gl::shutdown_processing() OK (context still current) — clean teardown, no SIGSEGV.\n");
+    if (gl_inited) {
+        rs2::gl::shutdown_processing();
+        printf("rs2::gl::shutdown_processing() OK (context still current) — clean teardown, no SIGSEGV.\n");
+    }
     glfwDestroyWindow(win);
     glfwTerminate();
     printf("DONE rc=%d (clean return — R2 teardown order verified).\n", rc);
