@@ -7,5 +7,39 @@ Comment=Live Intel RealSense viewer on GB10 — switch profiles/size/fps and cam
 Exec=/home/damartel/dev/repos/librealsense/scripts/gb10/gb10-viewer-launch.sh
 Icon=camera-video
 Terminal=true
-Categories=Development;Graphics;Video;
+Categories=Development;Graphics;
 Keywords=realsense;depth;camera;gb10;dgx;
+Actions=Doctor;KeepOnGPU;Viewer313;
+
+# --- Desktop Actions: launch + debug the updated GB10 code paths from one entry ---
+# NOTE on .desktop Exec quoting (Desktop Entry spec): only DOUBLE quotes group an
+# argument; ; $ & ` * ? ( ) are reserved. So each `bash -c "..."` uses an outer
+# DOUBLE quote, inner SINGLE quotes for the read prompt (literal inside ""), and
+# \$ to pass a literal $ through to bash. Terminal=true on the main entry applies
+# to the actions; the trailing `read` is a belt-and-braces hold so output stays
+# visible even if a launcher does not allocate a terminal for the action.
+
+# Diagnostics (Doctor): the camera-SAFE debug entry — opens NO device, only checks
+# USB presence + the whole runtime (venv/pyrealsense2/cv2/ffmpeg/GL/DISPLAY). Run
+# this FIRST when a launch misbehaves. Wrapped so the terminal stays open to read
+# PASS/WARN/FAIL output.
+[Desktop Action Doctor]
+Name=Diagnostics (Doctor) — camera-safe preflight
+Exec=bash -c "/home/damartel/dev/repos/librealsense/scripts/gb10/gb10-doctor.sh; read -p 'Press Enter to close...' _"
+
+# Keep-on-GPU: the GL-resident render path. Replicates `just hil-keepongpu`:
+# build the viewer binary via rs-gb10-keepongpu-build.sh, then run it with DISPLAY.
+# \${DISPLAY:-:1} faithfully mirrors the justfile default (:1) when DISPLAY is unset.
+# validation_dir = $HOME/realsense-gb10-validation (LRS_VALIDATION_DIR default).
+[Desktop Action KeepOnGPU]
+Name=Keep-on-GPU viewer (GL-resident render path)
+Exec=bash -c "/home/damartel/dev/repos/librealsense/scripts/gb10/rs-gb10-keepongpu-build.sh && DISPLAY=\${DISPLAY:-:1} /home/damartel/realsense-gb10-validation/rs-gb10-keepongpu-viewer; read -p 'Press Enter to close...' _"
+
+# Viewer (py3.13): retargets the launcher to the python3.13 ABI via LRS_PY_TAG.
+# gb10-env.sh maps python3.13 -> build-gb10-py313 + .venv313 and runs the loud ABI
+# guard. `env VAR=val ...` avoids reserved chars entirely. UNVERIFIED: 3.13 live
+# streaming has only been offline-verified (env flip + ABI guard); cv2 on 3.13 is
+# stock opencv-python 4.11 (the CUDA-OpenCV cv2 remains 3.12 only).
+[Desktop Action Viewer313]
+Name=Viewer (py3.13 — UNVERIFIED live streaming)
+Exec=env LRS_PY_TAG=python3.13 /home/damartel/dev/repos/librealsense/scripts/gb10/gb10-viewer-launch.sh
