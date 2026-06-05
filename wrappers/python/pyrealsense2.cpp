@@ -31,7 +31,10 @@ PYBIND11_MODULE(NAME, m) {
     init_serializable_device(m);
     init_util(m);
     init_eth_config(m);
-    
+#ifdef PYRS_WITH_GL
+    init_gl(m);   // rs.gl.* — GPU/OpenGL processing; only present when built with realsense2-gl
+#endif
+
     /** rs_export.hpp **/
     py::class_<rs2::save_to_ply, rs2::filter>(m, "save_to_ply")
         .def(py::init<std::string, rs2::pointcloud>(), "filename"_a = "RealSense Pointcloud ", "pc"_a = rs2::pointcloud())

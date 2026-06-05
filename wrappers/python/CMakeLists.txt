@@ -34,6 +34,19 @@ set_target_properties( pyrealsense2
         FOLDER Library/Python
     )
 
+# GPU (OpenGL) processing submodule rs.gl — bound only when the realsense2-gl library is built.
+# The gl target is created (root CMakeLists) under exactly this condition; matching it here keeps a
+# non-GLSL pyrealsense2 (e.g. the 3.12 HIL build) buildable — it just lacks the `gl` submodule.
+# realsense2-gl is added (src/gl) AFTER wrappers/, but a target name forward-reference is resolved at
+# generate time, so linking it here is fine.
+if((BUILD_EXAMPLES OR BUILD_PC_STITCHING) AND BUILD_GLSL_EXTENSIONS)
+    target_sources(pyrealsense2 PRIVATE pyrs_gl.cpp)
+    target_link_libraries(pyrealsense2 PRIVATE realsense2-gl)
+    target_compile_definitions(pyrealsense2 PRIVATE PYRS_WITH_GL)
+    target_include_directories(pyrealsense2 PRIVATE ../../include)
+    message(STATUS "pyrealsense2: GL submodule (rs.gl) enabled (realsense2-gl)")
+endif()
+
 set(RAW_RS
     pybackend.cpp
     pybackend_extras.h

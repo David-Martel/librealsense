@@ -244,3 +244,6 @@ void init_advanced_mode(py::module &m);
 void init_serializable_device(py::module& m);
 void init_util(py::module &m);
 void init_eth_config(py::module &m);
+#ifdef PYRS_WITH_GL
+void init_gl(py::module &m);   // GPU (OpenGL) processing submodule; only when realsense2-gl is built
+#endif
