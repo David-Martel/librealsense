@@ -7,14 +7,14 @@
 #   release. The previously-FATAL control_transfer index 768 (0x0300) is reduced to 2 benign startup
 #   EAGAIN warnings ("Resource temporarily unavailable, number: 11"). Log: ros2-depth-minimal-*.log.
 #
-# LIKELY CAUSE (consistent with H1 but NOT isolated — see docs/gb10/ros2-stream-start-analysis.md):
-# index 768 (0x0300) == the D4xx DEPTH EXTENSION UNIT (depth_xu, unit 3, iface 0 — src/ds/ds-private.h:70).
-# The leading hypothesis is that the stock node's MANUAL depth-XU exposure write (rs_launch.py declares
-# depth_module.exposure=8500 → unwrapped param callback, sensor_params.cpp:71-74) WHILE auto-exposure is on
-# is what the D435 fw 5.15.1.55 rejected. CAVEAT: this run is not proof — idx768 still fired (the SDK now
-# rides the EAGAIN), the selector isn't logged, and this config ALSO disables initial_reset (a co-suspect).
-# WHAT'S PROVEN: this minimal set (AE ON, no manual depth-XU control, no initial_reset) reliably streams.
-# To pin the culprit, A/B one variable at a time (re-add only exposure:=8500; then only initial_reset:=true).
+# CAUSE (A/B-tested 2026-06-05, 8 live runs — see docs/gb10/ros2-stream-start-analysis.md):
+# H1 was REFUTED. The original hypothesis (manual depth_module.exposure=8500 over the depth XU under AE)
+# does NOT break streaming: re-adding exposure:=8500 to this config still streams (just +3 benign idx768
+# EAGAIN). initial_reset:=true also streams. The actual failure: the stock node's FULL-DEFAULT config gets
+# 0 depth frames (deterministic, same SDK/env), and NO single override fixes it (enable_sync:=false and
+# hdr_enabled:=false each still 0 frames). So the fix is the COMBINATION of overrides below, not one param;
+# the exact minimal subset is not yet isolated (deferred — cumulative single-camera risk). WHAT'S PROVEN:
+# this set (AE ON + no manual depth-XU control + no initial_reset + hdr off + sync off + inter_cam 0) streams 4/4.
 #
 # SAFE-USE (the one-camera rule still applies):
 #   RUN SERIALLY, SINGLE-PROCESS, no concurrent heavy load (xHCI controller death is load-induced).

@@ -5,10 +5,10 @@
 **Scope:** `realsense2_camera` (realsense-ros ~4.58) depth-only start on GB10 / DGX-Spark (ARM64),
 GB10 SDK `librealsense2 2.58.1`, D435 firmware **5.15.1.55**.
 
-> **The analysis below was offline/static. The minimal config it proposed is now HIL-VERIFIED to
-> stream cleanly — see the VERIFIED RESULT box.** That validates the *fix*, not conclusively the
-> *mechanism*: the run is consistent with H1 but did not isolate it (see the box's caveat). Where the
-> body still says "PENDING-HIL", read it as the pre-test framing.
+> **The analysis below was offline/static. The minimal config it proposed is HIL-VERIFIED to stream
+> cleanly — but the subsequent single-variable A/B REFUTED the H1 mechanism (see the A/B RESULTS box).**
+> The *fix* is proven; the *root cause* is a parameter **combination**, NOT the manual-exposure-under-AE
+> write H1 blamed. Read the H1 reasoning in the body as the (now-falsified) pre-test hypothesis.
 
 ---
 
@@ -25,21 +25,38 @@ depth-XU control pushed) **streams cleanly on GB10**:
 | `index 768 / 0x0300` | **2 benign startup warnings**, `EAGAIN` ("Resource temporarily unavailable, number: 11") — the SDK rides through them |
 | Controller | **GREEN** before and after (no `HC died`); camera stayed @ 5000M USB3; `/dev/video*` released cleanly |
 
-**Consistent with H1 — but the mechanism is NOT isolated.** The minimal config streams; that proves the *fix*,
-not the *root cause*. Three caveats keep this short of "H1 confirmed":
-1. **idx768 still fired** (twice). `rs_launch.py` still declares `depth_module.exposure=8500`, so the supposedly-fatal
-   manual-exposure-under-AE write may well still be happening — yet it streamed. So "removing that write is what fixed
-   it" is not what the evidence shows; at most the write now returns `EAGAIN` instead of failing.
-2. **The control selector is not observable** — the libusb layer logs only the index (768), never `wValue`. So
-   "these two idx768 warnings are different/benign ones" is indistinguishable from "the same writes, now `EAGAIN` for
-   an unrelated reason (controller state / timing)."
-3. **`initial_reset:=false` is a co-suspect.** The minimal config also dropped the startup `hardware_reset` — a
-   control-path stressor on a fragile xHCI that fits the earlier failure at least as well as H1. The run changed ~5
-   params at once vs an earlier, differently-configured failure; it was not a controlled A/B.
+### Single-variable A/B (2026-06-05, 8 controlled live runs — H1 REFUTED)
 
-What IS established: **the depth-only minimal config (AE on, no manual depth-XU push, no initial_reset) reliably
-streams on GB10.** The deployable path is proven. Pinning the exact culprit (single-variable A/B: re-introduce only
-`exposure:=8500`, then only `initial_reset:=true`) and the Kilted rebuild are follow-on *enhancements*, not blockers.
+The A/B was run (single depth stream = safe envelope; controller GREEN throughout all 8 runs). It **refutes H1**
+and shows the fix is a *combination*, not the manual-exposure write:
+
+| Run | Config (Δ from minimal / original) | Frames | fps | idx768 | Result |
+|-----|------------------------------------|-------:|----:|-------:|--------|
+| ab0 | minimal (baseline)                 | 319 | 30.09 | 2 | **PASS** |
+| ab1 | minimal **+ `depth_module.exposure:=8500`** | 319 | 30.09 | **5** | **PASS** → **H1 REFUTED** |
+| ab2 | minimal **+ `initial_reset:=true`** | 316 | 30.09 | 2 | **PASS** → co-suspect refuted |
+| ab4 | minimal (re-confirm, post-ab3)     | 318 | 30.09 | 2 | **PASS** (device healthy) |
+| ab3 | **original** (all node defaults)   | **0** | — | 5 | **FAIL** (0 frames) |
+| ab5 | original **+ `enable_sync:=false`** | **0** | — | 2 | **FAIL** → refuted |
+| ab6 | original **+ `hdr_enabled:=false`** | **0** | — | 0 | **FAIL** → refuted |
+
+**Findings:**
+- **H1 is REFUTED.** Explicitly pushing `depth_module.exposure:=8500` under AE *streams fine* — it only raises the
+  benign idx768 `EAGAIN` count (2→5), confirming the write reaches the depth XU but the fw returns `EAGAIN`, **not** a
+  fatal error. The manual-exposure-under-AE write is not the killer. `initial_reset:=true` also streams (the
+  `hardware_reset` re-enumerates cleanly: `usb 2-1: USB disconnect` then back @ 5000M). Both named suspects: cleared.
+- **The original full-default config deterministically gets 0 frames** (ab3), and the device was proven healthy
+  *immediately after* (ab4 PASS) — so this is a real config effect, not a post-reset transient. Same SDK/env in both
+  scripts (verified offline: only `LRS_LOG_LEVEL` differs), so the cause is the ROS2 **parameter combination**.
+- **No single override fixes the original:** adding only `enable_sync:=false` (ab5) or only `hdr_enabled:=false` (ab6)
+  still yields 0 frames; AE (`true`) and `inter_cam_sync_mode` (`0`) defaults already match the minimal. So the
+  working config depends on a **combination** of the minimal's overrides — not isolatable to one param without
+  mapping the 2^N subset space (deferred; cumulative single-camera risk).
+- **Symptom shifted** from the first session's *"Hardware Error"* to a silent *0-frames* in ab3/ab5/ab6, hinting the
+  fatal-vs-silent face has a state component — but the 0-frames failure itself is deterministic and config-driven.
+
+**Bottom line:** the deployable minimal config is proven (4/4 PASS). H1 is wrong; the fix is the override
+*combination*. Exact-subset isolation + Kilted rebuild are follow-ons. Logs: `~/realsense-gb10-validation/{hil-runs/*ab*,ros2-ab*}`.
 
 ---
 

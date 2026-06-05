@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -267,13 +268,20 @@ def _preflight_ros2(hil):
 
 
 def cmd_live(args):
-    """Launch ros2-launch-depth-minimal.sh for --duration seconds, tee output, parse + emit result."""
+    """Launch ros2-launch-depth-minimal.sh for --duration seconds, tee output, parse + emit result.
+
+    Extra ros2 launch params (args.launch_args) are forwarded to the launch script verbatim — this is
+    how the single-variable A/B is driven, e.g. `--live depth_module.exposure:=8500` re-introduces one
+    suspect on top of the proven minimal config. args.label tags the artifact dir for easy comparison.
+    """
     # Import hil_common only here (needs numpy in live env, not in parse-log/CI)
     sys.path.insert(0, os.path.join(REPO_ROOT, "scripts", "gb10"))
     from hil_common import HIL, Tripwire  # noqa: late import
 
-    hil = HIL("ros2-depth-only")
+    launch_args = list(args.launch_args or [])
+    hil = HIL(args.label or "ros2-depth-only")
     hil.report["launch_script"] = LAUNCH_SCRIPT
+    hil.report["launch_args"] = launch_args
     hil.report["duration_secs"] = args.duration
 
     try:
@@ -287,25 +295,40 @@ def cmd_live(args):
     node_log = os.path.join(hil.dir, "node.log")
     hil.report["node_log"] = node_log
 
+    cmd = ["bash", LAUNCH_SCRIPT] + launch_args
     print(f"[ros2-hil] Launching {LAUNCH_SCRIPT} (duration={args.duration}s)")
+    if launch_args:
+        print(f"[ros2-hil] Extra params (A/B): {' '.join(launch_args)}")
     print(f"[ros2-hil] Node log: {node_log}")
-    print("[ros2-hil] Tripwire armed. SIGINT at the end of the bounded window.")
+    print("[ros2-hil] Tripwire armed. SIGINT to the process group at the end of the bounded window.")
 
     rc = 1
     try:
-        # Launch the ROS2 script; tee its combined stdout+stderr to the artifact log.
-        # SIGINT (Ctrl-C equivalent) is sent after --duration to trigger the proven clean shutdown.
+        # Launch in its OWN session/process group so the SIGINT reaches the whole ros2 launch tree
+        # (bash -> ros2 launch -> node), not just the bash PID — robust teardown that actually
+        # releases the camera. SIGINT (Ctrl-C equivalent) triggers ros2 launch's clean shutdown.
         with open(node_log, "w") as log_fh:
             proc = subprocess.Popen(
-                ["bash", LAUNCH_SCRIPT],
+                cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
+                start_new_session=True,
             )
+            try:
+                pgid = os.getpgid(proc.pid)
+            except ProcessLookupError:
+                pgid = proc.pid
             t0 = time.monotonic()
             tripwire_interval = 5  # poll journal every 5 s
             last_tripwire = t0
+
+            def _signal_group(sig):
+                try:
+                    os.killpg(pgid, sig)
+                except (ProcessLookupError, PermissionError):
+                    pass
 
             try:
                 for line in proc.stdout:
@@ -319,15 +342,15 @@ def cmd_live(args):
                         last_tripwire = now
 
                     if elapsed >= args.duration:
-                        # Send SIGINT for clean ROS2 shutdown (matches proven run)
-                        print(f"\n[ros2-hil] Duration {args.duration}s reached; sending SIGINT...")
-                        proc.send_signal(__import__("signal").SIGINT)
+                        # Send SIGINT to the whole group for clean ROS2 shutdown (matches proven run)
+                        print(f"\n[ros2-hil] Duration {args.duration}s reached; SIGINT -> process group...")
+                        _signal_group(signal.SIGINT)
                         break
             finally:
                 try:
                     proc.wait(timeout=10)
                 except subprocess.TimeoutExpired:
-                    proc.kill()
+                    _signal_group(signal.SIGKILL)
                     proc.wait()
 
         # Final tripwire check
@@ -396,6 +419,18 @@ def main():
         default=25,
         metavar="N",
         help="Bounded run duration in seconds for --live (default: 25).",
+    )
+    p.add_argument(
+        "--label",
+        metavar="TAG",
+        help="Tag the --live artifact dir (e.g. 'ab-exposure8500') for A/B comparison.",
+    )
+    p.add_argument(
+        "launch_args",
+        nargs="*",
+        metavar="ROS2_PARAM",
+        help="Extra ros2 launch params forwarded to the launch script for --live, e.g. "
+        "depth_module.exposure:=8500 (drives the single-variable A/B on the proven minimal config).",
     )
 
     if len(sys.argv) == 1:

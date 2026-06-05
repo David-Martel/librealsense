@@ -210,13 +210,14 @@ ros2-single:
 ros2-hil *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
-    LOG="${LOG:-{{validation_dir}}/ros2-depth-minimal-20260605-134449.log}"
-    if [[ "${1:-}" == "--live" ]]; then
-        {{hil_env}} "{{venv_python}}" "{{repo_root}}/scripts/gb10/rs-gb10-ros2-hil.py" --live "${@:2}"
-    elif [[ "${1:-}" == "--parse-log" ]]; then
-        "{{venv_python}}" "{{repo_root}}/scripts/gb10/rs-gb10-ros2-hil.py" "$@"
+    # NOTE: just does not populate $1/$@ for shebang recipes on this version — use {{ARGS}}
+    # interpolation, and let the tool itself dispatch --live/--parse-log/--self-test.
+    if [[ "{{ARGS}}" == --live* ]]; then
+        {{hil_env}} "{{venv_python}}" "{{repo_root}}/scripts/gb10/rs-gb10-ros2-hil.py" {{ARGS}}
+    elif [[ -z "{{ARGS}}" ]]; then
+        "{{venv_python}}" "{{repo_root}}/scripts/gb10/rs-gb10-ros2-hil.py" --self-test
     else
-        "{{venv_python}}" "{{repo_root}}/scripts/gb10/rs-gb10-ros2-hil.py" --self-test "$@"
+        "{{venv_python}}" "{{repo_root}}/scripts/gb10/rs-gb10-ros2-hil.py" {{ARGS}}
     fi
 
 # P4 (#31) async-pipelining microbench: shipped cached path vs double-buffered multi-stream. GPU only,
