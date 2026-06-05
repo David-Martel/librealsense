@@ -198,6 +198,19 @@ configure() {
          "${_opencv_cmake_dir}/OpenCVConfig.cmake not found; falling back to system OpenCV"
   fi
 
+  # The KinFu example needs OpenCV's rgbd contrib module (opencv2/rgbd/kinfu.hpp). The GB10 CUDA OpenCV
+  # build does NOT ship it, so a hard -DBUILD_CV_KINFU_EXAMPLE=ON fails the ENTIRE build at the rs-kinfu
+  # target (observed: every pyver build, e.g. py3.14). Auto-detect the header; LRS_GB10_CV_KINFU=ON/OFF overrides.
+  local build_cv_kinfu="${LRS_GB10_CV_KINFU:-}"
+  if [[ -z "$build_cv_kinfu" ]]; then
+    if [[ -f "${LRS_GB10_OPENCV_DIR}/include/opencv4/opencv2/rgbd/kinfu.hpp" ]]; then
+      build_cv_kinfu=ON
+    else
+      build_cv_kinfu=OFF
+      echo "LRS_GB10: opencv rgbd/kinfu.hpp not found -> BUILD_CV_KINFU_EXAMPLE=OFF (LRS_GB10_CV_KINFU=ON to force)"
+    fi
+  fi
+
   cmake -S "$ROOT" -B "$BUILD_DIR" "${generator_args[@]}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$PREFIX" \
@@ -221,7 +234,7 @@ configure() {
     -DBUILD_GRAPHICAL_EXAMPLES=ON \
     -DBUILD_GLSL_EXTENSIONS=ON \
     -DBUILD_CV_EXAMPLES=ON \
-    -DBUILD_CV_KINFU_EXAMPLE=ON \
+    -DBUILD_CV_KINFU_EXAMPLE="$build_cv_kinfu" \
     -DBUILD_PCL_EXAMPLES=ON \
     -DBUILD_PC_STITCHING=ON \
     -DBUILD_OPENNI2_BINDINGS=ON \
