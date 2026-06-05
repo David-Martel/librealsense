@@ -49,3 +49,7 @@ See `forensics/` for any new controller-death set. Result recorded in
 ## ROS2
 ROS2 Jazzy + colcon present. `realsense2_camera` against this custom SDK: see ROS section of
 the multistream doc / open items.
+
+> **Update (2026-06-05):** ROS2 depth stream-start **#26 SOLVED** — minimal config streams 4/4 @ 30 fps,
+> 0 drops, controller GREEN; H1 (manual-exposure-under-AE) REFUTED by 8-run live A/B. See
+> [ros2-stream-start-analysis.md](ros2-stream-start-analysis.md) for the full analysis and results.

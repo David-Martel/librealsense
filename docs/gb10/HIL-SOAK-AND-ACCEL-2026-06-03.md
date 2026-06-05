@@ -1,5 +1,10 @@
 # GB10 long-soak, capture/playback, and CUDA-acceleration reality (2026-06-03)
 
+> **Historical snapshot (2026-06-03).** Soak/playback results and per-op CUDA measurements remain
+> current. The "keep-on-GPU pipeline not evaluated" caveat (§4) has since been resolved: **keep-on-GPU
+> GL chain measured at 1–7 ms/frame saving** at 720p+
+> (see [ROS2-GL-PINNED-FINDINGS-2026-06-05.md](ROS2-GL-PINNED-FINDINGS-2026-06-05.md)).
+
 Host `spark-3066`, D435 on the clean USB-3 bus, full CUDA build (`build-gb10-full`) + a CUDA-OFF
 build (`build-gb10-nocuda`, identical flags minus `BUILD_WITH_CUDA`) for the head-to-head. Tests are
 standardized + idempotent: `scripts/gb10/hil_common.py` (pre-flight gate, continuous controller

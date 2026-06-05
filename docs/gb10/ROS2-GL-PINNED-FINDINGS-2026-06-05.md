@@ -4,6 +4,11 @@ Three specialist agents ran in parallel (offline-only; all live HIL serialized b
 errors enforced on changed files). Results below; reproducible artifacts under `~/realsense-gb10-validation/`.
 
 ## 1. ROS2 `realsense2_camera` — BUILDS against the GB10 SDK ✅ (Jazzy; see §4 for the Lyrica/py3.13 re-target)
+
+> **Update (2026-06-05, post this doc):** Depth stream-start **#26 SOLVED** — the minimal config
+> streams 4/4 @ 30 fps, 0 drops. H1 (manual-exposure-under-AE) refuted by 8-run live A/B; fix is the
+> param combination. See [ros2-stream-start-analysis.md](ros2-stream-start-analysis.md) and
+> `scripts/gb10/ros2-launch-depth-minimal.sh` for the proven baseline launch.
 `realsense-ros` tag **4.58.1** (matches librealsense 2.58.x) colcon-builds clean (exit 0, **zero compiler
 warnings**) against the installed GB10 SDK at `/opt/vigil/opt/librealsense-v2.58.1-dgx-spark-gb10/`. Binding:
 `-Drealsense2_DIR=<sdk>/lib/cmake/realsense2` + `CMAKE_PREFIX_PATH=<sdk>`. The node links

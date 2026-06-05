@@ -4,6 +4,8 @@ Index for the David-Martel librealsense fork's NVIDIA DGX Spark (GB10, aarch64, 
 USB-controller hardening, CUDA/GPU acceleration of the capture→process→render pipeline, and a
 RealSense→3D-pose→render test bed. All findings are HIL-measured on host spark-3066 (D435, FW 5.15.1.55).
 
+**Current master HEAD: `e657daba0` (tag `v2.58.1-gb10.1`). Run `just build-tag` for the live state.**
+
 ## Opt-in build defines (all OFF upstream = byte-identical; gate via `scripts/build-dgx-spark-gb10.sh`)
 | CMake define | env (build script) | runtime | effect |
 |---|---|---|---|
@@ -16,19 +18,29 @@ pools leak at exit by design (no static-teardown `cudaFree` → no shutdown cras
 to the per-frame-malloc baseline. `rs.align` is already cached upstream (no flag — it's the reference impl).
 
 ## Findings docs
-| doc | topic |
-|---|---|
-| [FINDINGS](FINDINGS-2026-06-03.md) | xHCI controller-death root cause (NVIDIA Stop-Endpoint defect) + P2/P3/P4/P7 mitigations |
-| [HIL-RESULTS](HIL-RESULTS-2026-06-03.md), [HIL-MULTISTREAM](HIL-MULTISTREAM-2026-06-03.md) | single/multi-stream HIL survival envelope (eyes-open vs safe) |
-| [HIL-SOAK-AND-ACCEL](HIL-SOAK-AND-ACCEL-2026-06-03.md) | long-soak + **per-op CUDA reality** (align 15-19×; pointcloud cached 3.3×; conversion neutral) |
-| [CUDA-ACCEL-SURFACE-AND-OPPORTUNITIES](CUDA-ACCEL-SURFACE-AND-OPPORTUNITIES-2026-06-03.md) | full CUDA/GPU dependency map + graded opportunities (no NVENC/cuDNN/NPP/TRT in core) |
-| [GPU-PIPELINE-ARCHITECTURE](GPU-PIPELINE-ARCHITECTURE-2026-06-03.md) | USB→process→display→file GPU map; **shared-memory finding** (cache buffers, not zero-copy); GL; TRT probe |
-| [QUALITY-RESULTS](QUALITY-RESULTS-2026-06-03.md) | NVENC encode fidelity (SSIM/XPSNR) |
-| [POSE-PIPELINE-TESTBED-PLAN](POSE-PIPELINE-TESTBED-PLAN-2026-06-03.md) | RealSense→3D-pose→render test bed — **live-proven on hardware** |
-| [FORK-VS-UPSTREAM-AND-CAMERA-FIRMWARE](FORK-VS-UPSTREAM-AND-CAMERA-FIRMWARE-2026-06-03.md) | fork-vs-upstream diff + firmware (downgrade device-blocked; HOLD 5.15.1.55) |
-| [ROS2-GL-PINNED-FINDINGS](ROS2-GL-PINNED-FINDINGS-2026-06-05.md) | parallel-agent results: ROS2 Jazzy builds vs GB10 SDK; keep-on-GPU GL measured win; pinned-mem DROPPED (harmful on coherent memory); py3.13/3.14 re-target plan |
-| [ENHANCEMENT-TARGETS](ENHANCEMENT-TARGETS-2026-06-05.md) | graded open items — R1-R4+P1+U3 all DONE; remaining: P2 filters, P3 depth-format cache, P4 async, O1/O2/O3 ROS2/py |
-| [nvidia-escalation/](nvidia-escalation/) | drafted NVIDIA bug report for the xHCI defect |
+
+Docs dated 2026-06-03 are **historical snapshots** from the initial analysis session; their measured data
+(xHCI root cause, per-op benchmarks, HIL results) remains valid but some open-item claims have since been
+resolved — see the banner at the top of each where applicable, and the current-state docs below.
+Living/current docs have no date suffix.
+
+| doc | topic | status |
+|---|---|---|
+| [FINDINGS](FINDINGS-2026-06-03.md) | xHCI controller-death root cause (NVIDIA Stop-Endpoint defect) + P2/P3/P4/P7 mitigations | historical snapshot — root cause current; open items see ENHANCEMENT-TARGETS |
+| [HIL-RESULTS](HIL-RESULTS-2026-06-03.md), [HIL-MULTISTREAM](HIL-MULTISTREAM-2026-06-03.md) | single/multi-stream HIL survival envelope (eyes-open vs safe) | historical snapshot |
+| [HIL-SOAK-AND-ACCEL](HIL-SOAK-AND-ACCEL-2026-06-03.md) | long-soak + **per-op CUDA reality** (align 15-19×; pointcloud cached 3.3×; conversion neutral) | historical snapshot |
+| [CUDA-ACCEL-SURFACE-AND-OPPORTUNITIES](CUDA-ACCEL-SURFACE-AND-OPPORTUNITIES-2026-06-03.md) | full CUDA/GPU dependency map + graded opportunities (no NVENC/cuDNN/NPP/TRT in core) | historical snapshot |
+| [GPU-PIPELINE-ARCHITECTURE](GPU-PIPELINE-ARCHITECTURE-2026-06-03.md) | USB→process→display→file GPU map; **shared-memory finding** (cache buffers, not zero-copy); GL; TRT probe | historical snapshot — NVENC cq=23/p4 default now set (see nvenc-cq-sweep); keep-on-GPU chain measured (see ROS2-GL-PINNED-FINDINGS) |
+| [QUALITY-RESULTS](QUALITY-RESULTS-2026-06-03.md) | NVENC encode fidelity (SSIM/XPSNR); initial cq=23 noted as under-tuned | historical snapshot — cq sweep completed; see [nvenc-cq-sweep](nvenc-cq-sweep.md) for final recommendation |
+| [POSE-PIPELINE-TESTBED-PLAN](POSE-PIPELINE-TESTBED-PLAN-2026-06-03.md) | RealSense→3D-pose→render test bed — **live-proven on hardware** | historical snapshot — Phase-1 DONE |
+| [FORK-VS-UPSTREAM-AND-CAMERA-FIRMWARE](FORK-VS-UPSTREAM-AND-CAMERA-FIRMWARE-2026-06-03.md) | fork-vs-upstream diff + firmware (downgrade device-blocked; HOLD 5.15.1.55) | historical snapshot — current |
+| [ROS2-GL-PINNED-FINDINGS](ROS2-GL-PINNED-FINDINGS-2026-06-05.md) | parallel-agent results: ROS2 Jazzy builds vs GB10 SDK; keep-on-GPU GL measured win (1–7 ms/frame at 720p+); pinned-mem DROPPED (harmful on coherent memory); py3.13/3.14 re-target plan | current |
+| [ros2-stream-start-analysis](ros2-stream-start-analysis.md) | ROS2 `#26` SOLVED — depth-only streams 4/4 at 30 fps, 0 drops; H1 (manual-exposure-under-AE) REFUTED by 8-run live A/B; fix is the minimal-config param **combination**, no single override isolated | current — do not edit |
+| [nvenc-cq-sweep](nvenc-cq-sweep.md) | NVENC CQ sweep by XPSNR: **cq=23/p4 is the deployed default** for `--record` (knee of quality/size curve; 39.1 dB XPSNR-Y, 10.9× realtime) | current |
+| [p4-async-pipelining](p4-async-pipelining.md) | P4 async pipelining (#31) — measured **NO-GO** for single-camera real-time: op is already 80–270× camera rate and <2.5% of frame budget; overlap collapses at higher res on unified memory | current |
+| [ENHANCEMENT-TARGETS](ENHANCEMENT-TARGETS-2026-06-05.md) | graded open items — R1-R4+P1+U3+O3+#26/#31/#32-NVENC all DONE; remaining: P2 NEON filters, O1 Kilted ROS2, O2 py3.14 | current |
+| [benchmarks](benchmarks.md) | benchmark summary (in progress — being populated by benchmark agent) | pending |
+| [nvidia-escalation/](nvidia-escalation/) | drafted NVIDIA bug report for the xHCI defect | historical |
 
 ## Tooling — `../../scripts/gb10/` (driven by the repo-root `justfile`; run `just`)
 Build: `just build` / `build-hil`. Tests (no HW): `just test`. HIL (needs D435 on USB-3): `just hil-*`.
@@ -37,18 +49,20 @@ Key benchmarks: `hil-align-bench`, `hil-cuda-bench`, `hil-pc-zerocopy`, `hil-gpu
 Additional recipes (all no-camera where noted):
 - `just test-cached` — CUDA cached-pool byte-identity tests (GPU, no camera; R4)
 - `just gb10-doctor` — one-command runtime preflight: toolchain, pyrealsense2, cv2/opencv/ffmpeg, CUDA, GL SDK, DISPLAY, NVENC, controller health, camera+USB-3 (U3)
-- `just hil-keepongpu` — P1 keep-on-GPU depth viewer: `gl::colorizer` output stays a GL texture, drawn straight to screen (no D2H); R2 teardown-order fixed
+- `just hil-keepongpu [--record m.mp4] [--stream color]` — P1 keep-on-GPU depth viewer: `gl::colorizer` output stays a GL texture, drawn straight to screen (no D2H); `--record` uses **NVENC cq=23/p4** (see [nvenc-cq-sweep](nvenc-cq-sweep.md)); R2 teardown-order fixed
+- `just ros2-hil` — ROS2 HIL wrapper (default: offline self-test, CI-safe; `--live` for operator-run); depth-only streams 4/4 @ 30 fps, 0 drops (#26 SOLVED — see [ros2-stream-start-analysis](ros2-stream-start-analysis.md))
+- `just bench-async` — P4 async-pipelining microbench (no camera, GPU); **measured NO-GO** for single-camera real-time; see [p4-async-pipelining](p4-async-pipelining.md)
+- `just nvenc-sweep [INPUT=…]` — NVENC CQ/preset quality sweep (no camera); see [nvenc-cq-sweep](nvenc-cq-sweep.md)
 - `just build-info [build_dir]` — emit/inspect `BUILD_PROVENANCE.json` (git tag+commit, actual compile options, toolchain, `.so` sha, reproduce command)
-- `just build-tag` — current source state (`git describe --tags --dirty`; current: `v2.58.1-gb10.1-4-g935294c5c`)
+- `just build-tag` — current source state (`git describe --tags --dirty`)
 See [`../../scripts/gb10/README.md`](../../scripts/gb10/README.md) for every tool + its safety class.
 
 ## Build provenance & reproducibility
 Every GB10 build records exactly how it was made so it can be reproduced on another system, and so you
 can verify a binary reflects the latest source.
 - **Tag:** the source tree is tagged `v2.58.1-gb10.1` (upstream 2.58.1 + the David-Martel GB10 build). Current
-  head: `v2.58.1-gb10.1-4-g935294c5c` (4 commits ahead of the tag). `just build-tag`
-  (= `git describe --tags --dirty`) shows the current state (a `-dirty`/`-N-g<sha>` suffix means
-  uncommitted/ahead of the tag).
+  head: `e657daba0`. `just build-tag` (= `git describe --tags --dirty`) shows the live state with any
+  `-dirty`/`-N-g<sha>` suffix.
 - **Manifest:** `just build-info [build_dir]` writes `BUILD_PROVENANCE.json` next to the binary, capturing the
   git describe+commit, the **actual** compile options (read from the build's `CMakeCache.txt` — `RS2_GB10_*`,
   CUDA/NEON/RSUSB, cuda-arch, build type), the runtime-mode defaults (`RS2_PC_MODE`/`RS2_CONV_MODE=1`), the

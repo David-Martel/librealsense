@@ -2,7 +2,7 @@
 
 Grounded audit of remaining opportunities in the David-Martel GB10 fork, ranked by (impact × low-risk).
 Each target cites evidence. "Shipped default" = affects the promoted GB10 build today. Measured items link
-the doc that measured them. Updated 2026-06-05 @ master f1abbcb8c.
+the doc that measured them. Updated 2026-06-05 @ master e657daba0.
 
 ## Reliability (highest priority — these affect the promoted default or are known crashes)
 | # | target | evidence | fix | effort |
@@ -15,10 +15,11 @@ the doc that measured them. Updated 2026-06-05 @ master f1abbcb8c.
 ## Performance (measured or high-surface)
 | # | target | evidence | expected | effort |
 |---|--------|----------|----------|--------|
-| P1 | Keep-on-GPU colorize→render — **✅ DONE (+ enhanced)** | live viewer `rs-gb10-keepongpu-viewer.cpp` (`just hil-keepongpu`): live depth → `gl::colorizer` (GL texture) → drawn straight to the on-screen window, **NO D2H**. Enhanced: **`--record` NVENC GPU-to-disk** + rich per-frame telemetry (ts/domain/exposure/fps/render-p50) + `--stream color`. | **Verified live: NVIDIA GB10/PCIe, render p50 3.4ms, NVENC mp4 written, live auto-exposure metadata, controller GREEN, clean teardown (R2) even with record.** | DONE |
+| P1 | Keep-on-GPU colorize→render — **✅ DONE (+ enhanced)** | live viewer `rs-gb10-keepongpu-viewer.cpp` (`just hil-keepongpu`): live depth → `gl::colorizer` (GL texture) → drawn straight to the on-screen window, **NO D2H**. Enhanced: **`--record` NVENC GPU-to-disk** (default cq=23/p4, see [nvenc-cq-sweep](nvenc-cq-sweep.md)) + rich per-frame telemetry (ts/domain/exposure/fps/render-p50) + `--stream color`. | **Verified live: NVIDIA GB10/PCIe, render p50 3.4ms, NVENC mp4 written, live auto-exposure metadata, controller GREEN, clean teardown (R2) even with record.** | DONE |
+| P1b | **NVENC cq/preset default — ✅ DONE (#32-NVENC)** | [`nvenc-cq-sweep.md`](nvenc-cq-sweep.md): 5-point cq sweep (19/23/26/29/33) × 2 presets (p4/p6); XPSNR + size + realtime-factor. **Knee at cq=23/p4**: 39.1 dB XPSNR-Y, 39% larger than source, 10.9× realtime. cq19→23 costs only 2.1 dB and saves 1.4 MB/7.7s (31%); next step costs 3.1 dB for 26%. p6 saves 3–4% file size at 0.4–0.7 dB lower XPSNR — not worth it. | DONE — `--record` default is `-rc vbr -cq 23 -b:v 0 -preset p4` | DONE |
 | P2 | **Scalar post-proc filters have ZERO acceleration** | spatial 499L, temporal 282L, hole-filling 103L, decimation/disparity/threshold — 0 NEON/OMP/CUDA hits | NEON+OpenMP (cross-platform, no GPU copy) — only if a live consumer enables them (opt-in) | M, gated on consumer need |
 | P3 | depth-format conversion CUDA path — **✅ MEASURED, don't cache** | `bench_depth_format_cuda.cu`: Y8I (both-IR) is the hot per-frame path (Y12I is cold/calibration); both have the same per-frame `cudaMalloc` churn as YUYV | caching would save ~57–65% kernel-level (~140–283µs/call) BUT end-to-end is expected plumbing-bound/neutral (Finding A) — **verdict: don't cache**; the real lever for depth latency is keep-on-GPU/async (P1/P4), not per-helper caching | DONE |
-| P4 | **No async pipelining** (single synchronous call per frame) | pinned-mem experiment showed copies aren't the bottleneck; sync IS | double-buffer + CUDA streams to overlap H2D(N+1)/compute(N) — bigger restructure, real for high-fps multi-op | L |
+| P4 | **No async pipelining — ✅ MEASURED, NO-GO** | [`p4-async-pipelining.md`](p4-async-pipelining.md): op already 80–270× camera rate and <2.5% of frame budget; overlap collapses on unified memory at higher res (pointcloud 1280×720: −0.8% efficiency); breaking byte-identical cache contract is pure downside. Conversion shows +58% aggregate throughput at 848×480 but only in offline/batch, not real-time. | DONE — NO-GO; revisit only for offline/batch multi-camera aggregate throughput workload | — |
 
 ## Usability
 | # | target | evidence | fix | effort |
@@ -32,8 +33,8 @@ the doc that measured them. Updated 2026-06-05 @ master f1abbcb8c.
 |---|--------|----------|--------|
 | O1 | ROS2 `realsense2_camera` rebuild vs **Kilted** (newest on 24.04); the L-release on 26.04 | ROS2-GL-PINNED §4 | M |
 | O2 | py3.14 SDK build (py3.13 already proven) | build-gb10-py313 verified | S |
-| O3 | ROS2 depth-only **live** HIL through the node (camera, serialized) | launch ready | S |
+| O3 | ROS2 depth-only live HIL — **✅ DONE (#26 SOLVED)** | [`ros2-stream-start-analysis.md`](ros2-stream-start-analysis.md): minimal config streams 4/4 @ 30 fps, 0 drops; H1 (manual-exposure-under-AE) REFUTED by 8-run A/B; fix is the param combination | DONE | — |
 
-## Recommended order
-R1 (done) → R2 (unblocks P1) → P1 keep-on-GPU integration → R3/R4 → P3 → O3 ROS2 live HIL → O1 Kilted →
-P2 filters (if a consumer needs them) → P4 async pipelining (largest, last).
+## Recommended order (updated — completed items struck)
+~~R1~~ → ~~R2~~ → ~~P1/P1b~~ → ~~R3/R4~~ → ~~P3~~ → ~~O3~~ → O1 Kilted ROS2 → O2 py3.14 →
+P2 NEON filters (only if a live consumer enables them).

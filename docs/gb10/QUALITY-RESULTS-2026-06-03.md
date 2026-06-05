@@ -1,5 +1,9 @@
 # GB10 Frame/Video Quality — measured data (2026-06-03)
 
+> **Historical snapshot (2026-06-03).** The NVENC quality data and verdict (SSIM/XPSNR tables) remain
+> valid. The "tune cq/preset by perceptual metric" recommendation has been actioned: **cq sweep complete,
+> cq=23/p4 is the deployed `--record` default** (see [nvenc-cq-sweep.md](nvenc-cq-sweep.md)).
+
 **Directive: get real data on frame/video rendering, don't assume it renders properly.**
 Host `spark-3066`, D435 on the clean USB-3 bus, full CUDA build (`build-gb10-full`, RSUSB +
 CUDA + pyrealsense2 3.12.3), CUDA OpenCV 4.14 (`cv2.cuda`), NVENC ffmpeg. Single color stream

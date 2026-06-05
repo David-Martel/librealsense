@@ -1,5 +1,11 @@
 # GB10 RealSense — full-pipeline GPU acceleration: USB → Processing → Display → File (2026-06-03)
 
+> **Historical snapshot (2026-06-03).** Measured benchmarks remain valid. Two open recommendations in
+> this doc have since been completed: (1) **NVENC cq sweep done** — cq=23/p4 is the deployed
+> `--record` default (see [nvenc-cq-sweep.md](nvenc-cq-sweep.md)); (2) **keep-on-GPU chain measured**
+> — 1–7 ms/frame saving at 720p+, now documented in [ROS2-GL-PINNED-FINDINGS-2026-06-05.md](ROS2-GL-PINNED-FINDINGS-2026-06-05.md).
+> **P4 async pipelining also resolved: NO-GO** for single-camera real-time (see [p4-async-pipelining.md](p4-async-pipelining.md)).
+
 Goal: push GPU/parallel acceleration through every stage of the RealSense pipeline on DGX Spark / GB10,
 **measure** each claim, and account for the shared (unified) memory architecture. This consolidates the
 op-level review ([`CUDA-ACCEL-SURFACE-AND-OPPORTUNITIES`](CUDA-ACCEL-SURFACE-AND-OPPORTUNITIES-2026-06-03.md))

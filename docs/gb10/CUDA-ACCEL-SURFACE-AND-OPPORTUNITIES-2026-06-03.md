@@ -1,5 +1,13 @@
 # librealsense acceleration surface on GB10 — rs.align dependents, the CUDA/GPU dependency map, and graded opportunities (2026-06-03)
 
+> **Historical snapshot (2026-06-03).** Source-analysis and dependency map remain current. Three
+> opportunities have since been resolved: **Opportunity 1** (async pipelining / double-buffer) measured
+> and **NO-GO** for single-camera real-time (see [p4-async-pipelining.md](p4-async-pipelining.md));
+> **Opportunity 2** (keep-on-GPU GL chain) measured — 1–7 ms/frame saving at 720p+
+> (see [ROS2-GL-PINNED-FINDINGS-2026-06-05.md](ROS2-GL-PINNED-FINDINGS-2026-06-05.md)); **NVENC cq sweep
+> done** — cq=23/p4 deployed (see [nvenc-cq-sweep.md](nvenc-cq-sweep.md)). Opportunity 3 (NEON filters)
+> still open.
+
 Source review of the David-Martel fork (`master`), grounded in greps cited inline. Answers three
 questions: (1) what depends on `rs.align`; (2) does `rs.colorizer` (or anything else) have CUDA or
 CUDA-*linked* dependencies — NVENC/Video-Codec-SDK, cuDNN, DNNL, NPP, TensorRT, nvJPEG; (3) where
