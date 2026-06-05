@@ -18,7 +18,7 @@
 namespace {
     int rs2_pc_mode() {
         static int m = -1;
-        if (m < 0) { const char* e = std::getenv("RS2_PC_MODE"); m = e ? std::atoi(e) : 0; }
+        if (m < 0) { const char* e = std::getenv("RS2_PC_MODE"); m = e ? std::atoi(e) : 1; }  // default 1 = cached-device (promoted)
         return m;
     }
     struct pc_zc_buffers {

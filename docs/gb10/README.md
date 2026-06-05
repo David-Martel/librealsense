@@ -8,10 +8,12 @@ RealSense→3D-pose→render test bed. All findings are HIL-measured on host spa
 | CMake define | env (build script) | runtime | effect |
 |---|---|---|---|
 | `RS2_GB10_USB_TUNING` | `LRS_GB10_USB_TUNING` (default 1) | — | P2 deeper URB pool + P4 gentler stop + P7 re-acquire guard (multistream xHCI mitigations) |
-| `RS2_GB10_PC_ZEROCOPY` | `LRS_GB10_PC_ZEROCOPY` (default 0) | `RS2_PC_MODE` 0/1/2 | pointcloud cached device buffers → **3.3× faster, > NEON** at mode 1 (mode 2 = managed, slower) |
-| `RS2_GB10_CONV_CACHE` | `LRS_GB10_CONV_CACHE` (default 0) | `RS2_CONV_MODE` 0/1 | YUYV→color cached buffers → kernel 5×, **end-to-end ~NEON-parity** at mode 1 |
-Cached ladders are byte-identical to baseline (verified max-abs-diff 0) and runtime-gated OFF by default,
-so compiling them in is harmless. `rs.align` is already cached upstream (no flag — it's the reference impl).
+| `RS2_GB10_PC_ZEROCOPY` | `LRS_GB10_PC_ZEROCOPY` (default **1**) | `RS2_PC_MODE` (default **1**) | pointcloud cached device buffers → **3.3× faster, > NEON** (mode 2 = managed, slower; mode 0 = baseline) |
+| `RS2_GB10_CONV_CACHE` | `LRS_GB10_CONV_CACHE` (default **1**) | `RS2_CONV_MODE` (default **1**) | YUYV→color cached buffers → kernel 5×, **end-to-end ~NEON-parity** (mode 0 = malloc baseline) |
+Cached ladders are **PROMOTED TO DEFAULT** on the GB10 build (mode 1) — byte-identical to baseline
+(verified max-abs-diff 0), `#if`-guarded so an upstream build is still byte-identical, and process-static
+pools leak at exit by design (no static-teardown `cudaFree` → no shutdown crash). `RS2_*_MODE=0` opts back
+to the per-frame-malloc baseline. `rs.align` is already cached upstream (no flag — it's the reference impl).
 
 ## Findings docs
 | doc | topic |

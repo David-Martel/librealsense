@@ -23,7 +23,7 @@
 namespace {
     int rs2_conv_mode() {
         static int m = -1;
-        if (m < 0) { const char* e = std::getenv("RS2_CONV_MODE"); m = e ? std::atoi(e) : 0; }
+        if (m < 0) { const char* e = std::getenv("RS2_CONV_MODE"); m = e ? std::atoi(e) : 1; }  // default 1 = cached (promoted)
         return m;
     }
     struct conv_cache_buffers {
@@ -32,12 +32,11 @@ namespace {
         size_t dst_cap = 0; // bytes allocated for d_dst (format-dependent)
         uint8_t* d_src = nullptr;
         uint8_t* d_dst = nullptr;
-        ~conv_cache_buffers() {
-            // Release on process exit (grow-only during operation; freed by OS anyway, but
-            // explicit cudaFree avoids CUDA shutdown warnings in checked builds).
-            if (d_src) cudaFree(d_src);
-            if (d_dst) cudaFree(d_dst);
-        }
+        // NO destructor by design: this is a process-static singleton. Freeing device memory in a
+        // static destructor races the CUDA runtime's own static teardown (unspecified order) and can
+        // SIGSEGV at process exit. The buffers are intentionally LEAKED at exit (the OS reclaims them);
+        // the cudaFree calls in ensure_*() below run during operation with a live context and are safe.
+        // This matches the pointcloud cached pool (pc_zc_buffers), which likewise has no destructor.
         // Grow-only: reallocate only when the new byte count exceeds current capacity.
         void ensure_src(size_t bytes) {
             if (d_src && src_cap >= bytes) return;
