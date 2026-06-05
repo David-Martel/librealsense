@@ -2,7 +2,14 @@
 
 Grounded audit of remaining opportunities in the David-Martel GB10 fork, ranked by (impact × low-risk).
 Each target cites evidence. "Shipped default" = affects the promoted GB10 build today. Measured items link
-the doc that measured them. Updated 2026-06-05 @ master e657daba0.
+the doc that measured them. Updated 2026-06-05 @ master `f38fd3471`.
+
+> **Reliability roadmap & status now live in [gb10-hardening-optimization-proposals](gb10-hardening-optimization-proposals-2026-06-05.md)**
+> (ranked H1–H10 + what's landed vs next). Landed + HIL-proven this session: the **single-opener cross-process
+> lock** (prevents the 2-process-open death), **H1 safe-stop** (relocates `clear_halt` out of the post-stop
+> window), **F5/F6** (atomic `_active`, NDEBUG-safe teardown), and the libusb error-path fixes (`errno`→`sts`).
+> CUDA acceleration is now LIVE-validated per-op in [accel-validation](accel-validation-2026-06-05.md)
+> (pointcloud cached **1.8×**, align 15–19×, keep-on-GPU 3.43 ms no-D2H; colorize/conversion = honest parity).
 
 ## Reliability (highest priority — these affect the promoted default or are known crashes)
 | # | target | evidence | fix | effort |
@@ -11,6 +18,10 @@ the doc that measured them. Updated 2026-06-05 @ master e657daba0.
 | R2 | GL processing-lane teardown SIGSEGV — **✅ FIXED** | static-lane GPU-object dtors freed GL after the context was gone | **Resolved:** call `rs2::gl::shutdown_processing()` while the context is still current, before `glfwDestroyWindow`/`glfwTerminate`. **Verified in the P1 viewer: clean `return 0`, exit code 0, no SIGSEGV** (was the crash). | DONE |
 | R3 | P7 REFUSE remediation text swallowed — **✅ DONE** | the throw is caught by `create_usb_device` → app saw a generic "No device connected" | **`LOG_ERROR(advice)` before the throw** in `check_device_reacquire` (device-libusb.cpp) so the remediation is visible regardless of the swallowed exception. Gated by `RS2_GB10_USB_TUNING` (upstream byte-identical); rebuilt clean; P7 path intact (hil-p7 no false-fire, GREEN). | DONE |
 | R4 | Cached-pool unit tests — **✅ DONE** | `scripts/gb10/test_cached_pools.cu` + `test-cached-pools.sh` (`just test-cached`) | both pools (pointcloud + conversion) **byte-identical mode0-vs-mode1 across a grow/shrink sequence** (848→1280→424→1280→640: grow, reuse-when-fits, no-shrink, regrow) + mode selection. No camera (GPU only), warning-clean. PASS. | DONE |
+| R5 | **2-process open of one camera → xHCI wedge → reboot** (the #1 death cause; e.g. the dormant UMichProjection standalone run while vigil streams) — **✅ DONE** | `device-libusb.cpp` (`08c0360cb`); vigil-realsense-reliability §footgun | **Single-opener cross-process `flock`** keyed on the USB bus-port id, refcounted per process (depth+color share one lock), acquired before `libusb_ref` (no per-retry leak); auto-released on process death. 2nd process queues, never simultaneous. **Live: Test A queue + Test B same-process depth+color, GREEN.** Gated by `RS2_GB10_USB_TUNING`. | DONE |
+| R6 | **Stop-path `clear_halt` armed in the post-`-110` teardown window** (what vigil's `restart_pipeline` stop→start hits every cycle) — **✅ DONE (H1)** | `uvc-streamer.cpp:225` (`f38fd3471`); FINDINGS death #3 | **H1 SAFE-STOP:** skip the stop-path `reset_endpoint`; rely on `start()`'s unconditional reset (line 184) — relocates `clear_halt` into the settled start window. **Live: 3× stop→start, frames resume, GREEN.** Upstream byte-identical. | DONE |
+| R7 | **`_active` data race + `~usb_context` NDEBUG teardown hang** (deferred audit F5/F6 — the hang is exactly what vigil's restart teardown would hit) — **✅ DONE** | `request-libusb.h`, `context-libusb.cpp` (`8a08572e0`); reliability-audit | F5: `std::atomic<bool>`. F6: kill-flag + `libusb_interrupt_event_handler` before `join()` (gated; libusb 1.0.27). Compile-verified. | DONE |
+| R8+ | **Remaining reliability hardening** (next steps) | gb10-hardening-optimization-proposals (H3/H4/H6/H10) | **H4 reconfigure-without-`stop()`** (re-`config` instead of destroy/recreate — directly removes vigil's `stop()→start()` from the recovery loop) is the highest-value next item; H3 wedge-watchdog (fail-fast); H6 bounded URB-drain; H10 P7 counter robustness; a lock fail-fast variant. | **next** |
 
 ## Performance (measured or high-surface)
 | # | target | evidence | expected | effort |
