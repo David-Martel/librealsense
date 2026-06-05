@@ -239,6 +239,18 @@ hil-keepongpu *ARGS:
     bash "{{repo_root}}/scripts/gb10/rs-gb10-keepongpu-build.sh"
     DISPLAY="${DISPLAY:-:1}" "{{validation_dir}}/rs-gb10-keepongpu-viewer" {{ARGS}}
 
+# Python keep-on-GPU viewer/validator via the rs.gl pybind binding (#30): depth -> rs.gl.colorizer
+# (GL texture) -> drawn straight to the window, NO D2H. Runs under the GL-enabled py3.14 tree
+# (build-gb10-py314 + .venv314 with glfw+PyOpenGL). `--validate` = headless GPU-frame proof (CI-safe,
+# single depth stream); `--view --duration N` = visible viewer. `just hil-keepongpu-py --validate`
+hil-keepongpu-py *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    B="{{validation_dir}}/build-gb10-py314/Release"
+    [ -e "$B"/pyrealsense2.cpython-314-*.so ] || { echo "build-gb10-py314 (GL tree) missing — build it first"; exit 1; }
+    DISPLAY="${DISPLAY:-:1}" PYTHONPATH="$B" LD_LIBRARY_PATH="$B" \
+        "{{validation_dir}}/.venv314/bin/python" "{{repo_root}}/scripts/gb10/rs-gb10-keepongpu-py.py" {{ARGS}}
+
 # DANGER: concurrent multi-stream stress — can KILL the USB controller (reboot to recover).
 # Requires explicit opt-in flag. Arms the journal tripwire + forensics.
 hil-stress-DANGER:
