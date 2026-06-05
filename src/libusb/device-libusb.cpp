@@ -140,10 +140,12 @@ namespace
     // A single process legitimately opens the device's multiple sensors (depth, color); that is refcounted
     // on a DEDICATED counter (device_lock_refcount — NOT reacquire_live, which isn't bumped until commit,
     // late in the ctor, so it would let a concurrent second sensor re-flock). ONE flock is held per device
-    // per process; a DIFFERENT process's flock(LOCK_EX|LOCK_NB) gets EAGAIN — we throw (the enumerator
-    // swallows it and retries, queueing the 2nd process until this one closes — so the two never open
-    // simultaneously). flock auto-releases when the holding process dies (no stale lock after a crash,
-    // unlike a PID-file). Acquired BEFORE libusb_ref_device() so a conflict leaks no ref across retries.
+    // per process; a DIFFERENT process's flock(LOCK_EX|LOCK_NB) gets EAGAIN — we throw, create_usb_device()
+    // catches it and SKIPS the device this enumeration pass (it does not retry that pass), and the caller's
+    // higher-level device detection re-enumerates until the holder closes — so the 2nd process effectively
+    // waits its turn and the two NEVER open simultaneously. flock auto-releases when the holding process
+    // dies (no stale lock after a crash, unlike a PID-file). Acquired BEFORE libusb_ref_device() so a
+    // conflict leaks no ref across re-enumerations; a release-on-throw guard covers a bad_alloc before commit.
 #if defined(RS2_GB10_SINGLE_OPENER_LOCK)
     std::unordered_map< std::string, int >& device_lock_fd()       { static std::unordered_map< std::string, int > m; return m; }
     std::unordered_map< std::string, int >& device_lock_refcount() { static std::unordered_map< std::string, int > m; return m; }
@@ -226,14 +228,34 @@ namespace librealsense
 #endif
 #if defined(RS2_GB10_SINGLE_OPENER_LOCK)
             // Single-opener cross-process lock — acquired here, BEFORE libusb_ref_device() and the
-            // descriptor work below, so that on a conflict (another process holds the device) the throw
-            // leaks nothing: the enumeration path is RETRIED by create_usb_device() on a swallowed throw,
-            // and acquiring after the ref would leak one libusb_ref per retry. Held for the device's
-            // lifetime (released in the destructor when this process's last sensor of the device closes).
+            // descriptor work below, so a conflict (another process holds the device) throws before the
+            // ref/work: create_usb_device() catches it and skips the device this enumeration pass, and the
+            // higher-level device detection retries until the holder releases — so the 2nd process never
+            // opens simultaneously (it opens once this one closes), and acquiring after the ref would leak
+            // one libusb_ref per retry. Held for the device's lifetime (released in the destructor).
+            const std::string _solg_id = reacquire_device_id( info );
             {
                 std::lock_guard< std::mutex > lock( reacquire_mutex() );
-                acquire_single_opener_locked( reacquire_device_id( info ) );
+                acquire_single_opener_locked( _solg_id );   // throws (without state) if another PROCESS holds it
             }
+            // RAII release-on-throw: the acquire mutates state (flock + refcount) but the matching release
+            // runs in the DESTRUCTOR, which a throwing ctor never invokes. The descriptor loop below can
+            // throw std::bad_alloc (make_shared/push_back) — which would otherwise leak the flock for the
+            // whole PROCESS lifetime (a self-lockout: the device could never be reopened). Release the lock
+            // if we throw before commit; disarm once construction succeeds (the destructor owns it then).
+            struct single_opener_unwind_guard
+            {
+                const std::string& id;
+                bool armed = true;
+                ~single_opener_unwind_guard()
+                {
+                    if( armed )
+                    {
+                        std::lock_guard< std::mutex > lock( reacquire_mutex() );
+                        release_single_opener_locked( id );
+                    }
+                }
+            } _solg{ _solg_id };
 #endif
 
             usb_descriptor ud = {desc.bLength, desc.bDescriptorType, std::vector<uint8_t>(desc.bLength)};
@@ -291,6 +313,10 @@ namespace librealsense
             }
             libusb_ref_device(_device);
 
+#if defined(RS2_GB10_SINGLE_OPENER_LOCK)
+            // Construction has passed every throwing step — hand the single-opener lock to the destructor.
+            _solg.armed = false;
+#endif
             // P7: register this live instance only after a fully successful construction,
             // so it pairs 1:1 with the destructor's release (a throwing ctor never commits).
 #if defined(RS2_GB10_USB_TUNING) && RS2_GB10_USB_TUNING
