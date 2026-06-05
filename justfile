@@ -226,6 +226,13 @@ ros2-hil *ARGS:
 bench-async:
     bash "{{repo_root}}/scripts/gb10/async-pipeline-bench.sh"
 
+# NEON+OpenMP depth-filter feasibility microbench (#32, no camera): scalar-vs-NEON-vs-NEON+OpenMP for the
+# src/proc post-process filters (all pure scalar/unparallelized on aarch64; gcc doesn't autovec the branchy
+# loops). Measured GO in isolation (threshold 5.3x, disparity 4.7x, temporal 3.5x NEON; spatial/decimation
+# OpenMP) — but consumer-gated (vigil uses rs.align/CUDA, not these). See docs/gb10/neon-openmp-filters.md.
+gb10-bench-filters:
+    bash "{{repo_root}}/scripts/gb10/bench-filters.sh"
+
 # NVENC cq quality sweep (#32, offline): sweep h264_nvenc cq x preset on a recorded clip, measure
 # size/time/XPSNR -> recommended default cq=23 p4 (now the keep-on-GPU --record default). NO camera.
 # Defaults INPUT to the recorded keepongpu clip in the validation dir. See docs/gb10/nvenc-cq-sweep.md.
