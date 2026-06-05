@@ -95,3 +95,31 @@ firmware (stay on 5.15.1.55); do not flash** while benchmarking/robustness/ROS2-
   changed) — see the firmware doc. Every suite run arms the tripwire and aborts on `HC died`.
 - The underlying defect (GB10 xHCI cannot complete a Stop-Endpoint after a `-110`) is **NVIDIA's**;
   see `docs/gb10/nvidia-escalation/`. These tools reduce the trigger surface, they cannot fix the crash.
+
+## Debugging utilities (repo'd 2026-06-05)
+
+Low-level diagnostics that live in `scripts/gb10/` alongside the HIL suite. Run from inside the repo
+tree (all self-relative `$(dirname "$0")` references resolve correctly). The out-of-band debugging brief
+that drove their creation is at [`../../docs/gb10/realsense-debugging-notes.md`](../../docs/gb10/realsense-debugging-notes.md).
+
+| tool | what / how to run |
+|------|-------------------|
+| `rs-gb10-healthcheck.sh` | Idempotent, independently-verifiable RealSense health gate. Produces a structured PASS/FAIL report + raw artifacts. **Does not open the camera for streaming.** Default output dir: `~/realsense-gb10-validation`. Run: `bash scripts/gb10/rs-gb10-healthcheck.sh` (add `--out DIR` to redirect artifacts). |
+| `rs-gb10-stress-matrix.py` | Multi-resolution/fps stress test: open+stream across a matrix of width×height×fps combinations, checking for dropped frames and control-path errors. Run standalone: `python3 scripts/gb10/rs-gb10-stress-matrix.py --help` or via `rs-gb10-stress.sh`. |
+| `rs-gb10-stress.sh` | Wrapper that drives `rs-gb10-stress-matrix.py` across a predefined resolution/fps matrix (60 fps + high-rate modes) with optional usbmon capture. Run: `bash scripts/gb10/rs-gb10-stress.sh` (calls sibling scripts via `$(dirname)`; artifact dir `~/realsense-gb10-validation/stress-matrix-<ts>`). |
+| `rs-gb10-usb2-guard.sh` | USB-2 link fail-fast guard. Detects whether the camera is negotiated at USB 2.x (instead of USB 3) and aborts with a clear error — prevents streaming on a degraded link that can trigger xHCI wedges. Run: `bash scripts/gb10/rs-gb10-usb2-guard.sh` (integrates into other scripts as a preflight). |
+| `rs-gb10-usbmon-capture.sh` | Low-level USB protocol capture helper (usbmon). Start/stop/forensics sub-commands. Used by `rs-gb10-stress.sh` and manually for packet-level debugging. Run: `bash scripts/gb10/rs-gb10-usbmon-capture.sh start <bus> <outdir> <secs>` / `stop <outdir>` / `forensics <outdir> <journal-delta>`. Needs `usbmon` kernel module + `sudo`. |
+| `rs_gpu_preview.py` | GPU-accelerated RealSense frame preview helper. Renders depth/color frames via CUDA/OpenGL to a display window, useful for live sanity checks without the full HIL harness overhead. Run: `python3 scripts/gb10/rs_gpu_preview.py --help`. |
+
+### Skipped / not copied
+
+| file | reason |
+|------|--------|
+| `rs-gb10-churn-test.py` | Already in repo as `scripts/gb10/rs-gb10-churn-test.py` |
+| `rs-gb10-hil-advanced.py` | Already in repo as `scripts/gb10/rs-gb10-hil-advanced.py` |
+| `rs-gb10-hil-multistream.py` | Already in repo as `scripts/gb10/rs-gb10-hil-multistream.py` |
+| `rs-gb10-p7-confirm.py` | Already in repo as `scripts/gb10/rs-gb10-p7-confirm.py` |
+| `rs-gb10-hil.py` (1349 lines) | Superseded by `rs-gb10-hil-suite.py` + `rs-gb10-hil-advanced.py` + `rs-gb10-hil-multistream.py` in this repo; no in-repo script references it |
+| `rs-gb10-hil.sh` (547 lines) | Same supersession as `rs-gb10-hil.py` above |
+| `rs-gb10-validate-patched.py` | **DEPRECATED — DO NOT USE.** Header says: "This script caused xHCI controller death #2 (2026-06-03)." |
+| `rs-gb10-validate-patched.sh` | Calls the deprecated `rs-gb10-validate-patched.py` at line 52 — tainted by association; excluded |
