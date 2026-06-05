@@ -222,7 +222,22 @@ namespace librealsense
 
                 _frames_archive->wait_until_empty();
 
+#if !(defined(RS2_GB10_USB_TUNING) && RS2_GB10_USB_TUNING)
+                // Upstream resets (libusb_clear_halt) the read endpoint on every stop — byte-identical here.
                 _context.messenger->reset_endpoint(_read_endpoint, RS2_USB_ENDPOINT_DIRECTION_READ);
+#else
+                // H1 (GB10 SAFE-STOP): SKIP the read-endpoint reset on stop. clear_halt is a
+                // Stop-Endpoint-arming control transfer; issuing it during the immediate post-stop
+                // teardown — which on the GB10 xHCI can race a -110 control timeout (the lethal sequence,
+                // FINDINGS death #3) — is exactly what vigil's restart_pipeline() stop->start recovery hits
+                // every cycle. We RELOCATE the clear_halt to start()'s unconditional reset_endpoint (line
+                // 184): that moves it OUT of the post-error teardown window and INTO the settled start
+                // window (after the recovery's stop + ~0.5s + fresh-pipeline rebuild), when the controller
+                // has calmed. Correctness holds because start() always clears the endpoint before the first
+                // transfer, and nothing transfers on _read_endpoint between stop and start (control is on
+                // ep0), so a momentarily-halted read endpoint in that window is inert. One fewer armed
+                // Stop-Endpoint per stream per teardown, issued only after traffic has settled.
+#endif
 
                 _publish_frame_thread->stop();
 
