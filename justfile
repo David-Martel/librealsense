@@ -199,6 +199,13 @@ ros2-single:
     @echo "ros2 launch realsense2_camera rs_launch.py enable_color:=false enable_gyro:=false enable_accel:=false depth_module.depth_profile:=848x480x60"
     @echo "(Build realsense-ros against {{hil_build_dir}} first; default all-stream config is proven lethal on GB10.)"
 
+# P1 keep-on-GPU viewer: live depth -> gl::colorizer (output stays a GL texture) -> drawn straight to the
+# on-screen window (NO device->host readback) on the GB10 GPU. R2 teardown fixed (rs2_gl_shutdown_processing
+# before context destroy -> clean exit, no SIGSEGV). Single depth stream = SAFE. `--duration N`, `--size WxH`.
+hil-keepongpu *ARGS:
+    bash "{{repo_root}}/scripts/gb10/rs-gb10-keepongpu-build.sh"
+    DISPLAY="${DISPLAY:-:1}" "{{validation_dir}}/rs-gb10-keepongpu-viewer" {{ARGS}}
+
 # DANGER: concurrent multi-stream stress — can KILL the USB controller (reboot to recover).
 # Requires explicit opt-in flag. Arms the journal tripwire + forensics.
 hil-stress-DANGER:
