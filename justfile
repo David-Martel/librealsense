@@ -204,6 +204,33 @@ ros2-single:
     @echo "ros2 launch realsense2_camera rs_launch.py enable_color:=false enable_gyro:=false enable_accel:=false depth_module.depth_profile:=848x480x60"
     @echo "(Build realsense-ros against {{hil_build_dir}} first; default all-stream config is proven lethal on GB10.)"
 
+# Parse-log self-test for the ROS2 HIL wrapper: offline, no camera, CI-safe.
+# Parses the proven 2026-06-05 HIL log and asserts 708 frames / 30.03 fps / 0 drops / PASS.
+# Override LOG= to check a different file.  `just ros2-hil --live` runs the live camera path.
+ros2-hil *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    LOG="${LOG:-{{validation_dir}}/ros2-depth-minimal-20260605-134449.log}"
+    if [[ "${1:-}" == "--live" ]]; then
+        {{hil_env}} "{{venv_python}}" "{{repo_root}}/scripts/gb10/rs-gb10-ros2-hil.py" --live "${@:2}"
+    elif [[ "${1:-}" == "--parse-log" ]]; then
+        "{{venv_python}}" "{{repo_root}}/scripts/gb10/rs-gb10-ros2-hil.py" "$@"
+    else
+        "{{venv_python}}" "{{repo_root}}/scripts/gb10/rs-gb10-ros2-hil.py" --self-test "$@"
+    fi
+
+# P4 (#31) async-pipelining microbench: shipped cached path vs double-buffered multi-stream. GPU only,
+# NO camera. Verdict on file: NO-GO for the single-camera real-time path (op is already 80-270x the camera
+# rate; overlap is bandwidth-capped on GB10 unified memory). See docs/gb10/p4-async-pipelining.md.
+bench-async:
+    bash "{{repo_root}}/scripts/gb10/async-pipeline-bench.sh"
+
+# NVENC cq quality sweep (#32, offline): sweep h264_nvenc cq x preset on a recorded clip, measure
+# size/time/XPSNR -> recommended default cq=23 p4 (now the keep-on-GPU --record default). NO camera.
+# Defaults INPUT to the recorded keepongpu clip in the validation dir. See docs/gb10/nvenc-cq-sweep.md.
+nvenc-sweep INPUT="" CQ_LIST="19 23 26 29 33" PRESET_LIST="p4 p6":
+    bash "{{repo_root}}/scripts/gb10/nvenc-cq-sweep.sh" "{{INPUT}}" "{{CQ_LIST}}" "{{PRESET_LIST}}"
+
 # P1 keep-on-GPU viewer: live depth -> gl::colorizer (output stays a GL texture) -> drawn straight to the
 # on-screen window (NO device->host readback) on the GB10 GPU. R2 teardown fixed (rs2_gl_shutdown_processing
 # before context destroy -> clean exit, no SIGSEGV). Single depth stream = SAFE. `--duration N`, `--size WxH`.

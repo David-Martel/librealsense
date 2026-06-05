@@ -218,11 +218,16 @@ struct FfmpegPipe {
         const char* ffbin = getenv("LRS_FFMPEG_BIN");
         if (!ffbin || ffbin[0] == '\0') ffbin = "/usr/bin/ffmpeg";
 
-        // Build the command string safely
+        // Build the command string safely.
+        // NVENC quality: constant-quality VBR cq=23 @ preset p4 — the measured knee of the
+        // quality/size curve from the cq sweep (docs/gb10/nvenc-cq-sweep.md): ~39 dB XPSNR-Y at the
+        // best dB-per-MB tradeoff, ~11x real-time. cq=23 is the quality-safe pick for a capture/debug
+        // tool (the sweep's source was already H.264-coded, so the raw-frame knee may sit ~1 step
+        // coarser; bias to quality). Override the whole encode via LRS_FFMPEG_BIN if needed.
         char cmd[2048];
         int n = snprintf(cmd, sizeof(cmd),
             "%s -y -f rawvideo -pixel_format rgba -video_size %dx%d -framerate %d -i pipe:0 "
-            "-vf vflip -c:v h264_nvenc -preset p4 -an \"%s\" 2>/dev/null",
+            "-vf vflip -c:v h264_nvenc -preset p4 -rc vbr -cq 23 -b:v 0 -an \"%s\" 2>/dev/null",
             ffbin, fbw, fbh, stream_fps, out_path.c_str());
         if (n < 0 || static_cast<size_t>(n) >= sizeof(cmd)) {
             printf("RECORD: command too long — recording disabled\n");

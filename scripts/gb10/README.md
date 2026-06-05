@@ -38,6 +38,7 @@ percentile stats, `--display` (non-headless on-screen render + `x11grab` proof).
 |--------|------|--------|
 | `just hil-soak [--display] [--scale S]` | phased single→dual+align→start/stop churn→quad-stream soak (~5 min at scale 1.0) + control-feature exercise (emitter/laser/preset/auto-exposure — the `-110` trigger class) | **eyes-open multi-stream** (can kill controller → reboot); tripwire aborts |
 | `just hil-capture-playback [--display]` | record→rosbag2 **`.db3`**→replay (real-time + max-speed loops), verify deterministic replay | single+dual record; tripwire |
+| `just ros2-hil` | **ROS2 depth-only HIL wrapper** (`rs-gb10-ros2-hil.py`): default = parser self-test against the proven 2026-06-05 log (offline, CI-safe); `just ros2-hil --live [--duration N]` = operator-run live launch (SAFE single-stream, 25 s default); `just ros2-hil --parse-log FILE` = parse any captured log. PASS iff frames>0, fps≈30, 0 fatals, controller GREEN. | default: **no hardware** (parse-log/self-test); `--live`: single depth stream = SAFE; tripwire armed |
 
 ## Individual HIL / quality tools
 | tool | recipe | what |
