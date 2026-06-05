@@ -16,6 +16,26 @@ Design (kept deliberately simple + testable):
     interactive viewer surfaces the error on-screen and re-acquires only on an explicit 'r' keypress
     (one guarded stop/start) — never an auto retry-loop (that churn is what kills the GB10 xHCI).
 
+Validate-mode PASS/FAIL gates (all must hold; report-only items never fail a synthetic edge case):
+  rendered_on_screen      screen grab is non-blank (std > 5)
+  our_content_on_screen   our green HUD overlay is visible in the grab
+  live_video_not_frozen   two grabs differ (the render is live, not a still)
+  framerate_ok            steady delivered fps >= profile fps - 3
+  smooth_no_stutter       <= 1 inter-frame stutter
+  clip_recorded           the NVENC/x264 .mp4 exists and decodes as h264
+  controller_green        no xHCI/HC-death tripwire fired
+  frames_monotonic        hardware frame numbers strictly increase            [continuity]
+  no_dropped_frames       zero missing hw frames between consecutive numbers  [continuity, 0-tolerance]
+  arrival_gap_sane        largest inter-frame wall gap within bound           [continuity]
+  ts_domain_consistent    all frames share one timestamp domain               [continuity]
+  depth_not_all_zero      depth frame has some reading (depth runs only)      [depth integrity]
+  depth_not_saturated     depth frame is not (near-)entirely 0xFFFF           [depth integrity]
+  depth_not_frozen        consecutive raw depth frames are not identical      [depth integrity]
+REPORT-ONLY (logged, never gating): continuity.max_gap_ms / ts_domain, depth_integrity.valid_ratio /
+  in_range_ratio / valid_ratio_in_band — scene-dependent (e.g. aimed at sky) so they would false-fail.
+The continuity + depth-integrity math are PURE (continuity_checks / depth_checks) and unit-exercised
+offline by --self-test with synthetic frame-number / gap / domain sequences and synthetic z16 arrays.
+
 Controls (`--interactive`): 1-9 profile(size x fps)  c/d color/depth  e emitter  a auto-exp  [ ] exposure
   - = gain   l/L laser   p preset   f freeze   r re-acquire after a stream error   s snapshot   h help   q quit
 """
@@ -114,6 +134,85 @@ def grab_checks(img_a, img_b):
         n = min(img_a.shape[0], img_b.shape[0]); m = min(img_a.shape[1], img_b.shape[1])
         out["live_change_meandiff"] = round(
             float(np.abs(img_a[:n, :m].astype(np.int16) - img_b[:n, :m].astype(np.int16)).mean()), 3)
+    return out
+
+
+def depth_checks(depth_u16, depth_scale, min_m, max_m, prev_u16=None,
+                 valid_lo=0.05, valid_hi=0.999):
+    """Depth-frame integrity over a raw z16 numpy array (uint16). Pure; used by --self-test too.
+
+    `depth_u16` is the RAW sensor frame (0 == no-reading, 0xFFFF == saturated); meters = raw*depth_scale.
+    Returns:
+      valid_ratio        fraction of non-zero (has-a-reading) pixels
+      in_range_ratio     fraction of valid pixels whose metric depth lies in [min_m, max_m]
+      not_all_zero       frame has SOME reading (gate)            — fails a dead/all-zero stream
+      not_saturated      frame is not (near-)entirely 0xFFFF (gate)
+      valid_ratio_in_band  valid_ratio within [valid_lo, valid_hi]  — REPORT-ONLY (scene-dependent)
+      frozen             True iff exactly identical to prev_u16    — gate (true freeze only; exact equality)
+    """
+    out = {"valid_ratio": 0.0, "in_range_ratio": 0.0, "not_all_zero": False,
+           "not_saturated": False, "valid_ratio_in_band": False, "frozen": None}
+    if depth_u16 is None:
+        return out
+    d = np.asarray(depth_u16)
+    total = int(d.size)
+    if total == 0:
+        return out
+    valid = d != 0
+    nvalid = int(valid.sum())
+    out["valid_ratio"] = round(nvalid / total, 4)
+    out["not_all_zero"] = nvalid > 0
+    # saturated == max z16; a frame that is (almost) entirely saturated is a fault
+    sat = int((d == 0xFFFF).sum())
+    out["not_saturated"] = (sat / total) < 0.99
+    if nvalid > 0:
+        meters = d[valid].astype(np.float64) * float(depth_scale)
+        in_range = int(((meters >= min_m) & (meters <= max_m)).sum())
+        out["in_range_ratio"] = round(in_range / nvalid, 4)
+    out["valid_ratio_in_band"] = bool(valid_lo <= out["valid_ratio"] <= valid_hi)
+    if prev_u16 is not None:
+        p = np.asarray(prev_u16)
+        # exact equality == a true freeze (real depth is noisy frame-to-frame); shape-mismatch != frozen
+        out["frozen"] = bool(p.shape == d.shape and np.array_equal(p, d))
+    return out
+
+
+def continuity_checks(frame_numbers, gaps_ms=None, domains=None, gap_max_ms=None):
+    """Frame continuity / metadata sanity over the run. Pure; used by --self-test too.
+
+    frame_numbers   list of per-frame hardware frame numbers (in arrival order)
+    gaps_ms         list of inter-frame wall-clock gaps in ms (the run's existing `gaps`)
+    domains         list of per-frame timestamp-domain strings (e.g. "Global Time"/"System Time")
+    gap_max_ms      sane upper bound for a single arrival gap (default: 5x the median gap, floor 250ms)
+    Returns:
+      delivered        count of frame numbers seen
+      monotonic        frame numbers strictly increase (gate)
+      dropped_frames   sum of (gap-1) over consecutive increasing pairs == missing hw frames (gate, 0-tol)
+      max_gap_ms       largest inter-frame wall gap (report)
+      gap_sane         max_gap_ms <= gap_max_ms (gate)
+      ts_domain        the (last) timestamp domain string seen (report)
+      ts_domain_consistent  all frames share one domain (gate)
+    """
+    fnums = [int(x) for x in (frame_numbers or [])]
+    out = {"delivered": len(fnums), "monotonic": True, "dropped_frames": 0,
+           "max_gap_ms": 0.0, "gap_sane": True, "ts_domain": None, "ts_domain_consistent": True}
+    dropped = 0
+    for prev, cur in zip(fnums, fnums[1:]):
+        if cur <= prev:
+            out["monotonic"] = False
+        else:
+            dropped += (cur - prev) - 1
+    out["dropped_frames"] = int(dropped)
+    g = [float(x) for x in (gaps_ms or [])]
+    if g:
+        out["max_gap_ms"] = round(max(g), 3)
+        if gap_max_ms is None:
+            gap_max_ms = max(250.0, 5.0 * float(np.median(g)))
+        out["gap_sane"] = bool(out["max_gap_ms"] <= gap_max_ms)
+    doms = [d for d in (domains or []) if d is not None]
+    if doms:
+        out["ts_domain"] = doms[-1]
+        out["ts_domain_consistent"] = (len(set(doms)) == 1)
     return out
 
 
@@ -269,6 +368,41 @@ def run_self_test():
     check("compose_hud returns frame", hud is not None and hud.shape == (200, 400, 3))
     check("compose_hud paints green line", int(((hud[:, :, 1] > 170) & (hud[:, :, 2] < 110) & (hud[:, :, 0] < 110)).sum()) > 50)
 
+    # depth-frame integrity math on synthetic raw z16 arrays (scale 0.001 m/unit; band [0.1,10]m)
+    scale = 0.001
+    good = np.full((48, 64), 1500, np.uint16); good[:8, :] = 0          # ~83% valid @ 1.5m
+    nxt = good.copy(); nxt[20:30, 20:30] = 1600                          # a region changed -> not frozen
+    dg = depth_checks(good, scale, 0.1, 10.0, prev_u16=nxt)
+    check("depth: valid_ratio sane", 0.7 < dg["valid_ratio"] < 0.9)
+    check("depth: in-range pixels", dg["in_range_ratio"] > 0.99)
+    check("depth: not_all_zero true", dg["not_all_zero"] is True)
+    check("depth: not_saturated true", dg["not_saturated"] is True)
+    check("depth: differing pair -> not frozen", dg["frozen"] is False)
+    check("depth: identical pair -> frozen", depth_checks(good, scale, 0.1, 10.0, prev_u16=good)["frozen"] is True)
+    zero = np.zeros((48, 64), np.uint16)
+    check("depth: all-zero fails not_all_zero", depth_checks(zero, scale, 0.1, 10.0)["not_all_zero"] is False)
+    sat = np.full((48, 64), 0xFFFF, np.uint16)
+    check("depth: all-saturated fails not_saturated", depth_checks(sat, scale, 0.1, 10.0)["not_saturated"] is False)
+    far = np.full((48, 64), 50000, np.uint16)                            # 50m -> out of [0.1,10] band
+    check("depth: out-of-range -> low in_range_ratio", depth_checks(far, scale, 0.1, 10.0)["in_range_ratio"] < 0.01)
+    check("depth: None-frame safe", depth_checks(None, scale, 0.1, 10.0)["not_all_zero"] is False)
+
+    # frame continuity / metadata math on synthetic frame-number / gap / domain sequences
+    cc = continuity_checks([10, 11, 12, 13, 14], gaps_ms=[33.0, 34.0, 33.0],
+                           domains=["Global Time"] * 5)
+    check("cont: clean seq dropped==0", cc["dropped_frames"] == 0)
+    check("cont: clean seq monotonic", cc["monotonic"] is True)
+    check("cont: clean seq gap_sane", cc["gap_sane"] is True)
+    check("cont: clean seq domain consistent", cc["ts_domain_consistent"] is True)
+    cc2 = continuity_checks([10, 11, 14, 15], gaps_ms=[33.0, 99.0, 33.0])  # gap 11->14 == 2 dropped
+    check("cont: gap seq dropped==2", cc2["dropped_frames"] == 2)
+    check("cont: non-increasing -> not monotonic", continuity_checks([10, 11, 11, 12])["monotonic"] is False)
+    cc3 = continuity_checks([1, 2, 3], gaps_ms=[1000.0], gap_max_ms=250.0)  # huge gap -> not sane
+    check("cont: huge gap -> gap_sane False", cc3["gap_sane"] is False)
+    cc4 = continuity_checks([1, 2], domains=["Global Time", "System Time"])
+    check("cont: mixed domains -> inconsistent", cc4["ts_domain_consistent"] is False)
+    check("cont: empty seq safe", continuity_checks([])["dropped_frames"] == 0)
+
     print(f"\nself-test: {'PASS' if not fails else 'FAIL ' + str(fails)}  ({len(fails)} failures)")
     return 0 if not fails else 1
 
@@ -337,6 +471,13 @@ def run(args):
             "l/L laser  p preset  f freeze  r re-acquire  s snapshot  h help  q quit"]
     show_help = args.interactive; frozen = False
     last = None; gaps = []; delivered = 0; i = 0; ok = True; status = ""; cur_img = None; stream_err = 0
+    frame_nums = []; domains = []                      # continuity / metadata accumulators
+    depth_scale = None; prev_depth_u16 = None; depth_pair = None   # depth-integrity (raw z16)
+    if cam.family == "depth" and cam.depth_sensor is not None:
+        try:
+            depth_scale = float(cam.depth_sensor.get_depth_scale())
+        except Exception:
+            depth_scale = None
     t_start = time.time()
     try:
         while True:
@@ -348,14 +489,28 @@ def run(args):
                         status = "stream error — failing fast"; ok = False; break
                     status = f"stream error #{stream_err} — press 'r' to re-acquire, 'q' to quit"
                 else:
-                    img = (np.asanyarray(frame.get_data()) if cam.family == "color"
-                           else np.asanyarray(colorizer.colorize(frame).get_data()))
+                    if cam.family == "color":
+                        img = np.asanyarray(frame.get_data())
+                    else:
+                        depth_u16 = np.asanyarray(frame.get_data())   # RAW z16 (integrity), not colorized
+                        img = np.asanyarray(colorizer.colorize(frame).get_data())
+                        if i > WARMUP and prev_depth_u16 is not None:
+                            depth_pair = (prev_depth_u16, depth_u16)  # keep latest consecutive raw pair
+                        prev_depth_u16 = depth_u16
                     now = time.time()
                     if last is not None and i > WARMUP:
                         gaps.append((now - last) * 1000.0)
                     last = now; delivered += 1; i += 1
                     cur_img = img
                     meta = md_lines(rs, frame)
+                    try:
+                        frame_nums.append(int(frame.get_frame_number()))
+                    except Exception:
+                        pass
+                    try:
+                        domains.append(str(frame.get_frame_timestamp_domain()).split(".")[-1])
+                    except Exception:
+                        pass
             if cur_img is None:
                 if cv2.waitKey(30) & 0xFF == ord('q'):
                     break
@@ -408,7 +563,10 @@ def run(args):
         cv2.destroyAllWindows(); cv2.waitKey(1)
         mon.join(timeout=2)
 
-    return _finish(hil, args, cam, gaps, delivered, grabs, ok)
+    dchecks = (depth_checks(depth_pair[1], depth_scale, 0.1, 10.0, prev_u16=depth_pair[0])
+               if (cam.family == "depth" and depth_pair is not None and depth_scale) else None)
+    cchecks = continuity_checks(frame_nums, gaps_ms=gaps, domains=domains)
+    return _finish(hil, args, cam, gaps, delivered, grabs, ok, dchecks, cchecks)
 
 
 def _camera_key(key, cam, cv2):
@@ -437,7 +595,7 @@ def _camera_key(key, cam, cv2):
     return None
 
 
-def _finish(hil, args, cam, gaps, delivered, grabs, ok):
+def _finish(hil, args, cam, gaps, delivered, grabs, ok, dchecks=None, cchecks=None):
     import cv2
     steady_fps = round(1000.0 / float(np.median(gaps)), 1) if gaps else 0.0
     med = float(np.median(gaps)) if gaps else 0.0
@@ -445,6 +603,10 @@ def _finish(hil, args, cam, gaps, delivered, grabs, ok):
     hil.report.update({"frames_rendered": delivered, "delivered_fps": steady_fps,
                        "interframe_gap_ms": H.stats(gaps), "stutter_count": stutters,
                        "final_profile": list(cam.whf) if cam.whf else None})
+    if cchecks is not None:
+        hil.report["continuity"] = cchecks
+    if dchecks is not None:
+        hil.report["depth_integrity"] = dchecks
     if args.interactive:
         hil.report["result"] = "PASS" if (ok and not hil.report["controller_death"]) else "FAIL"
         hil.finish(ok=ok)
@@ -468,6 +630,17 @@ def _finish(hil, args, cam, gaps, delivered, grabs, ok):
         "clip_recorded": v["recorded_ok"],
         "controller_green": not hil.report["controller_death"],
     }
+    # Frame continuity / metadata gates (apply to every run; valid_ratio band stays report-only).
+    if cchecks is not None:
+        checks["frames_monotonic"] = cchecks["monotonic"]
+        checks["no_dropped_frames"] = cchecks["dropped_frames"] == 0
+        checks["arrival_gap_sane"] = cchecks["gap_sane"]
+        checks["ts_domain_consistent"] = cchecks["ts_domain_consistent"]
+    # Depth-frame integrity gates (depth runs only; valid_ratio_in_band reported, not gated).
+    if dchecks is not None:
+        checks["depth_not_all_zero"] = dchecks["not_all_zero"]
+        checks["depth_not_saturated"] = dchecks["not_saturated"]
+        checks["depth_not_frozen"] = (dchecks["frozen"] is False)
     hil.report["checks"] = checks
     passed = ok and all(checks.values())
     hil.report["result"] = "PASS" if passed else "FAIL"
