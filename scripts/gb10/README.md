@@ -14,6 +14,11 @@ Findings these tools produced live in [`../../docs/gb10/`](../../docs/gb10/).
     and the `.venv313` interpreter. cv2 there is the **stock `opencv-python` 4.11 wheel** (display/HUD
     only — the CUDA-OpenCV `cv2` binding is still 3.12; a 3.13 CUDA-OpenCV rebuild is the remaining gap).
     numpy stays pinned 1.26.4. Build a new pyver tree with `PYTHON_EXECUTABLE=…/.venv313/bin/python ../build-dgx-spark-gb10.sh`.
+  - **Python 3.14:** `LRS_PY_TAG=python3.14` → canonical `build-gb10-py314` + `.venv314` (CPython 3.14.5). Full
+    SDK tree built (pybind11 2.13.6 supports 3.14; **sccache**-accelerated) and **live camera-validated**
+    (D435, 60 gapless depth frames, controller GREEN). `.venv314` has no numpy (not needed to build; numpy
+    1.26.4 has no cp314 wheel) and no cv2 — so the cv2-based display tools (and `gb10-doctor`'s cv2 check)
+    are 3.12/3.13-only; the binding + tools are fine. Builds with sccache for C++/CUDA (vcpkg N/A — deps are vendored).
 - **CUDA OpenCV 4.14 + NVENC ffmpeg** at `/opt/gb10-cuda/install` — add `{opencv,ffmpeg}/lib` to
   `LD_LIBRARY_PATH` and the opencv `site-packages` to `PYTHONPATH` for `cv2`/quality/encode tools.
 The `just` recipes set all of this; run tools by hand only with the same env.
