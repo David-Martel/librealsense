@@ -83,7 +83,13 @@ namespace
 
         const auto advice = librealsense::usb_tuning::reacquire_advice( device_id, total_before );
         if( action == librealsense::usb_tuning::reacquire_action::refuse )
+        {
+            // The throw is caught by create_usb_device() upstream (enumerator-libusb.cpp), which then
+            // reports a generic "No device connected" — so the operator would never see WHY the device
+            // refused. LOG_ERROR the remediation here so it is visible regardless of the swallowed throw.
+            LOG_ERROR( "GB10 re-acquire REFUSED: " << advice );
             throw std::runtime_error( advice );
+        }
         LOG_WARNING( advice );
     }
 
