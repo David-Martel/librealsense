@@ -43,6 +43,12 @@ FORCE_RSUSB="${LRS_GB10_FORCE_RSUSB:-ON}"
 # Enable GB10-specific USB mitigations (P2 URB pool depth + P4 watchdog rate-limit + stop settle).
 # Set LRS_GB10_USB_TUNING=0 to produce a vanilla build without the GB10 defaults baked in.
 GB10_USB_TUNING="${LRS_GB10_USB_TUNING:-1}"
+# Optional CUDA cached-buffer ladders (measured: pointcloud 3.3x faster, conversion ~NEON-parity;
+# both byte-identical to baseline and RUNTIME-gated off by default via RS2_PC_MODE/RS2_CONV_MODE=0,
+# so compiling them in is harmless). Default OFF here = upstream-identical binary; set =1 to compile
+# the ladder in, then select at runtime with RS2_PC_MODE=1 / RS2_CONV_MODE=1. See docs/gb10/README.md.
+GB10_PC_ZEROCOPY="${LRS_GB10_PC_ZEROCOPY:-0}"
+GB10_CONV_CACHE="${LRS_GB10_CONV_CACHE:-0}"
 # Opt-in to building the unit-test target alongside the SDK (off by default in GB10 builds to
 # avoid requiring Catch2 unless the user explicitly wants tests).
 BUILD_UNIT_TESTS="${LRS_GB10_BUILD_UNIT_TESTS:-OFF}"
@@ -85,6 +91,12 @@ Useful environment:
                            Python install dir, default under the GB10 prefix
   LRS_GB10_USB_TUNING      Bake in GB10 USB mitigations (RS2_GB10_USB_TUNING=1),
                            default 1 (ON). Set to 0 for a vanilla build.
+  LRS_GB10_PC_ZEROCOPY     Compile the pointcloud cached-buffer ladder
+                           (RS2_GB10_PC_ZEROCOPY=1), default 0 (OFF). When 1,
+                           select at runtime: RS2_PC_MODE=1 (cached, 3.3x faster).
+  LRS_GB10_CONV_CACHE      Compile the YUYV->color cached-buffer ladder
+                           (RS2_GB10_CONV_CACHE=1), default 0 (OFF). When 1,
+                           select at runtime: RS2_CONV_MODE=1 (~NEON-parity).
   LRS_GB10_BUILD_UNIT_TESTS
                            Pass BUILD_UNIT_TESTS to CMake so the Catch2 unit-test
                            targets are also built, default OFF.
@@ -225,6 +237,8 @@ configure() {
     -DENABLE_EASYLOGGINGPP_ASYNC=ON \
     -DCHECK_FOR_UPDATES=OFF \
     -DRS2_GB10_USB_TUNING="$GB10_USB_TUNING" \
+    -DRS2_GB10_PC_ZEROCOPY="$GB10_PC_ZEROCOPY" \
+    -DRS2_GB10_CONV_CACHE="$GB10_CONV_CACHE" \
     -DBUILD_UNIT_TESTS="$BUILD_UNIT_TESTS" \
     "${launcher_args[@]}" \
     "${opencv_args[@]}"
