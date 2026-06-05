@@ -76,6 +76,101 @@ int main()
         assert( msg.find( "context" ) != std::string::npos );   // tells the caller to hold one context
     }
 
+    // H3: controller_wedging -- (minus110_count, window_ms, threshold, window_limit_ms)
+    // Defaults: threshold=8, window_limit=2000ms; MIN_WEDGE_WINDOW_MS=50.
+    assert( controller_wedging( 8, 1000.0 ) == true );    // burst >= threshold within window -> wedging
+    assert( controller_wedging( 20, 500.0 ) == true );    // big burst, tight window -> wedging
+    assert( controller_wedging( 7, 1000.0 ) == false );   // just under threshold -> not wedging
+    assert( controller_wedging( 100, 5000.0 ) == false ); // spread WIDER than window_limit -> sparse, not a wedge
+    assert( controller_wedging( 100, 10.0 ) == false );   // window narrower than MIN_WEDGE_WINDOW_MS -> inconclusive
+
+    // H3: window-edge boundaries (window_ms vs MIN and vs window_limit).
+    assert( controller_wedging( 8, 50.0 ) == true );      // exactly MIN_WEDGE_WINDOW_MS -> conclusive, wedging
+    assert( controller_wedging( 8, 49.9 ) == false );     // a hair under MIN -> inconclusive
+    assert( controller_wedging( 8, 2000.0 ) == true );    // exactly at window_limit -> still within -> wedging
+    assert( controller_wedging( 8, 2000.1 ) == false );   // a hair over window_limit -> sparse
+
+    // H3: threshold-edge with explicit tunables.
+    assert( controller_wedging( 3, 1000.0, 3, 2000.0 ) == true );  // count == threshold -> wedging
+    assert( controller_wedging( 2, 1000.0, 3, 2000.0 ) == false ); // count < threshold -> not wedging
+
+    // H3: tunable clamping (out-of-range threshold / window cannot disable the guard).
+    assert( controller_wedging( 2, 1000.0, 0, 2000.0 ) == true );  // threshold clamped up to MIN(2) -> 2>=2 wedging
+    assert( controller_wedging( 2, 1000.0, 1, 2000.0 ) == true );  // threshold 1 clamps to 2 -> wedging
+    assert( controller_wedging( 8, 1000.0, 999, 2000.0 ) == false ); // threshold clamped to MAX(64), 8<64 -> not
+    assert( controller_wedging( 8, 70000.0, 8, 999999.0 ) == false ); // window_limit clamps to MAX, 70000<60000? no -> over -> sparse
+
+    // H3: wedge_tracker -- clock-injected, deterministic. Default threshold=8, window=2000ms.
+    {
+        wedge_tracker wt; // threshold 8, window 2000ms
+        // 8 timeouts all within a 700ms window -> wedging.
+        for( int i = 0; i < 8; ++i )
+            wt.record_timeout( 1000.0 + i * 100.0 ); // 1000..1700
+        assert( wt.count_in_window( 1700.0 ) == 8 );
+        assert( wt.is_wedging( 1700.0 ) == true );   // burst within window
+    }
+    {
+        wedge_tracker wt;
+        // 8 sparse timeouts 1000ms apart -> only the most recent few are in the 2000ms window.
+        for( int i = 0; i < 8; ++i )
+            wt.record_timeout( i * 1000.0 ); // 0,1000,...,7000
+        // At now=7000, window=2000 -> timeouts at 5000,6000,7000 qualify (3) -> below threshold.
+        assert( wt.count_in_window( 7000.0 ) == 3 );
+        assert( wt.is_wedging( 7000.0 ) == false );  // sparse -> not wedging
+    }
+    {
+        wedge_tracker wt;
+        assert( wt.is_wedging( 0.0 ) == false );     // empty tracker -> not wedging
+        wt.record_timeout( 100.0 );
+        assert( wt.is_wedging( 100.0 ) == false );   // single timeout -> not wedging
+    }
+    {
+        // Custom tight tracker: threshold 3, window 500ms.
+        wedge_tracker wt( 3, 500.0 );
+        wt.record_timeout( 1000.0 );
+        wt.record_timeout( 1100.0 );
+        wt.record_timeout( 1200.0 );
+        assert( wt.count_in_window( 1200.0 ) == 3 ); // all within 500ms
+        assert( wt.is_wedging( 1200.0 ) == true );   // 3 within 500ms -> wedging
+        // Advance just past the window edge: 1700-1200=500 (in), 1700-1100=600 (out), 1700-1000=700 (out).
+        assert( wt.count_in_window( 1700.0 ) == 1 ); // only the 1200 timeout still inside 500ms
+        assert( wt.is_wedging( 1700.0 ) == false );  // aged out below threshold -> not wedging
+        // Further out, everything ages off.
+        assert( wt.count_in_window( 1800.0 ) == 0 );
+    }
+    {
+        // Maximally-DENSE burst: threshold -110s within a few ms (span < MIN_WEDGE_WINDOW_MS).
+        // This is the strongest wedge signal and MUST read as wedging -- the tracker does its
+        // own windowing, so the free function's lower-bound "inconclusive" guard must not
+        // suppress it. (Regression guard for the measured-span-vs-nominal-window decision.)
+        wedge_tracker wt( 3, 500.0 );
+        wt.record_timeout( 1000.0 );
+        wt.record_timeout( 1020.0 );
+        wt.record_timeout( 1040.0 ); // 3 timeouts, span only 40ms (< 50ms MIN)
+        assert( wt.count_in_window( 1040.0 ) == 3 );
+        assert( wt.is_wedging( 1040.0 ) == true );   // dense burst -> wedging
+    }
+    {
+        // reset() clears history.
+        wedge_tracker wt( 2, 1000.0 );
+        wt.record_timeout( 100.0 );
+        wt.record_timeout( 200.0 );
+        assert( wt.is_wedging( 200.0 ) == true );
+        wt.reset();
+        assert( wt.count_in_window( 200.0 ) == 0 );
+        assert( wt.is_wedging( 200.0 ) == false );   // cleared -> not wedging
+    }
+
+    // H3: teardown_deadline_exceeded -- (start_ms, now_ms, budget_ms)
+    assert( teardown_deadline_exceeded( 1000.0, 1499.0, 500 ) == false ); // 499ms elapsed, budget 500 -> within
+    assert( teardown_deadline_exceeded( 1000.0, 1500.0, 500 ) == true );  // exactly budget -> exceeded
+    assert( teardown_deadline_exceeded( 1000.0, 2000.0, 500 ) == true );  // well past -> exceeded
+    assert( teardown_deadline_exceeded( 1000.0, 9999.0, 0 ) == false );   // budget 0 -> disabled, never exceeded
+    assert( teardown_deadline_exceeded( 1000.0, 9999.0, -5 ) == false );  // negative clamps to 0 -> never exceeded
+    // Budget above MAX clamps to MAX_TEARDOWN_BUDGET_MS (60000).
+    assert( teardown_deadline_exceeded( 0.0, 59999.0, 999999 ) == false ); // 59999 < 60000 -> within
+    assert( teardown_deadline_exceeded( 0.0, 60000.0, 999999 ) == true );  // 60000 >= clamped 60000 -> exceeded
+
     printf( "ALL_ASSERTIONS_PASSED\n" );
     return 0;
 }
