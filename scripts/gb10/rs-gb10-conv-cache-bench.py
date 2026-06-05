@@ -2,8 +2,8 @@
 """End-to-end benchmark for RS2_GB10_CONV_CACHE cached-buffer ladder on the YUYV->color path.
 
 Measures CPU ms/frame (the Finding A metric) for three configurations:
-  A) build-gb10-convcache  RS2_CONV_MODE=1  (cached device buffers)
-  B) build-gb10-convcache  RS2_CONV_MODE=0  (baseline, per-frame cudaMalloc/Free)
+  A) build-gb10-full  RS2_CONV_MODE=1  (cached device buffers)
+  B) build-gb10-full  RS2_CONV_MODE=0  (baseline, per-frame cudaMalloc/Free)
   C) build-gb10-nocuda                      (NEON conversion, CUDA disabled)
 
 Uses --convert-only mode of rs-gb10-gpu-pipeline.py (color stream only, no align, no depth)
@@ -61,7 +61,7 @@ def run_one(label: str, build_name: str, conv_mode: int | None,
             result_json: str) -> dict:
     """Launch rs-gb10-gpu-pipeline.py --convert-only in a subprocess, return parsed result."""
     env = os.environ.copy()
-    build_release = build_pythonpath(build_name)  # e.g. .../build-gb10-convcache/Release
+    build_release = build_pythonpath(build_name)  # e.g. .../build-gb10-full/Release
     # Both PYTHONPATH and LD_LIBRARY_PATH must point to the SAME build's Release dir:
     # pyrealsense2.cpython-*.so dlopen()s librealsense2.so from LD_LIBRARY_PATH.
     # Prepend so we shadow anything already set (e.g. a stale build-gb10-full entry).
@@ -119,8 +119,8 @@ def main():
 
     configs = [
         # (label, build_name, RS2_CONV_MODE)
-        ("cuda-cached(mode1)",   "build-gb10-convcache", 1),
-        ("cuda-baseline(mode0)", "build-gb10-convcache", 0),
+        ("cuda-cached(mode1)",   "build-gb10-full", 1),
+        ("cuda-baseline(mode0)", "build-gb10-full", 0),
         ("neon-nocuda",          "build-gb10-nocuda",    None),
     ]
 
