@@ -35,7 +35,9 @@ export DISPLAY="${DISPLAY:-:1}"
 # Loud ABI guard: if the resolved venv's Python minor doesn't match LRS_PY_TAG, the .so won't import.
 # Sourced file -> warn (never exit, that would kill the caller's shell). Skipped if the venv is absent.
 if [ -x "$LRS_VENV" ]; then
-  _GB10_VENV_TAG="$("$LRS_VENV" -c 'import sys;print(f"python{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)"
+  # `|| true` so a broken venv python can't take down a `set -e` sourcer (this file is the advertised
+  # single env source-of-truth; the ROS2 launchers run under `set -eo`). An empty tag just skips the warn.
+  _GB10_VENV_TAG="$("$LRS_VENV" -c 'import sys;print(f"python{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true)"
   if [ -n "$_GB10_VENV_TAG" ] && [ "$_GB10_VENV_TAG" != "$LRS_PY_TAG" ]; then
     printf '!! gb10-env: ABI MISMATCH — LRS_PY_TAG=%s but LRS_VENV is %s (%s).\n' \
            "$LRS_PY_TAG" "$_GB10_VENV_TAG" "$LRS_VENV" >&2

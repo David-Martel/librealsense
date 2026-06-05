@@ -535,13 +535,17 @@ int main(int argc, char** argv) {
         // FfmpegPipe destructor runs here, joining the child BEFORE GL shutdown.
         // Explicit scope to enforce destruction order vs RS2 teardown below.
         { FfmpegPipe tmp = std::move(ffpipe); }
-
-        // ---- R2 FIX: shut the GL processing lane down WHILE THE CONTEXT IS STILL CURRENT ----
-        rs2::gl::shutdown_processing();
-        printf("rs2::gl::shutdown_processing() OK (context still current) — clean teardown, no SIGSEGV.\n");
     } catch (const std::exception& e) {
         printf("ERROR: %s\n", e.what()); rc = 1;
     }
+    // ---- R2 FIX: shut the GL processing lane down WHILE THE CONTEXT IS STILL CURRENT ----
+    // Runs on BOTH success and error paths. (It was the last statement INSIDE the try, so any
+    // exception — e.g. wait_for_frames() timing out on an xHCI stall — skipped it and let the
+    // static GL destructors fire against a dead context: the exact R2 SIGSEGV, on every error
+    // exit.) On the error path the local FfmpegPipe has already drained during stack unwind,
+    // so the ffmpeg-before-GL ordering still holds.
+    rs2::gl::shutdown_processing();
+    printf("rs2::gl::shutdown_processing() OK (context still current) — clean teardown, no SIGSEGV.\n");
     glfwDestroyWindow(win);
     glfwTerminate();
     printf("DONE rc=%d (clean return — R2 teardown order verified).\n", rc);

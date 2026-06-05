@@ -46,15 +46,19 @@ namespace {
         // the cudaFree calls in ensure_*() below run during operation with a live context and are safe.
         // This matches the pointcloud cached pool (pc_zc_buffers), which likewise has no destructor.
         // Grow-only: reallocate only when the new byte count exceeds current capacity.
+        // Reset the pointer+capacity BEFORE the (throwing) malloc: cudaMalloc does not null *devPtr
+        // on failure, so if cuda_or_throw throws we must not leave d_src holding the just-freed
+        // pointer with a stale src_cap — the next call would either re-read freed memory (cap still
+        // >= bytes) or double-free it (cap < bytes). Mirrors pc_zc_buffers::free_all().
         void ensure_src(size_t bytes) {
             if (d_src && src_cap >= bytes) return;
-            if (d_src) cudaFree(d_src);
+            if (d_src) { cudaFree(d_src); d_src = nullptr; src_cap = 0; }
             cuda_or_throw(cudaMalloc((void**)&d_src, bytes), "alloc d_src");
             src_cap = bytes;
         }
         void ensure_dst(size_t bytes) {
             if (d_dst && dst_cap >= bytes) return;
-            if (d_dst) cudaFree(d_dst);
+            if (d_dst) { cudaFree(d_dst); d_dst = nullptr; dst_cap = 0; }
             cuda_or_throw(cudaMalloc((void**)&d_dst, bytes), "alloc d_dst");
             dst_cap = bytes;
         }
