@@ -5,10 +5,31 @@
 **Scope:** `realsense2_camera` (realsense-ros ~4.58) depth-only start on GB10 / DGX-Spark (ARM64),
 GB10 SDK `librealsense2 2.58.1`, D435 firmware **5.15.1.55**.
 
-> **EVERY conclusion below is a HYPOTHESIS. NOTHING here is hardware-verified.**
-> No camera was opened, queried, or streamed during this analysis. All "fix" claims are
-> marked **PENDING-HIL** and must be confirmed by a serial, single-process run against the
-> camera (task O3) before being trusted.
+> **The analysis below was offline/static. It has since been CONFIRMED by live HIL — see the
+> VERIFIED RESULT box.** Where the body still says "PENDING-HIL", read it as the pre-test framing;
+> the hypothesis (H1) held.
+
+---
+
+## ✅ VERIFIED RESULT (2026-06-05 live HIL, single-process, 25s bounded run)
+
+`scripts/gb10/ros2-launch-depth-minimal.sh` (depth-only 848×480×30, auto-exposure **ON**, **no** manual
+depth-XU control pushed) **streams cleanly on GB10**:
+
+| Metric | Result |
+|--------|--------|
+| Depth frames | **708** (Counter 0→707), Z16 848×480 |
+| Frame rate | **30.03 fps**, **zero drops** (707 expected = 707 actual over 23.57 s) |
+| Fatal errors | **none** — no "Hardware Error", no `-110`, no failed-start |
+| `index 768 / 0x0300` | **2 benign startup warnings**, `EAGAIN` ("Resource temporarily unavailable, number: 11") — the SDK rides through them |
+| Controller | **GREEN** before and after (no `HC died`); camera stayed @ 5000M USB3; `/dev/video*` released cleanly |
+
+**H1 confirmed.** The stock node's depth-start failure was the contradictory **manual `depth_module.exposure=8500`
+write over the depth XU while auto-exposure is enabled** (the unwrapped `param_set_option` callback, fired by
+`rs_launch.py`'s declared default). Leaving AE on and not pushing a manual depth-XU value turns the prior **fatal**
+`0x0300` "Hardware Error" into the harmless `EAGAIN` warnings above. idx768 still fires once/twice at init (the
+node's AE-enable / HDR-disable still touches the XU) but no longer fatally. Deployable depth-only ROS2 path proven;
+Kilted rebuild (§ plan) is now an *enhancement* (wrap the callback / change defaults upstream), not a blocker.
 
 ---
 

@@ -1,31 +1,23 @@
 #!/usr/bin/env bash
-# ros2-launch-depth-minimal.sh — HYPOTHESIS launch for the GB10 ROS2 depth stream-start failure
+# ros2-launch-depth-minimal.sh — VERIFIED depth-only launch for realsense2_camera on GB10
 #
-# ============================== UNVERIFIED — PENDING-HIL ==============================
-# This script is an UNVERIFIED HYPOTHESIS produced by OFFLINE static/log analysis.
-# It has NOT been run against the camera. NO claim here is hardware-verified.
+# ============================== VERIFIED — HIL-PROVEN 2026-06-05 ==============================
+# This config makes realsense2_camera stream depth on GB10. Live HIL result (single-process, 25s):
+#   708 depth frames Z16 848x480 @ 30.03 fps, ZERO drops, NO fatal error, controller GREEN, clean
+#   release. The previously-FATAL control_transfer index 768 (0x0300) is reduced to 2 benign startup
+#   EAGAIN warnings ("Resource temporarily unavailable, number: 11"). Log: ros2-depth-minimal-*.log.
 #
-# It exists to test the root-cause hypothesis in:
-#   docs/gb10/ros2-stream-start-analysis.md
+# ROOT CAUSE (confirmed, see docs/gb10/ros2-stream-start-analysis.md):
+# index 768 (0x0300) == the D4xx DEPTH EXTENSION UNIT (depth_xu, unit 3, iface 0 — src/ds/ds-private.h:70).
+# The stock node fails depth-start because rs_launch.py declares depth_module.exposure=8500, which the
+# UNWRAPPED parameter callback (sensor_params.cpp:71-74) writes as a MANUAL depth-XU exposure
+# (RS2_OPTION_EXPOSURE / DS5_EXPOSURE) WHILE auto-exposure is enabled — a contradictory depth-XU write the
+# D435 fw 5.15.1.55 rejects fatally. THE FIX: leave AUTO-EXPOSURE ON and do NOT push any manual depth-XU
+# control (exposure / emitter / preset / sync / json / reset). idx768 still fires once or twice at init
+# (the node's AE-enable / HDR-disable touches the XU) but now returns EAGAIN, which the SDK rides through.
 #
-# HYPOTHESIS (H1): the realsense2_camera node (~4.58) fails depth-stream start with
-# "Hardware Error" at control_transfer index 768 (0x0300) because 0x0300 == the D4xx
-# DEPTH EXTENSION UNIT (depth_xu, unit 3, iface 0 — src/ds/ds-private.h:70), and the node
-# pushes a MANUAL depth-XU exposure (RS2_OPTION_EXPOSURE / DS5_EXPOSURE) via the UNWRAPPED
-# parameter callback (src .../sensor_params.cpp:71-74) while depth auto-exposure is enabled.
-# rs_launch.py declares depth_module.exposure=8500 by default, which fires that fatal write.
-#
-# This wrapper's mitigation: keep depth-only 848x480x30, leave AUTO-EXPOSURE ON, and do NOT
-# push any manual depth-XU control (exposure / emitter / preset / sync / json / reset).
-#
-# NOTE (the rs_launch injection trap): rs_launch.py DECLARES depth_module.exposure regardless,
-# so this may not fully suppress the write on this node version. LRS_LOG_LEVEL=DEBUG is enabled
-# and output is tee'd so the serial HIL run captures whether index 768 still fires. The libusb
-# layer logs only the index, not the control selector, so pass/fail of THIS stripped config is
-# the discriminator (see analysis doc §5).
-#
-# RUN THIS SERIALLY, SINGLE-PROCESS, AGAINST THE CAMERA — and only the operator does so.
-# The GB10 xHCI controller is fragile; concurrent opens / multi-stream can kill it.
+# SAFE-USE (the one-camera rule still applies):
+#   RUN SERIALLY, SINGLE-PROCESS, no concurrent heavy load (xHCI controller death is load-induced).
 # =====================================================================================
 #
 # USAGE (operator, manual, serial only):
@@ -66,7 +58,7 @@ fi
 # ---- Optional: tee output to a HIL log next to the other validation runs ----
 HIL_LOG="${HOME}/realsense-gb10-validation/ros2-depth-minimal-$(date +%Y%m%d-%H%M%S).log"
 
-echo "[depth-minimal] *** UNVERIFIED HYPOTHESIS — PENDING-HIL *** (see docs/gb10/ros2-stream-start-analysis.md)"
+echo "[depth-minimal] *** VERIFIED depth-only config (HIL 2026-06-05: 30fps, 0 drops) — see docs/gb10/ros2-stream-start-analysis.md ***"
 echo "[depth-minimal] SDK: ${LD_LIBRARY_PATH%%:*}"
 echo "[depth-minimal] LRS_LOG_LEVEL=${LRS_LOG_LEVEL}"
 echo "[depth-minimal] Log: ${HIL_LOG}"
