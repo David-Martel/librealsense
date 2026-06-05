@@ -45,6 +45,10 @@ percentile stats, `--display` (non-headless on-screen render + `x11grab` proof).
 | `rs-gb10-trt-probe.py` | `just trt-probe` | **TensorRT capability probe** (NOT an SDK integration) — synthesizes a small depth-filter CNN at depth resolution and times it with `trtexec`. Characterizes NN headroom for a *future* learned depth-filter stage. **Measured: 5-conv filter @848×480 = 0.9 ms FP32, 37× headroom @30 fps.** Needs `onnx` in the venv + `trtexec`. |
 | `rs-gb10-soak.py`, `rs-gb10-multistream.py`, `rs-gb10-churn-test.py` | — | predecessors of the suite (kept for reference; prefer the suite) |
 
+## Desktop launcher + smoke tests
+- **`gb10-viewer-launch.sh`** — single source of env truth (pyrealsense2 from `build-gb10-full` + cv2's opencv/ffmpeg libs + DISPLAY + NVENC), friendly preflight (missing-runtime / dead-controller / no-camera messages instead of a traceback), then opens the interactive viewer. `--validate` runs the automated PASS/FAIL validation instead; extra args pass through. **Desktop entry:** `gb10-realsense-viewer.desktop` (template) → copy to `~/Desktop/`, `chmod +x`, `gio set … metadata::trusted true`.
+- **`smoke-test-display.sh`** (`just smoke-display [--live]`) — compile sweep + the display tool's offline `--self-test` (argparse / profile clamp / validation math / HUD compose) + CLI contract (`--help`=0, bad-arg=2); `--live` adds one tripwire-guarded on-screen validation. Run before trusting a display-tool change.
+
 ## Firmware
 | tool | what |
 |------|------|

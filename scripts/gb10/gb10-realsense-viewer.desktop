@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=GB10 RealSense Viewer
+GenericName=RealSense Debug Viewer
+Comment=Live Intel RealSense viewer on GB10 — switch profiles/size/fps and camera features, per-frame telemetry
+Exec=/home/damartel/dev/repos/librealsense/scripts/gb10/gb10-viewer-launch.sh
+Icon=camera-video
+Terminal=true
+Categories=Development;Graphics;Video;
+Keywords=realsense;depth;camera;gb10;dgx;
