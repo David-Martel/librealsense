@@ -8,15 +8,16 @@
 set -uo pipefail
 SG="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$SG/../.." && pwd)"
-VENV="${LRS_VENV:-$HOME/realsense-gb10-validation/.venv/bin/python}"
-OPENCV=/opt/gb10-cuda/install/opencv
-FFLIB=/opt/gb10-cuda/install/ffmpeg/lib
-FULL="$HOME/realsense-gb10-validation/build-gb10-full/Release"
-TOOL="$SG/rs-gb10-nonheadless-verify.py"
 
-# offline env (cv2 needs opencv/lib AND ffmpeg/lib; hil_common needs scripts/gb10 on PYTHONPATH)
+# Source the single env truth FIRST, then resolve VENV/paths from it, so everything tracks LRS_PY_TAG
+# (flip LRS_PY_TAG=python3.13 to test the 3.13 build+venv). cv2 needs opencv/lib AND ffmpeg/lib;
+# hil_common needs scripts/gb10 on PYTHONPATH — all exported by gb10-env. Offline-safe.
 # shellcheck source=scripts/gb10/gb10-env.sh
-source "$SG/gb10-env.sh"   # single source of env truth (also adds build-gb10-full; harmless for offline checks)
+source "$SG/gb10-env.sh"
+
+VENV="${LRS_VENV:?gb10-env did not export LRS_VENV}"
+FULL="$LRS_BUILD_RELEASE"
+TOOL="$SG/rs-gb10-nonheadless-verify.py"
 
 fails=0
 pass() { printf '  [PASS] %s\n' "$1"; }
@@ -44,10 +45,8 @@ if [ "${1:-}" = "--live" ]; then
   if journalctl -k --no-pager -n 25 2>/dev/null | grep -qiE "HC died|not responding to stop"; then
     fail "controller shows a prior death — reboot before live smoke"
   else
-    LD_LIBRARY_PATH="$OPENCV/lib:$FFLIB:$FULL" \
-    PYTHONPATH="$SG:$FULL:$OPENCV/lib/python3.12/site-packages" \
-    DISPLAY="${DISPLAY:-:1}" LRS_FFMPEG=/opt/gb10-cuda/install/ffmpeg/bin/ffmpeg LRS_DV_FRAMES=90 \
-      "$VENV" "$TOOL" >/tmp/smoke-live.log 2>&1
+    # env (LD_LIBRARY_PATH/PYTHONPATH/DISPLAY/LRS_FFMPEG) already exported by gb10-env.sh, tag-aware.
+    LRS_DV_FRAMES=90 "$VENV" "$TOOL" >/tmp/smoke-live.log 2>&1
     if grep -q '"result": "PASS"' /tmp/smoke-live.log; then
       pass "live validation PASS ($(grep -oE '"stutter_count": [0-9]+' /tmp/smoke-live.log | head -1))"
     else

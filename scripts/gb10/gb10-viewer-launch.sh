@@ -6,14 +6,13 @@
 # automated PASS/FAIL display validation instead of the interactive viewer.
 set -uo pipefail
 SG="$(cd "$(dirname "$0")" && pwd)"
-VENV="${LRS_VENV:-$HOME/realsense-gb10-validation/.venv/bin/python}"
-OPENCV=/opt/gb10-cuda/install/opencv
-FFLIB=/opt/gb10-cuda/install/ffmpeg/lib
-FULL="$HOME/realsense-gb10-validation/build-gb10-full/Release"
-TOOL="$SG/rs-gb10-nonheadless-verify.py"
 
 # shellcheck source=scripts/gb10/gb10-env.sh
-source "$SG/gb10-env.sh"   # single source of env truth (LD_LIBRARY_PATH/PYTHONPATH/DISPLAY/LRS_FFMPEG)
+source "$SG/gb10-env.sh"   # single source of env truth FIRST (LD_LIBRARY_PATH/PYTHONPATH/DISPLAY/LRS_FFMPEG/LRS_VENV/LRS_BUILD_RELEASE)
+
+VENV="${LRS_VENV:?gb10-env did not export LRS_VENV}"
+FULL="$LRS_BUILD_RELEASE"
+TOOL="$SG/rs-gb10-nonheadless-verify.py"
 
 echo "============================================================"
 echo " GB10 RealSense Viewer"
@@ -22,7 +21,7 @@ echo "============================================================"
 # friendly preflight (don't dump a traceback on a double-click)
 miss=""
 [ -x "$VENV" ] || miss="venv python ($VENV)"
-[ -e "$FULL/pyrealsense2.cpython-312-aarch64-linux-gnu.so" ] || miss="${miss:+$miss; }GB10 pyrealsense2 build ($FULL)"
+compgen -G "$FULL/pyrealsense2.cpython-*-aarch64-linux-gnu.so" >/dev/null || miss="${miss:+$miss; }GB10 pyrealsense2 build ($FULL)"
 if [ -n "$miss" ]; then
   echo "!! Missing runtime: $miss"; read -r -p "Press Enter to close..." _; exit 1
 fi

@@ -9,6 +9,11 @@ Findings these tools produced live in [`../../docs/gb10/`](../../docs/gb10/).
   (`~/realsense-gb10-validation/build-gb10-full/Release` = CUDA build; `build-gb10-nocuda` = CPU baseline).
 - **uv venv CPython 3.12.3** (`~/realsense-gb10-validation/.venv`) — bare `python3` is a 3.15 pre-release
   whose ABI cannot load the cpython-312 binding. numpy pinned **1.26.4** (cv2 ABI).
+  - **Python 3.13 retarget (UV minimum):** `LRS_PY_TAG=python3.13` selects the canonical 3.13 SDK
+    (`build-gb10-py313`, GB10 cached/USB customizations baked in, verified `import` + camera-enumerate)
+    and the `.venv313` interpreter. cv2 there is the **stock `opencv-python` 4.11 wheel** (display/HUD
+    only — the CUDA-OpenCV `cv2` binding is still 3.12; a 3.13 CUDA-OpenCV rebuild is the remaining gap).
+    numpy stays pinned 1.26.4. Build a new pyver tree with `PYTHON_EXECUTABLE=…/.venv313/bin/python ../build-dgx-spark-gb10.sh`.
 - **CUDA OpenCV 4.14 + NVENC ffmpeg** at `/opt/gb10-cuda/install` — add `{opencv,ffmpeg}/lib` to
   `LD_LIBRARY_PATH` and the opencv `site-packages` to `PYTHONPATH` for `cv2`/quality/encode tools.
 The `just` recipes set all of this; run tools by hand only with the same env.
@@ -21,7 +26,7 @@ The `just` recipes set all of this; run tools by hand only with the same env.
 | `rs-gb10-test-usb-tuning.sh` (`just test-fast`) | g++-only standalone gate for the `usb-tuning.h` P2/P3/P4/P7 policy — no SDK, no hardware. |
 | `just test-unit` | builds + runs the Catch2 `usb-tuning` unit tests. |
 | `test_cached_pools.cu` + `test-cached-pools.sh` (`just test-cached`) | **cached-pool unit test** (R4): pointcloud + conversion **byte-identical mode0-vs-mode1 across a grow/shrink resolution sequence** (grow-only buffer correctness + mode select). GPU only, **no camera**. |
-| `gb10-env.sh` | **single env source-of-truth** — `source` it to set `LD_LIBRARY_PATH`/`PYTHONPATH`/`DISPLAY`/`LRS_FFMPEG` (pyrealsense2 + cv2's opencv & ffmpeg libs). `LRS_PY_TAG`-parameterized (flip `python3.12`→`3.13/3.14` for the interpreter retarget). The launcher + smoke-test source it. |
+| `gb10-env.sh` | **single env source-of-truth** — `source` it to set `LD_LIBRARY_PATH`/`PYTHONPATH`/`DISPLAY`/`LRS_FFMPEG`/`LRS_VENV`/`LRS_BUILD_RELEASE` (pyrealsense2 + cv2's opencv & ffmpeg libs). **`LRS_PY_TAG` is the one-var retarget:** `python3.13`/`3.14` maps the SDK build tree (`build-gb10-py313`), the uv venv (`.venv313`) **and** the opencv site-packages together — they share an ABI and must move as one. A **loud ABI guard** warns if the resolved venv's Python minor ≠ `LRS_PY_TAG` (the `undefined symbol _PyThreadState_*` trap). The launcher + smoke-test `source` it first, then resolve `VENV`/paths from it. |
 | `gb10-build-info.sh` (`just build-info [dir]`, `just build-tag`) | **build provenance** — writes `BUILD_PROVENANCE.json` (git describe+commit, actual CMakeCache options, runtime-mode defaults, toolchain, `.so` sha, reflects-latest-source, reproduce cmd). Auto-emitted by the build script. Tag `v2.58.1-gb10.1`. |
 
 ## Standardized HIL suite (idempotent + tripwire-guarded)
