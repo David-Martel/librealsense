@@ -72,6 +72,11 @@ test-unit:
 # All no-hardware tests.
 test: test-fast test-unit
 
+# Smoke-test the rendering/display tools (compile sweep + offline self-test + CLI contract).
+# `just smoke-display` = offline only; `just smoke-display --live` adds a short on-screen validation.
+smoke-display *ARGS:
+    bash "{{repo_root}}/scripts/gb10/smoke-test-display.sh" {{ARGS}}
+
 # ---------------------------------------------------------------------------
 # HIL (HARDWARE — requires the D435 on a healthy USB-3 port)
 # ---------------------------------------------------------------------------
