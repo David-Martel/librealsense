@@ -34,6 +34,21 @@ Key benchmarks: `hil-align-bench`, `hil-cuda-bench`, `hil-pc-zerocopy`, `hil-gpu
 `rs-gb10-conv-cache-bench.py`, `hil-quality`, `trt-probe`. Firmware status: `just fw-status`. See
 [`../../scripts/gb10/README.md`](../../scripts/gb10/README.md) for every tool + its safety class.
 
+## Build provenance & reproducibility
+Every GB10 build records exactly how it was made so it can be reproduced on another system, and so you
+can verify a binary reflects the latest source.
+- **Tag:** the source tree is tagged `v2.58.1-gb10.1` (upstream 2.58.1 + the David-Martel GB10 build). `just
+  build-tag` (= `git describe --tags --dirty`) shows the current state (a `-dirty`/`-N-g<sha>` suffix means
+  uncommitted/ahead of the tag).
+- **Manifest:** `just build-info [build_dir]` writes `BUILD_PROVENANCE.json` next to the binary, capturing the
+  git describe+commit, the **actual** compile options (read from the build's `CMakeCache.txt` — `RS2_GB10_*`,
+  CUDA/NEON/RSUSB, cuda-arch, build type), the runtime-mode defaults (`RS2_PC_MODE`/`RS2_CONV_MODE=1`), the
+  toolchain (gcc/CUDA versions), the `.so` sha + build time, whether it **reflects the latest source**, and a
+  one-line `reproduce` command. `scripts/build-dgx-spark-gb10.sh` emits it automatically after `build`/`install`/`all`.
+- **Reproduce elsewhere:** read the manifest's `reproduce` field — checkout that commit, match the toolchain
+  (CUDA + gcc versions), and run the build script with the same `LRS_GB10_*` env. The opt-in defines are
+  `#if`-guarded so an upstream build without them is byte-identical.
+
 ## Safety model (read before any HIL)
 Single-stream (depth or color alone) is the conservative-safe envelope. Multi-stream / churn / soak are
 **eyes-open**: on the death-era camera/firmware/topology they killed the xHCI controller (reboot to recover).

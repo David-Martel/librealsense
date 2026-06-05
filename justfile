@@ -220,6 +220,15 @@ fw-status *ARGS:
 trt-probe *ARGS:
     "{{venv_python}}" "{{repo_root}}/scripts/gb10/rs-gb10-trt-probe.py" {{ARGS}}
 
+# Emit/inspect the build-provenance manifest (git tag+commit + compile options + toolchain) for a build.
+# Reproducibility: BUILD_PROVENANCE.json records exactly how a binary was built. Default = build-gb10-full.
+build-info build_dir=hil_build_dir:
+    bash "{{repo_root}}/scripts/gb10/gb10-build-info.sh" "{{build_dir}}"
+
+# Show the current build tag (git describe) — what version/state the source tree is at.
+build-tag:
+    @git -C "{{repo_root}}" describe --tags --always --dirty
+
 # Show the GB10 findings + open items.
 findings:
     @sed -n '1,40p' "{{repo_root}}/docs/gb10/FINDINGS-2026-06-03.md"

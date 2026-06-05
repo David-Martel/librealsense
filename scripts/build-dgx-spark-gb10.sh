@@ -305,10 +305,19 @@ clean() {
   rm -rf "$BUILD_DIR"
 }
 
+# Emit a build-provenance manifest (git tag+commit + compile options + toolchain) for reproducibility.
+emit_provenance() {
+  local here; here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ -x "$here/gb10/gb10-build-info.sh" ]]; then
+    "$here/gb10/gb10-build-info.sh" "$BUILD_DIR" >/dev/null 2>&1 \
+      && echo "[provenance] $BUILD_DIR/BUILD_PROVENANCE.json  ($(git -C "$here/.." describe --tags --always 2>/dev/null))"
+  fi
+}
+
 case "$MODE" in
   configure) configure ;;
-  build) build ;;
-  install) install_sdk ;;
+  build) build; emit_provenance ;;
+  install) install_sdk; emit_provenance ;;
   validate) validate ;;
   clean) clean ;;
   all)
@@ -317,5 +326,6 @@ case "$MODE" in
     build
     install_sdk
     validate
+    emit_provenance
     ;;
 esac
