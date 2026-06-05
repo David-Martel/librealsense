@@ -226,6 +226,12 @@ ros2-hil *ARGS:
 bench-async:
     bash "{{repo_root}}/scripts/gb10/async-pipeline-bench.sh"
 
+# H7/H8 perf feasibility (no camera): H7 = align per-frame alloc, H8 = USB-thread<->CUDA affinity jitter.
+# Verdict on file: BOTH NO-GO (align already caches buffers -> 0 cudaMalloc/frame; affinity shows no
+# reproducible jitter win on GB10's 20 cores). See docs/gb10/h7h8-perf-feasibility-2026-06-05.md.
+bench-h7h8 WHICH="all":
+    bash "{{repo_root}}/scripts/gb10/bench_h7h8.sh" {{WHICH}}
+
 # NEON+OpenMP depth-filter feasibility microbench (#32, no camera): scalar-vs-NEON-vs-NEON+OpenMP for the
 # src/proc post-process filters (all pure scalar/unparallelized on aarch64; gcc doesn't autovec the branchy
 # loops). Measured GO in isolation (threshold 5.3x, disparity 4.7x, temporal 3.5x NEON; spatial/decimation

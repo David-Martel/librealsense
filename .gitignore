@@ -97,3 +97,5 @@ librealsense-log.txt
 
 # agents
 .github/agents/
+scripts/gb10/bench_h7h8_affinity
+scripts/gb10/bench_h7h8_align_alloc
