@@ -15,8 +15,8 @@ FULL="$HOME/realsense-gb10-validation/build-gb10-full/Release"
 TOOL="$SG/rs-gb10-nonheadless-verify.py"
 
 # offline env (cv2 needs opencv/lib AND ffmpeg/lib; hil_common needs scripts/gb10 on PYTHONPATH)
-export LD_LIBRARY_PATH="$OPENCV/lib:$FFLIB"
-export PYTHONPATH="$SG:$OPENCV/lib/python3.12/site-packages"
+# shellcheck source=scripts/gb10/gb10-env.sh
+source "$SG/gb10-env.sh"   # single source of env truth (also adds build-gb10-full; harmless for offline checks)
 
 fails=0
 pass() { printf '  [PASS] %s\n' "$1"; }

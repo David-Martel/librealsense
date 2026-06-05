@@ -12,10 +12,8 @@ FFLIB=/opt/gb10-cuda/install/ffmpeg/lib
 FULL="$HOME/realsense-gb10-validation/build-gb10-full/Release"
 TOOL="$SG/rs-gb10-nonheadless-verify.py"
 
-export LD_LIBRARY_PATH="$OPENCV/lib:$FFLIB:$FULL"
-export PYTHONPATH="$SG:$FULL:$OPENCV/lib/python3.12/site-packages"
-export DISPLAY="${DISPLAY:-:1}"
-export LRS_FFMPEG=/opt/gb10-cuda/install/ffmpeg/bin/ffmpeg
+# shellcheck source=scripts/gb10/gb10-env.sh
+source "$SG/gb10-env.sh"   # single source of env truth (LD_LIBRARY_PATH/PYTHONPATH/DISPLAY/LRS_FFMPEG)
 
 echo "============================================================"
 echo " GB10 RealSense Viewer"
