@@ -89,6 +89,7 @@ librealsense-log.txt
 *.dll
 *.list
 *.json
+!CMakePresets.json
 *.ini
 *.cxx
 

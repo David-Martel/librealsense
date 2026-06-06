@@ -1,0 +1,60 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "windows-x64-release",
+      "displayName": "Windows x64 Release (MSVC)",
+      "description": "MSVC x64 Release build for Intel RealSense D435 on Windows 10/11. Uses the WMF backend (default Windows path), x86 CPU extensions as the SDK supports (SSE3 always-on; image-avx.cpp compiled with AVX2 per-file), and no ARM/NEON/CUDA/GB10-specific flags. All three GB10 fork enhancements (RS2_GB10_USB_TUNING, RS2_GB10_PC_ZEROCOPY, RS2_GB10_CONV_CACHE) are off by default on this path and are inert on the WMF backend regardless.",
+      "generator": "Visual Studio 17 2022",
+      "architecture": {
+        "value": "x64",
+        "strategy": "set"
+      },
+      "binaryDir": "${sourceDir}/build/windows-x64-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+
+        "BUILD_WITH_CPU_EXTENSIONS": "ON",
+
+        "BUILD_WITH_CUDA": "OFF",
+        "BUILD_WITH_NEON": "OFF",
+        "BUILD_WITH_OPENMP": "OFF",
+
+        "RS2_GB10_USB_TUNING": "OFF",
+        "RS2_GB10_PC_ZEROCOPY": "OFF",
+        "RS2_GB10_CONV_CACHE": "OFF",
+
+        "FORCE_RSUSB_BACKEND": "OFF",
+
+        "BUILD_GRAPHICAL_EXAMPLES": "ON",
+        "BUILD_EXAMPLES": "ON",
+        "BUILD_TOOLS": "ON",
+        "BUILD_SHARED_LIBS": "ON",
+
+        "BUILD_PYTHON_BINDINGS": "OFF",
+        "BUILD_CSHARP_BINDINGS": "OFF",
+        "BUILD_UNIT_TESTS": "OFF",
+
+        "CHECK_FOR_UPDATES": "OFF",
+
+        "ENABLE_SECURITY_FLAGS": "OFF",
+        "BUILD_ASAN": "OFF",
+
+        "ENABLE_CCACHE": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-x64-release",
+      "displayName": "Build windows-x64-release (Release)",
+      "configurePreset": "windows-x64-release",
+      "configuration": "Release"
+    }
+  ]
+}
