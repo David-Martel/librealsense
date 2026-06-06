@@ -184,3 +184,130 @@ The two build paths share no build directory and no configured state.
 | `CMakePresets.json` | New file | Primary deliverable — configure + build presets |
 | `docs/windows-x64-build.md` | New file | This document |
 | `.gitignore` | Modified (two-line addition) | The repo contains a blanket `*.json` rule (line 91) that was silently suppressing `CMakePresets.json` from git tracking. Two negation lines (`!CMakePresets.json`) were added immediately after the rule to allow the presets file to be tracked while keeping the blanket exclusion intact for all other `.json` artifacts (compile_commands.json, VS project files, etc.). **This is a minimal, scoped modification to an existing file.** If strict no-existing-file-modification is required, revert this change and instruct git to track the presets file explicitly via `git add -f CMakePresets.json`. |
+
+---
+
+## 8. CUDA preset — `windows-x64-cuda`
+
+Added in Task #20. Extends `CMakePresets.json` with an isolated CUDA-enabled configure+build preset for x86_64 Windows.
+
+### What it enables
+
+`BUILD_WITH_CUDA=ON` activates two code paths in the SDK's CMake:
+
+1. `CMake/cuda_config.cmake` — `enable_language(CUDA)` + `find_package(CUDA REQUIRED)`, sets arch list and NVCC flags.
+2. `src/CMakeLists.txt:52-54` — includes `src/cuda/CMakeLists.txt` → adds `cuda-pointcloud.cu`, `cuda-conversion.cu`, `rscuda_utils.cuh` to the `realsense2` target.
+3. `src/proc/CMakeLists.txt:5-7` — includes `src/proc/cuda/CMakeLists.txt` → adds `cuda-align.cu`, `cuda-pointcloud.cpp` to the target.
+4. `global_config.cmake:54-56` — adds `-DRS2_USE_CUDA` preprocessor define.
+
+All three GB10-specific options (`RS2_GB10_USB_TUNING`, `RS2_GB10_PC_ZEROCOPY`, `RS2_GB10_CONV_CACHE`) remain `OFF`. The `RS2_GB10_PC_ZEROCOPY` and `RS2_GB10_CONV_CACHE` guards inside `cuda-pointcloud.cu` and `cuda-conversion.cu` are `#if defined(...)` preprocessor blocks that are dormant unless those defines are passed — they are **not** auto-activated by `BUILD_WITH_CUDA`.
+
+### CUDA architecture decision (sm_120, Blackwell)
+
+The RTX 5060 Ti is a Blackwell-generation GPU (compute capability 1.2.0 = sm_120).
+
+`nvcc --list-gpu-arch` for the installed CUDA v13.1 toolkit confirms `compute_120` is accepted:
+```
+compute_75, compute_80, compute_86, compute_87, compute_88, compute_89,
+compute_90, compute_100, compute_110, compute_103, compute_120, compute_121
+```
+
+`CMake/cuda_config.cmake` builds its own architecture list from `CUDA_VERSION` at configure time — for v13.1 the auto-list is `75 80 86 89 90 100 120 110`. The preset overrides this via `CMAKE_CUDA_ARCHITECTURES=120` (single-arch, fastest build) using CMake policy `CMP0104 NEW` (CMake 3.18+, satisfied by CMake 4.3.3). Setting a single target arch keeps kernel object files small and is appropriate for a development/validation build targeting one known GPU.
+
+### Toolkit variable notes
+
+The SDK uses the legacy `find_package(CUDA)` path (with `enable_language(CUDA)` also called). Two variables are set in the preset:
+
+- `CUDA_TOOLKIT_ROOT_DIR` — consumed by `find_package(CUDA)` (legacy FindCUDA). **Used.**
+- `CUDAToolkit_ROOT` — consumed by `find_package(CUDAToolkit)` (modern). CMake warned "Manually-specified variable not used" — the SDK does not call the modern form, so this variable is redundant but harmless.
+
+nvcc path confirmed in cache: `C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1/bin/nvcc.exe`.
+
+Note: the configure output showed CUDA compiler identification as `NVIDIA 13.2.51` (the nvcc driver version) while `CUDA_VERSION=13.1` (the toolkit version). Both refer to the v13.1 toolkit directory. This is normal — nvcc's internal compiler version differs from the toolkit release number.
+
+### `windows-x64-release` is untouched
+
+The new preset is a parallel, independent entry in `configurePresets`. It does not inherit from `windows-x64-release` and does not modify it. Binary directories are separate (`build/windows-x64-cuda/` vs `build/windows-x64-release/`).
+
+### CMakePresets.json key settings
+
+```json
+{
+  "name": "windows-x64-cuda",
+  "generator": "Visual Studio 17 2022",
+  "architecture": { "value": "x64", "strategy": "set" },
+  "binaryDir": "${sourceDir}/build/windows-x64-cuda",
+  "cacheVariables": {
+    "BUILD_WITH_CUDA":            "ON",
+    "CMAKE_CUDA_ARCHITECTURES":   "120",
+    "CUDAToolkit_ROOT":           "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1",
+    "CUDA_TOOLKIT_ROOT_DIR":      "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1",
+    "RS2_GB10_USB_TUNING":        "OFF",
+    "RS2_GB10_PC_ZEROCOPY":       "OFF",
+    "RS2_GB10_CONV_CACHE":        "OFF",
+    "FORCE_RSUSB_BACKEND":        "OFF",
+    "CHECK_FOR_UPDATES":          "OFF",
+    "ENABLE_SECURITY_FLAGS":      "OFF",
+    "ENABLE_CCACHE":              "OFF"
+  }
+}
+```
+
+### Build and configure commands
+
+```powershell
+cd C:\codedev\librealsense
+cmake --preset windows-x64-cuda
+
+# Full build (multi-hour; not run in Task #20):
+cmake --build --preset windows-x64-cuda --config Release
+```
+
+### Configure result (2026-06-06 HIL run)
+
+Configure exit code: **0** (success).
+
+Key configure-time messages (verbatim):
+
+```
+-- The CXX compiler identification is MSVC 19.44.35227.0
+-- The CUDA compiler identification is NVIDIA 13.2.51 with host compiler MSVC 19.44.35227.0
+-- Info: Building with CUDA..
+-- Found CUDA: C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1 (found version "13.1")
+-- CUDA_LIBRARIES: C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1/include
+    C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1/lib/x64/cudart_static.lib;
+    cusparse.lib;cublas.lib
+-- using RS2_USE_WMF_BACKEND
+-- Building with SSE optimizations
+-- Configuring done (47.8s)
+-- Generating done (3.1s)
+-- Build files have been written to: C:/codedev/librealsense/build/windows-x64-cuda
+```
+
+CMake cache confirmed (from `CMakeCache.txt`):
+- `CMAKE_CUDA_ARCHITECTURES:UNINITIALIZED=120`
+- `CUDA_VERSION:STRING=13.1`
+- `CUDA_NVCC_EXECUTABLE:FILEPATH=C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1/bin/nvcc.exe`
+- `CUDA_TOOLKIT_ROOT_DIR:UNINITIALIZED=C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1`
+
+CUDA `.cu` sources confirmed in `realsense2.vcxproj` as `<CudaCompile>` items:
+- `src\cuda\cuda-conversion.cu`
+- `src\cuda\cuda-pointcloud.cu`
+- `src\proc\cuda\cuda-align.cu`
+
+### What was verified vs assumed (CUDA preset)
+
+| Claim | Status |
+|---|---|
+| `compute_120` accepted by CUDA v13.1 nvcc | **Verified** — `nvcc --list-gpu-arch` output |
+| `CMAKE_CUDA_ARCHITECTURES=120` reaches the cache | **Verified** — `CMakeCache.txt:148` |
+| `CUDA_VERSION=13.1` in cache | **Verified** — `CMakeCache.txt:490` |
+| nvcc from v13.1 toolkit dir | **Verified** — `CMakeCache.txt:443` |
+| CUDA .cu files added as `<CudaCompile>` in realsense2.vcxproj | **Verified** — grep of generated vcxproj |
+| `RS2_GB10_PC_ZEROCOPY` / `RS2_GB10_CONV_CACHE` not auto-enabled by `BUILD_WITH_CUDA` | **Verified** — CMakeLists.txt:83,92 plain `if(RS2_GB10_*)` blocks, not `if(BUILD_WITH_CUDA)` |
+| WMF backend selected (not RSUSB) | **Verified** — configure message `using RS2_USE_WMF_BACKEND` |
+| Configure succeeds (exit 0) | **Verified** — run on this machine 2026-06-06 |
+| MSVC 19.44 is a supported host compiler for CUDA 13.1 | **Assumed** — configure probed and accepted it; CUDA 13.x support for VS 2022 17.14 toolset is expected but no explicit NVIDIA compatibility table consulted |
+| sm_120 generates correct Blackwell microarchitecture code | **Assumed** — nvcc accepts the arch flag at configure time; actual PTX/SASS output not inspected |
+| Full build produces working CUDA kernels at runtime | **NOT verified** — full build not run (multi-hour; out of Task #20 scope) |
+| `CUDAToolkit_ROOT` unused warning is benign | **Verified** — CMake warning text confirms it; legacy `find_package(CUDA)` path is what the SDK uses |

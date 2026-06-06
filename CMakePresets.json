@@ -47,6 +47,52 @@
 
         "ENABLE_CCACHE": "OFF"
       }
+    },
+    {
+      "name": "windows-x64-cuda",
+      "displayName": "Windows x64 Release + CUDA (MSVC, sm_120)",
+      "description": "MSVC x64 Release build with CUDA enabled (toolkit v13.1). Enables the rs2 CUDA kernels (cuda-pointcloud.cu, cuda-conversion.cu, proc/cuda/) compiled for sm_120 (Blackwell / RTX 5060 Ti). All GB10-specific options remain OFF — RS2_GB10_PC_ZEROCOPY and RS2_GB10_CONV_CACHE are preprocessor guards inside those .cu files and are NOT activated by BUILD_WITH_CUDA alone. WMF backend unchanged. Separate binary dir: build/windows-x64-cuda/.",
+      "generator": "Visual Studio 17 2022",
+      "architecture": {
+        "value": "x64",
+        "strategy": "set"
+      },
+      "binaryDir": "${sourceDir}/build/windows-x64-cuda",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+
+        "BUILD_WITH_CPU_EXTENSIONS": "ON",
+
+        "BUILD_WITH_CUDA": "ON",
+        "BUILD_WITH_NEON": "OFF",
+        "BUILD_WITH_OPENMP": "OFF",
+
+        "CMAKE_CUDA_ARCHITECTURES": "120",
+        "CUDAToolkit_ROOT": "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1",
+        "CUDA_TOOLKIT_ROOT_DIR": "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1",
+
+        "RS2_GB10_USB_TUNING": "OFF",
+        "RS2_GB10_PC_ZEROCOPY": "OFF",
+        "RS2_GB10_CONV_CACHE": "OFF",
+
+        "FORCE_RSUSB_BACKEND": "OFF",
+
+        "BUILD_GRAPHICAL_EXAMPLES": "ON",
+        "BUILD_EXAMPLES": "ON",
+        "BUILD_TOOLS": "ON",
+        "BUILD_SHARED_LIBS": "ON",
+
+        "BUILD_PYTHON_BINDINGS": "OFF",
+        "BUILD_CSHARP_BINDINGS": "OFF",
+        "BUILD_UNIT_TESTS": "OFF",
+
+        "CHECK_FOR_UPDATES": "OFF",
+
+        "ENABLE_SECURITY_FLAGS": "OFF",
+        "BUILD_ASAN": "OFF",
+
+        "ENABLE_CCACHE": "OFF"
+      }
     }
   ],
   "buildPresets": [
@@ -54,6 +100,12 @@
       "name": "windows-x64-release",
       "displayName": "Build windows-x64-release (Release)",
       "configurePreset": "windows-x64-release",
+      "configuration": "Release"
+    },
+    {
+      "name": "windows-x64-cuda",
+      "displayName": "Build windows-x64-cuda (Release)",
+      "configurePreset": "windows-x64-cuda",
       "configuration": "Release"
     }
   ]
