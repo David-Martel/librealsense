@@ -221,6 +221,33 @@ inline std::string reacquire_advice( const std::string& device_id, int prior_acq
     return os.str();
 }
 
+// H10: the live/total re-acquire counter state-machine that backs the P7 guard.
+//
+// device-libusb.cpp keeps one of these per device id (USB bus-port). The P7 guard reads
+// dangerous() at construction start, commit()s at the END of a successful construction, and
+// release()s in the destructor. Extracting the transition logic here (a) lets it be unit-
+// tested offline against the SAME code production runs -- not a parallel reimplementation --
+// and (b) keeps the "commit-at-end, always-release" invariant in one auditable place. The
+// danger predicate delegates to is_dangerous_reacquire() so there is a single source of truth.
+//
+// Pure value type, no locking: the call site serializes every access under reacquire_mutex().
+struct reacquire_state
+{
+    int live  = 0;   // live usb_device_libusb instances for this device id, right now.
+    int total = 0;   // how many times this device has been successfully acquired this process.
+
+    // Is constructing now the dangerous full-release-then-reacquire churn? Read BEFORE commit().
+    bool dangerous() const { return is_dangerous_reacquire( live, total ); }
+
+    // Register a live instance at the END of a successful construction (pairs 1:1 with release()).
+    void commit() { ++live; ++total; }
+
+    // Drop a live instance (destructor path). Floored at 0 so an unbalanced release -- which the
+    // ctor/dtor pairing prevents today but a future edit might introduce -- can never underflow
+    // live into a permanently-"still open" state that would defeat the dangerous() detection.
+    void release() { if( live > 0 ) --live; }
+};
+
 // H3: controller-wedge detector.
 //
 // DISTINCT FROM watchdog_should_reset (P4). The P4 watchdog only RATE-LIMITS the

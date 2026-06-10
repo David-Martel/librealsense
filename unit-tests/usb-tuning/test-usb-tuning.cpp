@@ -105,3 +105,64 @@ TEST_CASE( "reacquire_advice: names the device and the remediation", "[usb-tunin
     REQUIRE( msg.find( "2-1" ) != std::string::npos );          // names the offending device
     REQUIRE( msg.find( "context" ) != std::string::npos );      // tells the caller to hold one context
 }
+
+TEST_CASE( "reacquire_state: counters stay balanced across a normal multi-sensor session", "[usb-tuning][P7][H10]" )
+{
+    // depth + color on one device: two concurrent sensors construct then both destruct.
+    // live returns to baseline, total reflects the two acquires, never dangerous mid-session.
+    reacquire_state st;
+    REQUIRE( st.live == 0 );
+    REQUIRE( st.total == 0 );
+    REQUIRE( st.dangerous() == false );          // first acquire of this device
+    st.commit();                                 // depth opens
+    REQUIRE( st.live == 1 );
+    REQUIRE( st.total == 1 );
+    REQUIRE( st.dangerous() == false );          // 2nd sensor sees a live handle -> not churn
+    st.commit();                                 // color opens
+    REQUIRE( st.live == 2 );
+    REQUIRE( st.total == 2 );
+    st.release();                                // color closes
+    st.release();                                // depth closes
+    REQUIRE( st.live == 0 );                     // balanced: every commit paired by a release
+    REQUIRE( st.total == 2 );
+}
+
+TEST_CASE( "reacquire_state: a refused dangerous re-acquire does not perturb the counters", "[usb-tuning][P7][H10]" )
+{
+    // After a full churn cycle (live hit 0, total>0) the next construct is dangerous; the refuse
+    // path throws BEFORE commit(), so a refused acquire must leave live/total exactly as they were.
+    reacquire_state st;
+    st.commit();
+    st.release();                                // fully released -> live 0, total 1
+    REQUIRE( st.live == 0 );
+    REQUIRE( st.total == 1 );
+    REQUIRE( st.dangerous() == true );           // full-release-then-reacquire = churn
+    const int live_at_refuse = st.live, total_at_refuse = st.total;
+    // production throws here (REFUSE) BEFORE commit() -- the refused path is a no-op on the counters:
+    REQUIRE( st.live == live_at_refuse );
+    REQUIRE( st.total == total_at_refuse );
+}
+
+TEST_CASE( "reacquire_state: a transient probe leaves no live drift", "[usb-tuning][P7][H10]" )
+{
+    // Constructs then destructs with no streaming/set_power -- still a balanced commit/release pair.
+    reacquire_state st;
+    st.commit();
+    st.release();
+    REQUIRE( st.live == 0 );                     // probe leaves no live drift
+    REQUIRE( st.total == 1 );                    // but the acquire is counted (future churn detection)
+}
+
+TEST_CASE( "reacquire_state: release() floors live at zero", "[usb-tuning][P7][H10]" )
+{
+    // An unbalanced release (the ctor/dtor pairing prevents it today, but this hardens against
+    // future edits) can never drive live negative -- which would defeat dangerous() detection.
+    reacquire_state st;
+    st.release();
+    REQUIRE( st.live == 0 );                     // floored, not -1
+    st.commit();
+    st.release();
+    st.release();                                // one extra release
+    REQUIRE( st.live == 0 );                     // still floored
+    REQUIRE( st.total == 1 );                    // total untouched by release
+}

@@ -63,8 +63,11 @@ namespace
     // Gated behind RS2_GB10_USB_TUNING so a stock upstream build is byte-identical.
 #if defined(RS2_GB10_USB_TUNING) && RS2_GB10_USB_TUNING
     std::mutex& reacquire_mutex() { static std::mutex m; return m; }
-    std::unordered_map< std::string, int >& reacquire_live()  { static std::unordered_map< std::string, int > m; return m; }
-    std::unordered_map< std::string, int >& reacquire_total() { static std::unordered_map< std::string, int > m; return m; }
+    // H10: one per-device counter (live + total) instead of twin maps. The transition logic
+    // (commit / release / dangerous) lives in usb_tuning::reacquire_state and is unit-tested
+    // offline against this exact type. Every access is serialized by reacquire_mutex().
+    std::unordered_map< std::string, librealsense::usb_tuning::reacquire_state >& reacquire_states()
+    { static std::unordered_map< std::string, librealsense::usb_tuning::reacquire_state > m; return m; }
 
 #if defined(RS2_GB10_SINGLE_OPENER_LOCK)
     // Forward declarations (defined below) — used by commit/release_device_acquire above their definition.
@@ -76,14 +79,14 @@ namespace
     // construction before any commit, keeping the live/total counters balanced.
     void check_device_reacquire( const std::string& device_id )
     {
-        int live_before = 0, total_before = 0;
+        bool dangerous = false;
+        int total_before = 0;
         {
             std::lock_guard< std::mutex > lock( reacquire_mutex() );
-            live_before  = reacquire_live()[device_id];
-            total_before = reacquire_total()[device_id];
+            const auto& st = reacquire_states()[device_id];   // default {0,0} on first sight of this id
+            dangerous    = st.dangerous();
+            total_before = st.total;                          // for the remediation message below
         }
-
-        const bool dangerous = librealsense::usb_tuning::is_dangerous_reacquire( live_before, total_before );
 
         const char* refuse_env = std::getenv( "RS2_GB10_REFUSE_REACQUIRE" );
         const bool refuse_opt_in = refuse_env && *refuse_env && std::string( refuse_env ) != "0";
@@ -111,17 +114,14 @@ namespace
     void commit_device_acquire( const std::string& device_id )
     {
         std::lock_guard< std::mutex > lock( reacquire_mutex() );
-        reacquire_live()[device_id]++;
-        reacquire_total()[device_id]++;
+        reacquire_states()[device_id].commit();
     }
 
     // Drop a live instance — called from the destructor.
     void release_device_acquire( const std::string& device_id )
     {
         std::lock_guard< std::mutex > lock( reacquire_mutex() );
-        auto& live = reacquire_live()[device_id];
-        if( live > 0 )
-            --live;
+        reacquire_states()[device_id].release();
 #if defined(RS2_GB10_SINGLE_OPENER_LOCK)
         // Release the cross-process flock once the LAST sensor of this device closes in this process.
         release_single_opener_locked( device_id );
@@ -313,14 +313,18 @@ namespace librealsense
             }
             libusb_ref_device(_device);
 
+            // P7: register this live instance only after a fully successful construction, so it
+            // pairs 1:1 with the destructor's release (a throwing ctor never commits). H10: commit
+            // BEFORE disarming the single-opener unwind guard — commit's argument copies a
+            // std::string (reacquire_device_id), which can bad_alloc; doing it while the guard is
+            // still armed means an OOM there unwinds the flock too instead of leaking it for the
+            // whole process lifetime. Nothing throws between commit and the disarm below.
+#if defined(RS2_GB10_USB_TUNING) && RS2_GB10_USB_TUNING
+            commit_device_acquire( reacquire_device_id( info ) );
+#endif
 #if defined(RS2_GB10_SINGLE_OPENER_LOCK)
             // Construction has passed every throwing step — hand the single-opener lock to the destructor.
             _solg.armed = false;
-#endif
-            // P7: register this live instance only after a fully successful construction,
-            // so it pairs 1:1 with the destructor's release (a throwing ctor never commits).
-#if defined(RS2_GB10_USB_TUNING) && RS2_GB10_USB_TUNING
-            commit_device_acquire( reacquire_device_id( info ) );
 #endif
         }
 

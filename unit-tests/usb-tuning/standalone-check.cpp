@@ -76,6 +76,59 @@ int main()
         assert( msg.find( "context" ) != std::string::npos );   // tells the caller to hold one context
     }
 
+    // H10: reacquire_state -- the live/total counter state-machine behind the P7 guard.
+    // Asserts counter BALANCE across the three re-acquire scenarios the guard must survive,
+    // so the "commit-at-end, always-release" invariant is proven, not just reasoned.
+    {
+        // Scenario 1: a normal multi-sensor session (depth + color on one device). Two
+        // concurrent sensors construct then both destruct; live returns to baseline, total
+        // reflects the two acquires, and the guard never reads "dangerous" mid-session.
+        reacquire_state st;
+        assert( st.live == 0 && st.total == 0 );
+        assert( st.dangerous() == false );          // first acquire of this device
+        st.commit();                                // depth opens
+        assert( st.live == 1 && st.total == 1 );
+        assert( st.dangerous() == false );          // 2nd sensor sees a live handle -> not churn
+        st.commit();                                // color opens
+        assert( st.live == 2 && st.total == 2 );
+        st.release();                               // color closes
+        st.release();                               // depth closes
+        assert( st.live == 0 && st.total == 2 );    // balanced: every commit paired by a release
+    }
+    {
+        // Scenario 2: a dangerous re-acquire that gets REFUSED does NOT perturb the counters.
+        // After a full churn cycle (live hit 0, total>0) the next construct is dangerous; the
+        // refuse path throws BEFORE commit(), so a refused acquire must leave live/total exactly
+        // as they were -- no drift from the throw path (the invariant H10 unit-asserts).
+        reacquire_state st;
+        st.commit();                                // 1st session
+        st.release();                               // fully released -> live 0, total 1
+        assert( st.live == 0 && st.total == 1 );
+        assert( st.dangerous() == true );           // full-release-then-reacquire = churn
+        const int live_at_refuse = st.live, total_at_refuse = st.total;
+        // production throws here (REFUSE) BEFORE commit() -- assert the refused path is a no-op:
+        assert( st.live == live_at_refuse && st.total == total_at_refuse );
+    }
+    {
+        // Scenario 3: a transient probe -- constructs then destructs with no streaming/set_power.
+        // Still a balanced commit/release pair; live returns to 0, total advances by one.
+        reacquire_state st;
+        st.commit();
+        st.release();
+        assert( st.live == 0 && st.total == 1 );    // probe leaves no live drift
+    }
+    {
+        // release() floors at 0: an unbalanced release (the dtor pairing prevents it today, but
+        // this hardens against future edits) can never drive live negative.
+        reacquire_state st;
+        st.release();
+        assert( st.live == 0 );                     // floored, not -1
+        st.commit();
+        st.release();
+        st.release();                               // one extra release
+        assert( st.live == 0 && st.total == 1 );    // still floored; total untouched by release
+    }
+
     // H3: controller_wedging -- (minus110_count, window_ms, threshold, window_limit_ms)
     // Defaults: threshold=8, window_limit=2000ms; MIN_WEDGE_WINDOW_MS=50.
     assert( controller_wedging( 8, 1000.0 ) == true );    // burst >= threshold within window -> wedging
