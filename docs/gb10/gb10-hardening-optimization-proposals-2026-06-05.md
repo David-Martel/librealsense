@@ -1,8 +1,8 @@
 # GB10 librealsense fork — Hardening & Optimization Proposals (2026-06-05)
 
-**Status (updated 2026-06-05, master `0a959dbc4`):** most P0/P1 items have LANDED and were
+**Status (updated 2026-06-10, master `338a278c3`):** most P0/P1/P2 items have LANDED and were
 **live-validated controller-GREEN**; the remainder are either deferred-with-rationale (can't pass a safe
-validation gate) or reclassified (needs consumer adoption).
+validation gate) or reclassified (needs consumer adoption). H10 (P7 counter robustness) landed 2026-06-10.
 
 | item | what | status | commit / validation |
 |------|------|--------|---------------------|
@@ -18,11 +18,13 @@ validation gate) or reclassified (needs consumer adoption).
 | **lock fail-fast** | abort the 2nd opener instead of waiting-its-turn | ⬜ next (refinement) | current behavior is SAFE (never simultaneous); needs defeating the enumerator catch+re-enumerate to fail fast |
 | **H6 (F8)** | bound the 100 ms URB-drain stacking across N streams on close | ⬜ next | OFFLINE + 2-STREAM HIL |
 | **H9 (F10)** | gl-lane dtor / `atexit` shutdown (static-teardown GL UAF) | ⬜ next (P2 — test-bed/posebench only, not vigil) | OFFLINE + 1-STREAM HIL |
-| **H10** | re-acquire state-machine hardening (P7 counter robustness) | ⬜ next | OFFLINE unit |
+| **H10** | re-acquire state-machine hardening (P7 counter robustness) | ✅ **DONE** | `f049e4bab` — P7 counter extracted to a unit-tested `usb_tuning::reacquire_state` (twin maps → one; commit-before-disarm OOM tightening), behavior-identical. Offline gate + Catch2 (4 cases, 55 assertions) PASS; single-stream HIL 2/2 PASS (depth 59.89/60, color 59.53/60, danger=0, uvc110=0), controller GREEN |
 
 **Original framing (still valid):** static reading of the GB10 code paths + the reliability audit, ranked by
 consumer relevance. All of the high-value, safely-validatable hardening is now landed + HIL-proven; what
 remains is either un-validatable-without-controller-risk (H3 back-off, H6) or needs a consumer (H4).
+H10 (P7 counter robustness) is the most recent landing (offline unit + single-stream HIL, GREEN); the
+remaining ⬜ items (lock fail-fast, H6, H9) need a 2-stream HIL session or are test-bed-only refinements.
 
 **Framing:** the primary consumer (`vigil-spark`, see `vigil-spark-integration.md`) is
 **unavoidably 2-stream** (color 640×480 bgr8@30 + depth 640×480 z16@30, one camera, one
