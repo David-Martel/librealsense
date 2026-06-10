@@ -43,7 +43,7 @@ build-hil:
       -DBUILD_TOOLS=ON -DBUILD_EXAMPLES=OFF -DBUILD_GRAPHICAL_EXAMPLES=OFF -DBUILD_UNIT_TESTS=OFF \
       -DCHECK_FOR_UPDATES=OFF -DRS2_GB10_USB_TUNING=1 -DOpenCV_DIR="{{opencv_cmake}}"
     cmake --build "{{hil_build_dir}}" --parallel "$(nproc)"
-    @echo "HIL build ready: {{hil_build_dir}}/Release/librealsense2.so (+ pyrealsense2)"
+    echo "HIL build ready: {{hil_build_dir}}/Release/librealsense2.so (+ pyrealsense2)"
 
 # Remove the HIL build dir.
 clean-hil:
