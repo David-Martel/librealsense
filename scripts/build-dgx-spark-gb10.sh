@@ -184,6 +184,24 @@ configure() {
     enable_legacy_ccache="OFF"
   fi
 
+  # RPATH bake-in: make pyrealsense2.so self-sufficient w.r.t. SONAME resolution.
+  # Without this, the dynamic linker resolves librealsense2.so.2.58 from ldconfig
+  # (alphabetical conf ordering), which can pick a non-CUDA build from /usr/local/lib
+  # over the CUDA build in $PREFIX/lib — silently, at runtime.
+  # $ORIGIN expands to the directory of the importing .so at dlopen time, so the
+  # pyrealsense2.so always finds its sibling librealsense2.so.2.58 even without
+  # ldconfig.  The explicit CUDA lib64 entry is belt-and-suspenders for cudarc links.
+  # LRS_GB10_RPATH_EXTRA: optional colon-separated additional RPATH entries.
+  local rpath_entries="\$ORIGIN:\$ORIGIN/../..:${PREFIX}/lib:/usr/local/cuda/lib64"
+  if [[ -n "${LRS_GB10_RPATH_EXTRA:-}" ]]; then
+    rpath_entries="${rpath_entries}:${LRS_GB10_RPATH_EXTRA}"
+  fi
+  local rpath_args=(
+    -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
+    -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=ON
+    "-DCMAKE_INSTALL_RPATH=${rpath_entries}"
+  )
+
   # Wire the CUDA-enabled OpenCV if the install prefix has a valid cmake config.
   # The config file path was verified on 2026-06-03: OpenCV 4.14.0 at
   #   /opt/gb10-cuda/install/opencv/lib/cmake/opencv4/OpenCVConfig.cmake
@@ -255,7 +273,8 @@ configure() {
     -DRS2_GB10_CONV_CACHE="$GB10_CONV_CACHE" \
     -DBUILD_UNIT_TESTS="$BUILD_UNIT_TESTS" \
     "${launcher_args[@]}" \
-    "${opencv_args[@]}"
+    "${opencv_args[@]}" \
+    "${rpath_args[@]}"
 }
 
 build() {
@@ -292,6 +311,7 @@ int main()
     return 0;
 }
 CPP
+  # shellcheck disable=SC2046  # pkg-config output must word-split into separate compiler flags
   c++ -std=c++20 "$smoke_dir/smoke.cpp" $(pkg-config --cflags --libs realsense2) -o "$smoke_dir/smoke"
   "$smoke_dir/smoke"
 
