@@ -63,6 +63,24 @@ Additional recipes (all no-camera where noted):
 - `just build-tag` — current source state (`git describe --tags --dirty`)
 See [`../../scripts/gb10/README.md`](../../scripts/gb10/README.md) for every tool + its safety class.
 
+## Visible Display Environment
+
+Before non-headless RealSense validation from Codex, RTK, SSH-adjacent shells,
+or any shell that did not inherit the desktop session, source the VIGIL fleet
+GUI environment:
+
+```bash
+source "$HOME/dev/repos/vigil-spark/ops/vigil-network/scripts/vigil-gui-env.sh"
+source scripts/gb10/gb10-env.sh
+```
+
+`scripts/gb10/gb10-env.sh` now sources that wrapper automatically when present
+and then preserves its historical `DISPLAY=:1` fallback if no live desktop or
+Xvfb socket is available. On the asuspro13 coordinator, the expected optimized
+path is native Wayland (`QT_QPA_PLATFORM=wayland`, `WAYLAND_DISPLAY=wayland-0`)
+with `DISPLAY=:0` available for Xwayland tools. See the canonical VIGIL runbook
+in `vigil-spark/ops/vigil-network/docs/dgx-spark-display-runbook.md`.
+
 ## Build provenance & reproducibility
 Every GB10 build records exactly how it was made so it can be reproduced on another system, and so you
 can verify a binary reflects the latest source.

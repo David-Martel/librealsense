@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # gb10-env.sh — single source of env truth for the GB10 RealSense tools. SOURCE it (don't execute):
 #   source "$(dirname "${BASH_SOURCE[0]}")/gb10-env.sh"
 # Sets LD_LIBRARY_PATH (pyrealsense2 from build-gb10-full + cv2's opencv & ffmpeg libs), PYTHONPATH
@@ -30,7 +31,21 @@ export LD_LIBRARY_PATH="$LRS_OPENCV_BASE/lib:$LRS_FFMPEG_BASE/lib:$_GB10_FULL${L
 export PYTHONPATH="$_GB10_ENV_DIR:$_GB10_FULL:$LRS_OPENCV_BASE/lib/$LRS_PY_TAG/site-packages${PYTHONPATH:+:$PYTHONPATH}"
 export LRS_FFMPEG LRS_VENV
 export LRS_BUILD_RELEASE="$_GB10_FULL"   # the resolved <build>/Release dir, for consumers that need it
+
+for _GB10_GUI_ENV in \
+  "$HOME/dev/repos/vigil-spark/ops/vigil-network/scripts/vigil-gui-env.sh" \
+  "$HOME/vigil-spark/ops/vigil-network/scripts/vigil-gui-env.sh"; do
+  if [ -f "$_GB10_GUI_ENV" ]; then
+    # shellcheck disable=SC1090
+    . "$_GB10_GUI_ENV"
+    break
+  fi
+done
 export DISPLAY="${DISPLAY:-:1}"
+if [ -z "${QT_QPA_PLATFORM:-}" ] && [ -n "${WAYLAND_DISPLAY:-}" ]; then
+  export QT_QPA_PLATFORM=wayland
+fi
+unset _GB10_GUI_ENV
 
 # Loud ABI guard: if the resolved venv's Python minor doesn't match LRS_PY_TAG, the .so won't import.
 # Sourced file -> warn (never exit, that would kill the caller's shell). Skipped if the venv is absent.
