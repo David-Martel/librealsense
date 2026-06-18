@@ -10,6 +10,7 @@
 #include "environment.h"
 #include "align.h"
 #include "stream.h"
+#include <cstdlib>
 #include <rsutils/easylogging/easyloggingpp.h>
 
 #if defined(RS2_USE_CUDA)
@@ -28,10 +29,15 @@ namespace librealsense
     std::shared_ptr<align> align::create_align(rs2_stream align_to)
     {
         #if defined(RS2_USE_CUDA)
-        if (rsutils::rs2_is_gpu_available())
+        auto disable_cuda_align = std::getenv("RS2_DISABLE_CUDA_ALIGN");
+        if (!disable_cuda_align && rsutils::rs2_is_gpu_available())
         {
             LOG_INFO("Using CUDA-optimized align implementation");
             return std::make_shared<librealsense::align_cuda>(align_to);
+        }
+        if (disable_cuda_align)
+        {
+            LOG_INFO("RS2_DISABLE_CUDA_ALIGN is set; skipping CUDA align implementation");
         }
         #endif
         #if defined(__SSSE3__)
