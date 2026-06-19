@@ -3,9 +3,12 @@
 #include "cuda-align.cuh"
 #include "../../../include/librealsense2/rsutil.h"
 #include "../../cuda/rscuda_utils.cuh"
+#include <rsutils/easylogging/easyloggingpp.h>
 
 // CUDA headers
 #include <cuda_runtime.h>
+#include <stdexcept>
+#include <string>
 
 #ifdef _MSC_VER 
 // Add library dependencies if using VS
@@ -18,6 +21,38 @@ using namespace librealsense;
 using namespace rscuda;
 
 template<int N> struct bytes { unsigned char b[N]; };
+
+namespace
+{
+    void cuda_or_throw(cudaError_t result, const char* what)
+    {
+        if (result != cudaSuccess)
+        {
+            std::string message = std::string("CUDA align failure (") + what + "): "
+                + cudaGetErrorString(result);
+            LOG_ERROR(message);
+            throw std::runtime_error(message);
+        }
+    }
+
+    template<typename T>
+    void ensure_dev_buffer(std::shared_ptr<T>& buffer, size_t& capacity, size_t elements)
+    {
+        if (!buffer || capacity < elements)
+        {
+            buffer = alloc_dev<T>(static_cast<int>(elements));
+            capacity = elements;
+        }
+    }
+
+    template<typename T>
+    void refresh_device_copy(std::shared_ptr<T>& buffer, const T& value, const char* what)
+    {
+        if (!buffer)
+            buffer = alloc_dev<T>(1);
+        cuda_or_throw(cudaMemcpy(buffer.get(), &value, sizeof(T), cudaMemcpyHostToDevice), what);
+    }
+}
 
 int calc_block_size(int pixel_count, int thread_count)
 {
@@ -50,15 +85,37 @@ __device__ void kernel_transfer_pixels(int2* mapped_pixels, const rs2_intrinsics
     mapped_pixels[mapped_index].y = static_cast<int>(other_pixel[1] + 0.5f);
 }
 
+__device__ void atomic_min_uint16(uint16_t* address, uint16_t value)
+{
+    auto base_address = reinterpret_cast<unsigned int*>(reinterpret_cast<size_t>(address) & ~size_t(2));
+    auto high_word = (reinterpret_cast<size_t>(address) & size_t(2)) != 0;
+    unsigned int old_value = *base_address;
+    unsigned int assumed_value;
+    do
+    {
+        assumed_value = old_value;
+        uint16_t current = high_word ?
+            static_cast<uint16_t>(assumed_value >> 16) :
+            static_cast<uint16_t>(assumed_value & 0xffff);
+        if (current <= value)
+            return;
+        unsigned int replacement = high_word ?
+            ((assumed_value & 0x0000ffff) | (static_cast<unsigned int>(value) << 16)) :
+            ((assumed_value & 0xffff0000) | static_cast<unsigned int>(value));
+        old_value = atomicCAS(base_address, assumed_value, replacement);
+    } while (old_value != assumed_value);
+}
+
 __global__  void kernel_map_depth_to_other(int2* mapped_pixels, const uint16_t* depth_in, const rs2_intrinsics* depth_intrin, const rs2_intrinsics* other_intrin,
     const rs2_extrinsics* depth_to_other, float depth_scale)
 {
     int depth_x = blockIdx.x * blockDim.x + threadIdx.x;
     int depth_y = blockIdx.y * blockDim.y + threadIdx.y;
 
-    int depth_pixel_index = depth_y * depth_intrin->width + depth_x;
-    if (depth_pixel_index >= depth_intrin->width * depth_intrin->height)
+    if (depth_x >= depth_intrin->width || depth_y >= depth_intrin->height)
         return;
+
+    int depth_pixel_index = depth_y * depth_intrin->width + depth_x;
     float depth_val = depth_in[depth_pixel_index] * depth_scale;
     kernel_transfer_pixels(mapped_pixels, depth_intrin, other_intrin, depth_to_other, depth_val, depth_x, depth_y, blockIdx.z);
 }
@@ -72,21 +129,31 @@ __global__  void kernel_other_to_depth(unsigned char* aligned, const unsigned ch
     auto depth_size = depth_intrin->width * depth_intrin->height;
     int depth_pixel_index = depth_y * depth_intrin->width + depth_x;
 
-    if (depth_pixel_index >= depth_intrin->width * depth_intrin->height)
+    if (depth_x >= depth_intrin->width || depth_y >= depth_intrin->height)
         return;
 
     int2 p0 = mapped_pixels[depth_pixel_index];
     int2 p1 = mapped_pixels[depth_size + depth_pixel_index];
 
-    if (p0.x < 0 || p0.y < 0 || p1.x >= other_intrin->width || p1.y >= other_intrin->height)
+    if (p0.x < 0 && p1.x < 0)
+        return;
+    if (p0.y < 0 && p1.y < 0)
+        return;
+    if (p0.x >= other_intrin->width && p1.x >= other_intrin->width)
+        return;
+    if (p0.y >= other_intrin->height && p1.y >= other_intrin->height)
         return;
 
     // Transfer between the depth pixels and the pixels inside the rectangle on the other image
     auto in_other = (const bytes<BPP> *)(other);
     auto out_other = (bytes<BPP> *)(aligned);
-    for (int y = p0.y; y <= p1.y; ++y)
+    int x0 = max(0, min(p0.x, p1.x));
+    int y0 = max(0, min(p0.y, p1.y));
+    int x1 = min(other_intrin->width - 1, max(p0.x, p1.x));
+    int y1 = min(other_intrin->height - 1, max(p0.y, p1.y));
+    for (int y = y0; y <= y1; ++y)
     {
-        for (int x = p0.x; x <= p1.x; ++x)
+        for (int x = x0; x <= x1; ++x)
         {
             auto other_pixel_index = y * other_intrin->width + x;
             out_other[depth_pixel_index] = in_other[other_pixel_index];
@@ -102,25 +169,36 @@ __global__  void kernel_depth_to_other(uint16_t* aligned_out, const uint16_t* de
     auto depth_size = depth_intrin->width * depth_intrin->height;
     int depth_pixel_index = depth_y * depth_intrin->width + depth_x;
 
-    if (depth_pixel_index >= depth_intrin->width * depth_intrin->height)
+    if (depth_x >= depth_intrin->width || depth_y >= depth_intrin->height)
         return;
 
     int2 p0 = mapped_pixels[depth_pixel_index];
     int2 p1 = mapped_pixels[depth_size + depth_pixel_index];
 
-    if (p0.x < 0 || p0.y < 0 || p1.x >= other_intrin->width || p1.y >= other_intrin->height)
+    uint16_t new_val = depth_in[depth_pixel_index];
+    if (!new_val)
+        return;
+
+    if (p0.x < 0 && p1.x < 0)
+        return;
+    if (p0.y < 0 && p1.y < 0)
+        return;
+    if (p0.x >= other_intrin->width && p1.x >= other_intrin->width)
+        return;
+    if (p0.y >= other_intrin->height && p1.y >= other_intrin->height)
         return;
 
     // Transfer between the depth pixels and the pixels inside the rectangle on the other image
-    unsigned int new_val = depth_in[depth_pixel_index];
-    unsigned int* arr = (unsigned int*)aligned_out;
-    for (int y = p0.y; y <= p1.y; ++y)
+    int x0 = max(0, min(p0.x, p1.x));
+    int y0 = max(0, min(p0.y, p1.y));
+    int x1 = min(other_intrin->width - 1, max(p0.x, p1.x));
+    int y1 = min(other_intrin->height - 1, max(p0.y, p1.y));
+    for (int y = y0; y <= y1; ++y)
     {
-        for (int x = p0.x; x <= p1.x; ++x)
+        for (int x = x0; x <= x1; ++x)
         {
             auto other_pixel_index = y * other_intrin->width + x;
-            new_val = new_val << 16 | new_val;
-            atomicMin(&arr[other_pixel_index / 2], new_val);
+            atomic_min_uint16(&aligned_out[other_pixel_index], new_val);
         }
     }
 }
@@ -129,6 +207,9 @@ __global__  void kernel_replace_to_zero(uint16_t* aligned_out, const rs2_intrins
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= other_intrin->width || y >= other_intrin->height)
+        return;
 
     auto other_pixel_index = y * other_intrin->width + x;
     if (aligned_out[other_pixel_index] == 0xffff)
@@ -147,21 +228,20 @@ void align_cuda_helper::align_other_to_depth(unsigned char* h_aligned_out, const
     int aligned_size = aligned_pixel_count * other_bytes_per_pixel;
 
     // allocate and copy objects to cuda device memory
-    if (!_d_depth_intrinsics) _d_depth_intrinsics = make_device_copy(h_depth_intrin);
-    if (!_d_other_intrinsics) _d_other_intrinsics = make_device_copy(h_other_intrin);
-    if (!_d_depth_other_extrinsics) _d_depth_other_extrinsics = make_device_copy(h_depth_to_other);
+    refresh_device_copy(_d_depth_intrinsics, h_depth_intrin, "H2D depth intrinsics");
+    refresh_device_copy(_d_other_intrinsics, h_other_intrin, "H2D other intrinsics");
+    refresh_device_copy(_d_depth_other_extrinsics, h_depth_to_other, "H2D depth-to-other extrinsics");
 
-    if (!_d_depth_in) _d_depth_in = alloc_dev<uint16_t>(aligned_pixel_count);
-    cudaMemcpy(_d_depth_in.get(), h_depth_in, depth_size, cudaMemcpyHostToDevice);
+    ensure_dev_buffer(_d_depth_in, _depth_capacity, static_cast<size_t>(aligned_pixel_count));
+    cuda_or_throw(cudaMemcpy(_d_depth_in.get(), h_depth_in, depth_size, cudaMemcpyHostToDevice), "H2D depth");
 
-    if (!_d_other_in) _d_other_in = alloc_dev<unsigned char>(other_size);
-    cudaMemcpy(_d_other_in.get(), h_other_in, other_size, cudaMemcpyHostToDevice);
+    ensure_dev_buffer(_d_other_in, _other_capacity, static_cast<size_t>(other_size));
+    cuda_or_throw(cudaMemcpy(_d_other_in.get(), h_other_in, other_size, cudaMemcpyHostToDevice), "H2D other");
 
-    if (!_d_aligned_out)
-        _d_aligned_out = alloc_dev<unsigned char>(aligned_size);
-    cudaMemset(_d_aligned_out.get(), 0, aligned_size);
+    ensure_dev_buffer(_d_aligned_out, _aligned_capacity, static_cast<size_t>(aligned_size));
+    cuda_or_throw(cudaMemset(_d_aligned_out.get(), 0, aligned_size), "clear aligned other-to-depth");
 
-    if (!_d_pixel_map) _d_pixel_map = alloc_dev<int2>(depth_pixel_count * 2);
+    ensure_dev_buffer(_d_pixel_map, _pixel_map_capacity, static_cast<size_t>(depth_pixel_count * 2));
 
     // config threads
     dim3 threads(RS2_CUDA_THREADS_PER_BLOCK, RS2_CUDA_THREADS_PER_BLOCK);
@@ -170,6 +250,7 @@ void align_cuda_helper::align_other_to_depth(unsigned char* h_aligned_out, const
 
     kernel_map_depth_to_other <<<mapping_blocks,threads>>> (_d_pixel_map.get(), _d_depth_in.get(), _d_depth_intrinsics.get(), _d_other_intrinsics.get(),
         _d_depth_other_extrinsics.get(), depth_scale);
+    cuda_or_throw(cudaGetLastError(), "map depth to other launch");
 
     switch (other_bytes_per_pixel)
     {
@@ -178,10 +259,11 @@ void align_cuda_helper::align_other_to_depth(unsigned char* h_aligned_out, const
     case 3: kernel_other_to_depth<3> <<<depth_blocks,threads>>> (_d_aligned_out.get(), _d_other_in.get(), _d_pixel_map.get(), _d_depth_intrinsics.get(), _d_other_intrinsics.get()); break;
     case 4: kernel_other_to_depth<4> <<<depth_blocks,threads>>> (_d_aligned_out.get(), _d_other_in.get(), _d_pixel_map.get(), _d_depth_intrinsics.get(), _d_other_intrinsics.get()); break;
     }
+    cuda_or_throw(cudaGetLastError(), "other to depth launch");
 
-    cudaStreamSynchronize(0);
+    cuda_or_throw(cudaStreamSynchronize(0), "other to depth sync");
 
-    cudaMemcpy(h_aligned_out, _d_aligned_out.get(), aligned_size, cudaMemcpyDeviceToHost);
+    cuda_or_throw(cudaMemcpy(h_aligned_out, _d_aligned_out.get(), aligned_size, cudaMemcpyDeviceToHost), "D2H aligned other-to-depth");
 }
 
 void align_cuda_helper::align_depth_to_other(unsigned char* h_aligned_out, const uint16_t* h_depth_in,
@@ -196,17 +278,17 @@ void align_cuda_helper::align_depth_to_other(unsigned char* h_aligned_out, const
     int aligned_byte_size = aligned_pixel_count * 2;
 
     // allocate and copy objects to cuda device memory
-    if (!_d_depth_intrinsics) _d_depth_intrinsics = make_device_copy(h_depth_intrin);
-    if (!_d_other_intrinsics) _d_other_intrinsics = make_device_copy(h_other_intrin);
-    if (!_d_depth_other_extrinsics) _d_depth_other_extrinsics = make_device_copy(h_depth_to_other);
+    refresh_device_copy(_d_depth_intrinsics, h_depth_intrin, "H2D depth intrinsics");
+    refresh_device_copy(_d_other_intrinsics, h_other_intrin, "H2D other intrinsics");
+    refresh_device_copy(_d_depth_other_extrinsics, h_depth_to_other, "H2D depth-to-other extrinsics");
 
-    if (!_d_depth_in) _d_depth_in = alloc_dev<uint16_t>(depth_pixel_count);
-    cudaMemcpy(_d_depth_in.get(), h_depth_in, depth_byte_size, cudaMemcpyHostToDevice);
+    ensure_dev_buffer(_d_depth_in, _depth_capacity, static_cast<size_t>(depth_pixel_count));
+    cuda_or_throw(cudaMemcpy(_d_depth_in.get(), h_depth_in, depth_byte_size, cudaMemcpyHostToDevice), "H2D depth");
 
-    if (!_d_aligned_out) _d_aligned_out = alloc_dev<unsigned char>(aligned_byte_size);
-    cudaMemset(_d_aligned_out.get(), 0xff, aligned_byte_size);
+    ensure_dev_buffer(_d_aligned_out, _aligned_capacity, static_cast<size_t>(aligned_byte_size));
+    cuda_or_throw(cudaMemset(_d_aligned_out.get(), 0xff, aligned_byte_size), "clear aligned depth-to-other");
 
-    if (!_d_pixel_map) _d_pixel_map = alloc_dev<int2>(depth_pixel_count * 2);
+    ensure_dev_buffer(_d_pixel_map, _pixel_map_capacity, static_cast<size_t>(depth_pixel_count * 2));
 
     // config threads
     dim3 threads(RS2_CUDA_THREADS_PER_BLOCK, RS2_CUDA_THREADS_PER_BLOCK);
@@ -216,15 +298,18 @@ void align_cuda_helper::align_depth_to_other(unsigned char* h_aligned_out, const
 
     kernel_map_depth_to_other <<<mapping_blocks,threads>>> (_d_pixel_map.get(), _d_depth_in.get(), _d_depth_intrinsics.get(),
         _d_other_intrinsics.get(), _d_depth_other_extrinsics.get(), depth_scale);
+    cuda_or_throw(cudaGetLastError(), "map depth to other launch");
 
     kernel_depth_to_other <<<depth_blocks,threads>>> ((uint16_t*)_d_aligned_out.get(), _d_depth_in.get(), _d_pixel_map.get(),
         _d_depth_intrinsics.get(), _d_other_intrinsics.get());
+    cuda_or_throw(cudaGetLastError(), "depth to other launch");
 
     kernel_replace_to_zero <<<other_blocks, threads>>> ((uint16_t*)_d_aligned_out.get(), _d_other_intrinsics.get());
+    cuda_or_throw(cudaGetLastError(), "replace invalid depth launch");
 
-    cudaStreamSynchronize(0);
+    cuda_or_throw(cudaStreamSynchronize(0), "depth to other sync");
 
-    cudaMemcpy(h_aligned_out, _d_aligned_out.get(), aligned_pixel_count * 2, cudaMemcpyDeviceToHost);
+    cuda_or_throw(cudaMemcpy(h_aligned_out, _d_aligned_out.get(), aligned_pixel_count * 2, cudaMemcpyDeviceToHost), "D2H aligned depth-to-other");
 }
 
 #endif //RS2_USE_CUDA
