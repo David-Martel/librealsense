@@ -22,12 +22,6 @@ namespace librealsense
         simulate_device_reconnect(this->get_device_info());
     }
 
-    void d400_mipi_device::toggle_advanced_mode(bool enable)
-    {
-        ds_advanced_mode_base::toggle_advanced_mode(enable);
-        simulate_device_reconnect(this->get_device_info());
-    }
-
     void d400_mipi_device::simulate_device_reconnect(std::shared_ptr<const device_info> dev_info)
     {
         //limitation: the user must hold the context from which the device was created

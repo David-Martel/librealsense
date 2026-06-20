@@ -79,6 +79,8 @@ namespace librealsense
         static bool is_fisheye_module_sensor(const std::string& sensor_name);
         static bool is_safety_module_sensor(const std::string& sensor_name);
         static bool is_depth_mapping_sensor(const std::string& sensor_name);
+        static bool is_inference_module_sensor(const std::string& sensor_name);
+        static bool is_object_detection_sensor(const std::string& sensor_name);
 
         std::shared_ptr<recommended_proccesing_blocks_snapshot> read_proccesing_blocks(device_serializer::sensor_identifier sensor_id,
             std::shared_ptr<options_interface> options);
@@ -138,6 +140,8 @@ namespace librealsense
         std::map< stream_identifier, std::shared_ptr<serialized_data> > _last_frame_cache;
 
         std::map< stream_identifier, std::pair< uint32_t, rs2_extrinsics > > m_extrinsics_map;
+
+        static void decompress_if_needed(std::shared_ptr<rosbag2_storage::SerializedBagMessage>& msg);
 
         std::shared_ptr<rosbag2_storage::SerializedBagMessage> _cached_message;
         bool _cache_valid = false;  // true means _cached_message contains valid unconsumed data

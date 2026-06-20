@@ -4,6 +4,9 @@
 #pragma once
 #include <string>
 #include <chrono>
+#include <memory>
+#include <stdexcept>
+#include <rcutils/types/uint8_array.h>
 #include "librealsense2/rs.h"
 #include "sensor_msgs/image_encodings.h"
 #include "ros2-msg-types/sensor_msgs/msg/Imu.h"
@@ -32,6 +35,7 @@ namespace librealsense
         static constexpr const char* ros_safety_type_str() { return "safety"; }
         static constexpr const char* ros_occupancy_type_str() { return "occupancy"; }
         static constexpr const char* ros_labeled_points_type_str() { return "labeled_points"; }
+        static constexpr const char* ros_object_detection_type_str() { return "object_detection"; }
 
         static uint32_t get_device_index(const std::string& topic)
         {
@@ -164,7 +168,9 @@ namespace librealsense
 
         static std::string notification_topic(const device_serializer::sensor_identifier& sensor_id, rs2_notification_category nc)
         {
-            return create_from({ device_prefix(sensor_id.device_index), sensor_prefix(sensor_id.sensor_index), "notification", rs2_notification_category_to_string(nc)});
+            std::string topic_name = rs2_notification_category_to_string(nc);
+            std::replace(topic_name.begin(), topic_name.end(), ' ', '_');
+            return create_from({ device_prefix(sensor_id.device_index), sensor_prefix(sensor_id.sensor_index), "notification", topic_name });
         }
 
         template<uint32_t index>
@@ -226,6 +232,8 @@ namespace librealsense
                 return ros_occupancy_type_str();
             case RS2_STREAM_LABELED_POINT_CLOUD:
                 return ros_labeled_points_type_str();
+            case RS2_STREAM_OBJECT_DETECTION:
+                return ros_object_detection_type_str();
             }
             throw io_exception( rsutils::string::from() << "Unknown stream type when resolving ros type: " << type );
         }
@@ -285,4 +293,35 @@ namespace librealsense
         void deserialize(eprosima::fastcdr::Cdr& cdr) { cdr >> value; }
         static size_t getCdrSerializedSize(const cdr_uint32&, size_t = 0) { return sizeof(uint32_t); }
     };
+
+    inline std::shared_ptr<rcutils_uint8_array_t> create_buffer(size_t size)
+    {
+        auto buffer = std::shared_ptr<rcutils_uint8_array_t>(new rcutils_uint8_array_t(),
+            [](rcutils_uint8_array_t* arr) {
+                if (arr) {
+                    rcutils_ret_t ret = rcutils_uint8_array_fini(arr);
+                    (void)ret; // Cast to void to suppress unused warning
+                }
+                delete arr;
+            });
+
+        rcutils_allocator_t alloc = rcutils_get_default_allocator();
+        auto ret = rcutils_uint8_array_init(buffer.get(), size, &alloc);
+        if (ret != RCUTILS_RET_OK)
+            throw std::runtime_error("Failed to initialize rosbag2 buffer");
+
+        return buffer;
+    }
+
+    // Make sure `buf` has at least `size` bytes. Allocates on first call, grows if too small, otherwise reuses as is.
+    inline std::shared_ptr<rcutils_uint8_array_t>& ensure_buffer_capacity(
+        std::shared_ptr<rcutils_uint8_array_t>& buf, size_t size)
+    {
+        if (!buf)
+            buf = create_buffer(size);  // no buffer yet
+        else if (buf->buffer_capacity < size)  // buffer too small
+            if (rcutils_uint8_array_resize(buf.get(), size) != RCUTILS_RET_OK)
+                throw std::runtime_error("Failed to resize rosbag2 buffer");
+        return buf;
+    }
 }

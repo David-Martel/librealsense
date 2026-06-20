@@ -209,6 +209,7 @@ namespace rs2
         std::shared_ptr<rs2::colorizer> depth_colorizer;
         std::shared_ptr<rs2::yuy_decoder> yuy2rgb;
         std::shared_ptr<rs2::m420_decoder> m420_to_rgb;
+        std::shared_ptr<rs2::nv12_decoder> nv12_to_rgb;
         std::shared_ptr<rs2::y411_decoder> y411;
 
         std::vector<std::shared_ptr<processing_block_model>> post_processing;
@@ -240,6 +241,7 @@ namespace rs2
         void set_extrinsics_from_depth_if_needed();
         bool is_post_processing_enabled_in_config_file() const;
         void avoid_streaming_on_embedded_filters_not_matching_configuration() const;
+        bool hide_resolutions(const stream_profile& profile) const;
         // used in method get_max_resolution per stream
         std::map<rs2_stream, std::vector<std::pair<int, int>>> resolutions_per_stream;
 

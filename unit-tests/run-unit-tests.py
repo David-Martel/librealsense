@@ -1,3 +1,4 @@
+# ruff: noqa
 #!python3
 
 # License: Apache 2.0. See LICENSE file in root directory.
@@ -9,24 +10,12 @@ import sys, os, subprocess, re, platform, getopt, time
 current_dir = os.path.dirname( os.path.abspath( __file__ ) )
 sys.path.append( os.path.join( current_dir, 'py' ))
 
-from rspy import log, file, repo, libci
+from rspy import log, file, repo, libci, python_path
 from rspy.signals import register_signal_handlers
 
-# Python's default list of paths to look for modules includes user-installed. We want
-# to avoid those to take only the pyrealsense2/pyrealdds/pyrsutils we actually compiled!
-#
-# Rather than rebuilding the whole sys.path, we instead remove only the user site-packages
-# directories that actually contain our compiled packages. This preserves other user-installed
-# packages (e.g. paramiko, pykush) that tests depend on.
-from site import getusersitepackages   # not the other stuff, like quit(), exit(), etc.!
-_user_site = getusersitepackages()
-_compiled_pkg_names = { 'pyrealsense2', 'pyrealdds', 'pyrsutils' }
-#log.d( 'site packages=', _user_site )
-#log.d( 'sys.path=', sys.path )
-sys.path = [p for p in sys.path
-            if not file.is_inside( p, _user_site )
-            or not any( os.path.exists( os.path.join( p, pkg ) ) for pkg in _compiled_pkg_names )]
-#log.d( 'modified=', sys.path )
+# Make sure the freshly-built pyrealsense2/pyrealdds/pyrsutils win over any copy
+# pip may have left in the user site (~/.local/...).
+python_path.block_user_site_for( { 'pyrealsense2', 'pyrealdds', 'pyrsutils' } )
 
 
 def usage():
@@ -55,8 +44,10 @@ def usage():
     print( '        --repeat <#>         Repeat each test <#> times' )
     print( '        --retry <#>          Retry each test <#> times (unless test specified more)' )
     print( '        --config <>          Ignore test configurations; use the one provided' )
-    print( '        --device <>          Run only on the specified devices; ignore any test that does not match (implies --live)' )
-    print( '        --exclude-device <>  Exclude the specified devices from testing (space-separated list)' )
+    print( '        --device <>          Run only on the specified devices; ignore any test that does not match (implies --live).' )
+    print( '                             Can be repeated or given a space-separated list, e.g. --device "D455 D435".' )
+    print( '        --exclude-device <>  Exclude the specified devices from testing.' )
+    print( '                             Can be repeated or given a space-separated list, e.g. --exclude-device "D555 D585S".' )
     print( '        --no-reset           Do not try to reset any devices, with or without a hub' )
     print( '        --hub-reset          If a hub is available, reset the hub itself' )
     print( '        --custom-fw-d400          If custom fw provided flash it if its different that the current fw installed' )
@@ -155,9 +146,13 @@ for opt, arg in opts:
             log.e( "--device and --not-live are mutually exclusive" )
             usage()
         only_live = True
-        device_set = arg.split()
+        if device_set is None:
+            device_set = []
+        device_set.extend( arg.split() )
     elif opt == '--exclude-device':
-        exclude_device_set = arg.split()
+        if exclude_device_set is None:
+            exclude_device_set = []
+        exclude_device_set.extend( arg.split() )
     elif opt == '--no-reset':
         no_reset = True
     elif opt == '--hub-reset':
@@ -544,6 +539,7 @@ try:
         if pyrs:
             sys.path.insert( 1, pyrs_path )  # Make sure we pick up the right pyrealsense2!
         from rspy import devices
+        devices.init_hub()
         register_signal_handlers(close_hubs)
         disable_dds = "dds" not in context
         devices.query( hub_reset = hub_reset, disable_dds = disable_dds, rslog = rslog ) #resets the device
@@ -578,27 +574,20 @@ try:
         #
         if exclude_device_set is not None:
             excluded_sns = set()  # convert the list of exclude specs to a list of serial numbers
-            ignored_list = list()
             for spec in exclude_device_set:
-                excluded_devices = [sn for sn in devices.by_spec( spec, ignored_list )]
-                excluded_sns.update( excluded_devices )
-            
-            if excluded_sns:
-                log.d( f'excluding devices: {serial_numbers_to_string( excluded_sns )}' )
-                if device_set is not None:
-                    # Remove excluded devices from the included device set
-                    device_set = device_set - excluded_sns
-                    if not device_set:
-                        log.f( 'All specified devices were excluded; no devices left to test' )
-                    log.d( f'final device set after exclusions: {serial_numbers_to_string( device_set )}' )
-                else:
-                    # If no device_set was specified, we need to discover all devices and exclude the specified ones
-                    all_devices = set(devices.all())
-                    device_set = all_devices - excluded_sns
-                    if not device_set:
-                        log.f( 'All discovered devices were excluded; no devices left to test' )
-                    else:
-                        log.d( f'using all devices except excluded ones: {serial_numbers_to_string( device_set )}' )
+                excluded_sns.update( devices.by_spec( spec, [] ) )
+            log.d( f'excluding devices: {serial_numbers_to_string( excluded_sns ) if excluded_sns else "(none connected match " + str(exclude_device_set) + ")"}' )
+
+            # Always narrow device_set to "connected minus excluded" — even when no connected device
+            # matches the exclude pattern. This makes `inclusions` truthy in devices.by_configuration,
+            # so configurations requiring an excluded product type are silently ignored instead of
+            # erroring with "no device matches configuration".
+            base = device_set if device_set is not None else set(devices.all())
+            if base:
+                device_set = base - excluded_sns
+                if not device_set:
+                    log.f( 'All devices were excluded; no devices left to test' )
+                log.d( f'using devices: {serial_numbers_to_string( device_set )}' )
         #
         log.progress()
     #

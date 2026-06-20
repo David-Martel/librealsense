@@ -11,6 +11,7 @@
 #include "proc/hdr-merge.h"
 #include "proc/sequence-id-filter.h"
 #include "ros2_writer.h"
+#include <zstd.h>
 #include "media/ros_factory.h"
 #include "core/motion-frame.h"
 #include <sstream>
@@ -19,6 +20,7 @@
 #include <src/core/depth-frame.h>
 #include <src/points.h>
 #include <src/labeled-points.h>
+#include <src/object-detection-frame.h>
 
 #include <fstream>
 
@@ -57,10 +59,7 @@ namespace librealsense
             throw std::runtime_error(rsutils::string::from() << "Failed to open rosbag2 storage for uri '" << file
                 << "' using storage id 'sqlite3'");
 
-        if (compress_while_record)
-        {
-            // TODO: implement
-        }
+        _compress = compress_while_record;
 
         write_file_version();
     }
@@ -77,25 +76,18 @@ namespace librealsense
         _topics.emplace(name, md);
     }
 
-    std::shared_ptr<rcutils_uint8_array_t> ros2_writer::create_buffer(size_t size) const
+    std::shared_ptr<rcutils_uint8_array_t> ros2_writer::compress_buffer(const std::shared_ptr<rcutils_uint8_array_t>& input)
     {
-        auto buffer = std::shared_ptr<rcutils_uint8_array_t>(new rcutils_uint8_array_t(),
-            [](rcutils_uint8_array_t* arr) {
-                if (arr) {
-                    rcutils_ret_t ret = rcutils_uint8_array_fini(arr);
-                    (void)ret; // Cast to void to suppress unused warning
-                } 
-                delete arr;
-            });
+        auto bound = ZSTD_compressBound(input->buffer_length);
+        auto& out = ensure_buffer_capacity(_compress_buf, bound);
 
-        rcutils_allocator_t alloc = rcutils_get_default_allocator();
-        auto ret = rcutils_uint8_array_init(buffer.get(), size, &alloc);
-        if (ret != RCUTILS_RET_OK)
-            throw std::runtime_error("Failed to initialize rosbag2 buffer");
-
-        return buffer;
+        // Level 1 is the fastest zstd level with good-enough ratio; comparable in speed to LZ4 used by rosbag1
+        auto compressed_size = ZSTD_compress(out->buffer, out->buffer_capacity, input->buffer, input->buffer_length, 1);
+        if (ZSTD_isError(compressed_size))
+            throw std::runtime_error(rsutils::string::from() << "Zstd compression failed: " << ZSTD_getErrorName(compressed_size));
+        out->buffer_length = compressed_size;
+        return out;
     }
-
 
     void ros2_writer::write_string(std::string const& topic, const nanoseconds& ts, std::string const& payload)
     {
@@ -232,6 +224,41 @@ namespace librealsense
 
             write_message(ros2_topic::frame_data_topic(stream_id), "sensor_msgs/msg/Image", timestamp, img);
         }
+        else if (Is<object_detection_frame>(frame.frame))
+        {
+            // Re-encode the binary object_detection_payload back to the same JSON format the DDS server sends,
+            // so that playback can reconstruct the frame using the same parse path.
+            auto od = As<object_detection_frame>(frame.frame);
+            auto raw = reinterpret_cast<object_detection_frame::object_detection_payload const *>(od->get_frame_data());
+            auto n = raw->number_of_detections;
+
+            std::ostringstream json;
+            json << "{"
+                 << "\"frame_id\":" << raw->frame_id << ","
+                 << "\"number_of_detections\":" << n << ","
+                 << "\"detections\":[";
+            for (uint16_t i = 0; i < n; ++i)
+            {
+                auto const & e = raw->detections[i];
+                if (i) json << ",";
+                json << "{"
+                     << "\"class_id\":"    << static_cast<int>(e.detection_type) << ","
+                     << "\"confidence\":"  << static_cast<int>(e.confidence) << ","
+                     << "\"x1\":"          << e.top_left_x << ","
+                     << "\"y1\":"          << e.top_left_y << ","
+                     << "\"x2\":"          << e.bottom_right_x << ","
+                     << "\"y2\":"          << e.bottom_right_y << ","
+                     << "\"distance\":"    << e.distance
+                     << "}";
+            }
+            json << "],"
+                 << "\"source_frame_id\":" << raw->source_frame_id << ","
+                 << "\"version\":"         << raw->header.version << ","
+                 << "\"timestamp_us\":"    << (raw->timestamp * 1e6)
+                 << "}";
+
+            write_string(ros2_topic::frame_data_topic(stream_id), timestamp, json.str());
+        }
         else
         {
             LOG_WARNING("Unsupported frame type for stream " << stream_id.stream_type << ". Skipping frame.");
@@ -347,21 +374,25 @@ namespace librealsense
             LOG_WARNING("Failed to write frame metadata for " << stream_id.stream_type << ". Exception: " << e.what());
         }
 
-        try
+        // Inference streams don't participate in the extrinsics map
+        if (stream_id.stream_type != RS2_STREAM_OBJECT_DETECTION)
         {
-            auto sensor = frame->get_sensor();
-            if (sensor)
+            try
             {
-                auto& dev = sensor->get_device();
-                uint32_t reference_id = 0;
-                rs2_extrinsics ext;
-                std::tie(reference_id, ext) = dev.get_extrinsics(*frame->get_stream());
-                write_extrinsics(stream_id, reference_id, ext);
+                auto sensor = frame->get_sensor();
+                if (sensor)
+                {
+                    auto& dev = sensor->get_device();
+                    uint32_t reference_id = 0;
+                    rs2_extrinsics ext;
+                    std::tie(reference_id, ext) = dev.get_extrinsics(*frame->get_stream());
+                    write_extrinsics(stream_id, reference_id, ext);
+                }
             }
-        }
-        catch (std::exception const& e)
-        {
-            LOG_WARNING("Failed to write stream extrinsics for " << stream_id.stream_type << ". Exception: " << e.what());
+            catch (std::exception const& e)
+            {
+                LOG_WARNING("Failed to write stream extrinsics for " << stream_id.stream_type << ". Exception: " << e.what());
+            }
         }
     }
 
@@ -506,6 +537,12 @@ namespace librealsense
             write_streaming_info(timestamp, { device_id, sensor_id }, profile);
             break;
         }*/
+        case RS2_EXTENSION_INFERENCE_PROFILE:
+        {
+            auto profile = SnapshotAs<RS2_EXTENSION_INFERENCE_PROFILE>(snapshot);
+            write_stream_info(timestamp, { device_id, sensor_id }, profile);
+            break;
+        }
         case RS2_EXTENSION_RECOMMENDED_FILTERS:
         {
             auto filters = SnapshotAs<RS2_EXTENSION_RECOMMENDED_FILTERS>(snapshot);

@@ -1,0 +1,8 @@
+line-length = 120
+
+[lint]
+# Upstream librealsense Python tests/tools are not ruff-clean at the repo root.
+# Keep git-guard from rewriting SDK imports, comments, and legacy test idioms
+# during upstream synchronization; project-specific Python wrappers can still
+# carry their own scoped pyproject/ruff settings.
+ignore = ["E", "F"]

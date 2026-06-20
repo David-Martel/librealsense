@@ -1,3 +1,4 @@
+# ruff: noqa
 # License: Apache 2.0. See LICENSE file in root directory.
 # Copyright(c) 2026 RealSense, Inc. All Rights Reserved.
 
@@ -14,7 +15,6 @@ log = logging.getLogger(__name__)
 
 pytestmark = [
     pytest.mark.device("D400*"),
-    pytest.mark.device_exclude("D401"),
 ]
 
 FPS = 30
@@ -79,6 +79,10 @@ def test_depth_sensor_vs_frame_timestamp(test_device):
     _run_sensor_ts_check(ds, dp, "Depth")
 
 
+# D421/D401/D405 do not have a color sensor support.
+@pytest.mark.device_exclude("D421")
+@pytest.mark.device_exclude("D401")
+@pytest.mark.device_exclude("D405")
 def test_color_sensor_vs_frame_timestamp(test_device):
     dev, ctx = test_device
 

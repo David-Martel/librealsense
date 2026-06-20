@@ -50,8 +50,8 @@
     },
     {
       "name": "windows-x64-cuda",
-      "displayName": "Windows x64 Release + CUDA (MSVC, sm_120)",
-      "description": "MSVC x64 Release build with CUDA enabled (toolkit v13.1). Enables the rs2 CUDA kernels (cuda-pointcloud.cu, cuda-conversion.cu, proc/cuda/) compiled for sm_120 (Blackwell / RTX 5060 Ti). All GB10-specific options remain OFF — RS2_GB10_PC_ZEROCOPY and RS2_GB10_CONV_CACHE are preprocessor guards inside those .cu files and are NOT activated by BUILD_WITH_CUDA alone. WMF backend unchanged. Separate binary dir: build/windows-x64-cuda/.",
+      "displayName": "Windows x64 Release + CUDA (MSVC, sm_120/sm_89)",
+      "description": "MSVC x64 Release build with CUDA enabled (toolkit v13.1). Enables the rs2 CUDA kernels (cuda-pointcloud.cu, cuda-conversion.cu, proc/cuda/) compiled for sm_120 (Blackwell / RTX 5060 Ti) and sm_89 for the secondary Ada GPU on this workstation. All GB10-specific options remain OFF — RS2_GB10_PC_ZEROCOPY and RS2_GB10_CONV_CACHE are preprocessor guards inside those .cu files and are NOT activated by BUILD_WITH_CUDA alone. WMF backend unchanged. Separate binary dir: build/windows-x64-cuda/.",
       "generator": "Visual Studio 17 2022",
       "architecture": {
         "value": "x64",
@@ -67,7 +67,7 @@
         "BUILD_WITH_NEON": "OFF",
         "BUILD_WITH_OPENMP": "OFF",
 
-        "CMAKE_CUDA_ARCHITECTURES": "120",
+        "CMAKE_CUDA_ARCHITECTURES": "120;89",
         "CUDAToolkit_ROOT": "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1",
         "CUDA_TOOLKIT_ROOT_DIR": "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1",
 
@@ -93,6 +93,55 @@
 
         "ENABLE_CCACHE": "OFF"
       }
+    },
+    {
+      "name": "windows-x64-cuda-py313-all",
+      "displayName": "Windows x64 CUDA + Python 3.13 + tools/tests",
+      "description": "Ninja/MSVC all-target validation lane for local VIGIL consumers. Uses CUDA v13.1, sm_120/sm_89, Python 3.13 from the clarius uv environment, pyrealsense2 + rs.gl, tools, examples, graphical examples, pointcloud stitching, unit tests, compile_commands.json, and no implicit compiler cache.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/windows-cuda-py313-all",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+
+        "BUILD_WITH_CPU_EXTENSIONS": "ON",
+
+        "BUILD_WITH_CUDA": "ON",
+        "BUILD_WITH_NEON": "OFF",
+        "BUILD_WITH_OPENMP": "OFF",
+
+        "CMAKE_CUDA_ARCHITECTURES": "120;89",
+        "CUDAToolkit_ROOT": "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1",
+        "CUDA_TOOLKIT_ROOT_DIR": "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1",
+
+        "PYTHON_EXECUTABLE": "C:/codedev/clarius/.venv/Scripts/python.exe",
+        "Python_EXECUTABLE": "C:/codedev/clarius/.venv/Scripts/python.exe",
+        "Python3_EXECUTABLE": "C:/codedev/clarius/.venv/Scripts/python.exe",
+
+        "RS2_GB10_USB_TUNING": "OFF",
+        "RS2_GB10_PC_ZEROCOPY": "OFF",
+        "RS2_GB10_CONV_CACHE": "OFF",
+
+        "FORCE_RSUSB_BACKEND": "OFF",
+
+        "BUILD_GRAPHICAL_EXAMPLES": "ON",
+        "BUILD_EXAMPLES": "ON",
+        "BUILD_TOOLS": "ON",
+        "BUILD_PC_STITCHING": "ON",
+        "BUILD_SHARED_LIBS": "ON",
+
+        "BUILD_PYTHON_BINDINGS": "ON",
+        "BUILD_CSHARP_BINDINGS": "OFF",
+        "BUILD_UNIT_TESTS": "ON",
+        "UNIT_TESTS_ARGS": "--not-live",
+
+        "CHECK_FOR_UPDATES": "OFF",
+
+        "ENABLE_SECURITY_FLAGS": "OFF",
+        "BUILD_ASAN": "OFF",
+
+        "ENABLE_CCACHE": "OFF"
+      }
     }
   ],
   "buildPresets": [
@@ -106,6 +155,12 @@
       "name": "windows-x64-cuda",
       "displayName": "Build windows-x64-cuda (Release)",
       "configurePreset": "windows-x64-cuda",
+      "configuration": "Release"
+    },
+    {
+      "name": "windows-x64-cuda-py313-all",
+      "displayName": "Build windows-x64-cuda-py313-all (Release)",
+      "configurePreset": "windows-x64-cuda-py313-all",
       "configuration": "Release"
     }
   ]

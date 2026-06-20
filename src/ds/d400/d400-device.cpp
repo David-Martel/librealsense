@@ -937,13 +937,10 @@ namespace librealsense
                 }
             }
 
-            if (!_is_mipi_device)
-            {
-                depth_sensor.register_option( RS2_OPTION_STEREO_BASELINE,
-                                              std::make_shared< const_value_option >(
-                                                  "Distance in mm between the stereo imagers",
-                                                  rsutils::lazy< float >( [this]() { return get_stereo_baseline_mm(); } ) ) );
-            }
+            depth_sensor.register_option( RS2_OPTION_STEREO_BASELINE,
+                                          std::make_shared< const_value_option >(
+                                              "Distance in mm between the stereo imagers",
+                                              rsutils::lazy< float >( [this]() { return get_stereo_baseline_mm(); } ) ) );
 
             _depth_units_register_action = [this]()
             {
@@ -1037,7 +1034,6 @@ namespace librealsense
     void d400_device::register_features()
     {
         firmware_version fw_ver = firmware_version( get_info( RS2_CAMERA_INFO_FIRMWARE_VERSION ) );
-        auto pid = get_pid();
 
         if( val_in_range( _pid, { ds::RS455_PID, ds::RS457_PID } )
             && fw_ver >= firmware_version( 5, 14, 0, 0 ) )
@@ -1051,7 +1047,9 @@ namespace librealsense
 
         register_feature( std::make_shared< auto_exposure_roi_feature >( get_depth_sensor(), _hw_monitor ) );
 
-        if( !_is_mipi_device && fw_ver >= firmware_version( 5, 12, 10, 11 ) )
+        // ae / gain limit feature is not supported on rolling-shutter
+        if( fw_ver >= firmware_version( 5, 12, 10, 11 )
+            && ( _device_capabilities & ds::ds_caps::CAP_GLOBAL_SHUTTER ) == ds::ds_caps::CAP_GLOBAL_SHUTTER )
         {
             register_feature(
                 std::make_shared< auto_exposure_limit_feature >( get_depth_sensor(), d400_device::_hw_monitor ) );

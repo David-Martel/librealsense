@@ -1,3 +1,4 @@
+# ruff: noqa
 # License: Apache 2.0. See LICENSE file in root directory.
 # Copyright(c) 2023 RealSense, Inc. All Rights Reserved.
 
@@ -188,37 +189,50 @@ def _find_active_hub():
 def _create_acroname():
     try:
         from rspy import acroname
-        return acroname.Acroname()
     except ModuleNotFoundError:
+        return None  # package not installed
+    except Exception as e:
+        log.w(f"acroname import failed: {e}")
         return None
+    try:
+        return acroname.Acroname()
     except acroname.NoneFoundError:
-        return None
-    except BaseException:
+        return None  # no hub connected
+    except Exception as e:
+        log.w(f"acroname hub init failed: {e}")
         return None
 
 
 def _create_ykush():
     try:
         from rspy import ykush
-        return ykush.Ykush()
     except ModuleNotFoundError:
+        return None  # package not installed
+    except Exception as e:
+        log.w(f"ykush import failed: {e}")
         return None
+    try:
+        return ykush.Ykush()
     except ykush.NoneFoundError:
-        return None
-    except BaseException:
+        return None  # no hub connected
+    except Exception as e:
+        log.w(f"ykush hub init failed: {e}")
         return None
 
 def _create_unifi():
     try:
         from rspy import unifi
-        return unifi.UniFiSwitch()
     except ModuleNotFoundError:
+        return None  # package not installed
+    except Exception as e:
+        log.w(f"unifi import failed: {e}")
         return None
-    except EnvironmentError:
-        return None
+    try:
+        return unifi.UniFiSwitch()
     except unifi.NoneFoundError:
-        return None
-    except BaseException as e:
+        return None  # no hub connected
+    except Exception as e:
+        log.w(f"unifi hub init failed: {e}")
         return None
 
 def _create_combined_hubs(hub_list):

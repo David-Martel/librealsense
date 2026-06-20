@@ -3,11 +3,16 @@
 
 #include "post-processing-filters-list.h"
 #include "post-processing-block-model.h"
+#ifdef BUILD_WITH_CLOSE_RANGE_DEPTH
+#include "close-range-depth-filter.h"
+#include "rs-depth-range-loader.h"
+#endif
 #include <imgui_internal.h>
 #include <realsense_imgui.h>
 
 #include "metadata-helper.h"
 #include "subdevice-model.h"
+#include <rsutils/accelerators/gpu.h>
 
 namespace rs2
 {
@@ -73,6 +78,7 @@ namespace rs2
         depth_colorizer(std::make_shared<rs2::gl::colorizer>()),
         yuy2rgb(std::make_shared<rs2::gl::yuy_decoder>()),
         m420_to_rgb(std::make_shared<rs2::gl::m420_decoder>()),
+        nv12_to_rgb(std::make_shared<rs2::gl::nv12_decoder>()),
         y411(std::make_shared<rs2::gl::y411_decoder>()),
         viewer(viewer),
         detected_objects(device_detected_objects),
@@ -82,6 +88,7 @@ namespace rs2
         restore_processing_block("colorizer", depth_colorizer);
         restore_processing_block("yuy2rgb", yuy2rgb);
         restore_processing_block("m420_to_rgb", m420_to_rgb);
+        restore_processing_block("nv12_to_rgb", nv12_to_rgb);
         restore_processing_block("y411", y411);
 
         post_processing_enabled = is_post_processing_enabled_in_config_file();
@@ -112,6 +119,73 @@ namespace rs2
 
         bool const is_rgb_camera = s->is< color_sensor >();
 
+        // The close-range improver must run before get_recommended_filters() (decimation, spatial, temporal…).
+        // Decimation halves depth resolution while leaving IR unchanged; the mismatch would
+        // trigger the resolution guard in close_range_depth_improver::apply() and silently skip the improver.
+#ifdef BUILD_WITH_CLOSE_RANGE_DEPTH
+        if( !is_rgb_camera && s->supports( RS2_OPTION_STEREO_BASELINE ) )
+        {
+            auto block = std::make_shared< close_range_depth_filter >();
+            auto model = std::make_shared< processing_block_model >(
+                this, "Improved Close Range Depth", block,
+                [block]( rs2::frame f ) { return block->process( f ); },
+                error_message, false );
+
+            if( ! get_rs_depth_range_loader().is_loaded() )
+            {
+                model->available = []() { return false; };
+                model->unavailable_tooltip = "Improved Close Range Depth library not found; install librealsense2-enhanced-depth package";
+            }
+            else if( !rsutils::rs2_is_cuda_available() )
+            {
+                model->available = []() { return false; };
+                model->unavailable_tooltip = "Improved Close Range Depth requires CUDA (not detected on this system)";
+            }
+            else
+            {
+                // Safe to capture this: the lambda lives in model which lives in post_processing,
+                // a member of this subdevice_model — so the lambda cannot outlive its owner.
+                model->available = [this]()
+                {
+                    // Resolution check — VGA (640x480) minimum
+                    if( ui.is_multiple_resolutions )
+                    {
+                        // Per-stream resolutions: check depth and IR independently
+                        auto check = [&]( rs2_stream stream ) {
+                            auto it = ui.selected_stream_to_res.find( stream );
+                            if( it == ui.selected_stream_to_res.end() ) return false;
+                            return it->second.first >= 640 && it->second.second >= 480;
+                        };
+                        if( !check( RS2_STREAM_DEPTH ) || !check( RS2_STREAM_INFRARED ) )
+                            return false;
+                    }
+                    else if( !res_values.empty()
+                             && ui.selected_res_id >= 0
+                             && ui.selected_res_id < static_cast< int >( res_values.size() ) )
+                    {
+                        const auto& res = res_values.at( ui.selected_res_id );
+                        if( res.first < 640 || res.second < 480 )
+                            return false;
+                    }
+
+                    bool depth = false, ir1 = false, ir2 = false;
+                    for( auto& p : profiles )
+                    {
+                        auto it = stream_enabled.find( p.unique_id() );
+                        if( it == stream_enabled.end() || !it->second ) continue;
+                        if( p.stream_type() == RS2_STREAM_DEPTH ) depth = true;
+                        else if( p.stream_type() == RS2_STREAM_INFRARED && p.stream_index() == 1 ) ir1 = true;
+                        else if( p.stream_type() == RS2_STREAM_INFRARED && p.stream_index() == 2 ) ir2 = true;
+                    }
+                    return depth && ir1 && ir2;
+                };
+                model->unavailable_tooltip = "Depth, IR Left/Right streams have to be enabled at VGA or higher resolution";
+            }
+
+            post_processing.push_back( model );
+        }
+#endif
+
         for (auto&& f : s->get_recommended_filters())
         {
             auto shared_filter = std::make_shared<filter>(f);
@@ -132,7 +206,7 @@ namespace rs2
             }
 
             if( shared_filter->is< rotation_filter >() )
-                model->enable( false ); 
+                model->enable( false );
 
             if (shared_filter->is<threshold_filter>())
             {
@@ -142,19 +216,17 @@ namespace rs2
                     std::string device_pid = s->get_info(RS2_CAMERA_INFO_PRODUCT_ID);
                     if (device_pid == "0B5B")
                     {
-                        std::string error_msg;
                         auto threshold_pb = shared_filter->as<threshold_filter>();
                         threshold_pb.set_option(RS2_OPTION_MIN_DISTANCE, SHORT_RANGE_MIN_DISTANCE);
                         threshold_pb.set_option(RS2_OPTION_MAX_DISTANCE, SHORT_RANGE_MAX_DISTANCE);
                     }
                 }
-                model->enable( false ); 
+                model->enable( false );
             }
 
             if (shared_filter->is<hdr_merge>())
             {
                 // processing block will be skipped if the requested option is not supported
-                auto supported_options = s->get_supported_options();
                 if (std::find(supported_options.begin(), supported_options.end(), RS2_OPTION_SEQUENCE_ID) == supported_options.end())
                     continue;
             }
@@ -272,10 +344,14 @@ namespace rs2
                             }
                         }
                     }
-                    res << vid_prof.width() << " x " << vid_prof.height();
-                    push_back_if_not_exists(res_values, std::pair<int, int>(vid_prof.width(), vid_prof.height()));
-                    push_back_if_not_exists(resolutions, res.str());
-                    push_back_if_not_exists(resolutions_per_stream[profile.stream_type()], std::pair<int, int>(vid_prof.width(), vid_prof.height()));
+                    
+                    if (!hide_resolutions(profile))
+                    {
+                        res << vid_prof.width() << " x " << vid_prof.height();
+                        push_back_if_not_exists(res_values, std::pair<int, int>(vid_prof.width(), vid_prof.height()));
+                        push_back_if_not_exists(resolutions, res.str());
+                        push_back_if_not_exists(resolutions_per_stream[profile.stream_type()], std::pair<int, int>(vid_prof.width(), vid_prof.height()));
+                    }
                 }
 
                 std::stringstream fps;
@@ -590,6 +666,37 @@ namespace rs2
                     if (ImGui::Checkbox(label.c_str(), &stream_enabled[f.first]))
                     {
                         prev_stream_enabled = tmp;
+                        res = true;
+
+                        if (stream_enabled[f.first])
+                        {
+                            // Find the stream type for this unique_id
+                            rs2_stream stream_type = RS2_STREAM_ANY;
+                            for (auto& p : profiles)
+                            {
+                                if (p.unique_id() == f.first)
+                                {
+                                    stream_type = p.stream_type();
+                                    break;
+                                }
+                            }
+
+                            // If the currently selected resolution is not valid for the newly
+                            // enabled stream, auto-select the first resolution that is
+                            if (stream_type != RS2_STREAM_ANY)
+                            {
+                                auto it = resolutions_per_stream.find(stream_type);
+                                if (it != resolutions_per_stream.end() && !it->second.empty())
+                                {
+                                    auto& valid_res = it->second;
+                                    auto current_res = res_values[ui.selected_res_id];
+                                    bool valid = std::any_of(valid_res.begin(), valid_res.end(),
+                                        [&](const std::pair<int, int>& r) { return r == current_res; });
+                                    if (!valid)
+                                        select_resolution(valid_res[0].first, valid_res[0].second);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1699,6 +1806,7 @@ namespace rs2
             save_processing_block_to_config_file("colorizer", depth_colorizer);
             save_processing_block_to_config_file("yuy2rgb", yuy2rgb);
             save_processing_block_to_config_file("m420_to_rgb", m420_to_rgb);
+            save_processing_block_to_config_file("nv12_to_rgb", nv12_to_rgb);
             save_processing_block_to_config_file("y411", y411);
 
             for (auto&& pbm : post_processing) pbm->save_to_config_file();
@@ -1831,4 +1939,20 @@ namespace rs2
         }
     }
 
+    bool subdevice_model::hide_resolutions(const stream_profile& profile) const
+    {
+        if (s->supports(RS2_CAMERA_INFO_NAME) &&
+            s->get_info(RS2_CAMERA_INFO_NAME) == std::string("Depth Mapping Camera"))
+        {
+            if (auto vid_prof = profile.as<video_stream_profile>())
+            {
+                int width = vid_prof.width();
+                int height = vid_prof.height();
+
+                if ((width == 2880 && height == 32) || (width == 128 && height == 128))
+                    return true;
+            }
+        }
+        return false;
+    }
 }

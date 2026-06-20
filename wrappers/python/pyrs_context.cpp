@@ -52,7 +52,8 @@ void init_context(py::module &m) {
             "Create a device_hub bound to the given context.")
         .def("wait_for_device",
             &rs2::device_hub::wait_for_device,
-            "If a device is connected return it, otherwise wait until one connects.")
+            "If a device is connected return it, otherwise wait until one connects.",
+            py::call_guard<py::gil_scoped_release>())
         .def("is_connected",
             &rs2::device_hub::is_connected,
             py::arg("device"),
