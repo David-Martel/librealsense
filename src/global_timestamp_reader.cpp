@@ -7,6 +7,14 @@ using namespace std::chrono;
 
 namespace librealsense
 {
+    // Clock-sync sample admission, delay gate (see time_diff_keeper::update_diff_time).
+    // Each poll pairs a device-clock reading with a system time. If the control-transfer round-trip is
+    // much slower than the fastest seen, the device clock could have been read anywhere within that
+    // round-trip: the pairing is unreliable and a single such sample can shift the fit by seconds.
+    // Reject these, but not forever - after too many in a row accept one, to keep the fit from going stale.
+    static const double max_delay_over_min_ms = 15.;
+    static const unsigned int max_rejections_in_a_row = 10;
+
     CSample& CSample::operator-=(const CSample& other)
     {
         _x -= other._x;
@@ -174,6 +182,7 @@ namespace librealsense
         _users_count(0),
         _is_ready(false),
         _min_command_delay(1000),
+        _rejections_in_row(0),
         _active_object([this](dispatcher::cancellable_timer cancellable_timer)
             {
                 polling(cancellable_timer);
@@ -205,6 +214,7 @@ namespace librealsense
             _is_ready = false;
             std::lock_guard< std::recursive_mutex > lock( _read_mtx );
             _coefs.reset();
+            _rejections_in_row = 0;
         }
     }
 
@@ -230,6 +240,33 @@ namespace librealsense
                 _coefs.add_const_y_coefs(command_delay - _min_command_delay);
                 _min_command_delay = command_delay;
             }
+            else if (command_delay - _min_command_delay > max_delay_over_min_ms)
+            {
+                // Delayed control transfer (e.g. USB congestion): the pairing is unreliable
+                // (see the delay-gate comment above max_delay_over_min_ms).
+                if (!_is_ready)
+                {
+                    // During warmup accept it anyway - rejecting could starve the fit before it is ever
+                    // ready, and enforce_monotonicity bounds the damage a noisy early fit can do.
+                    LOG_DEBUG("time_diff_keeper: accepting delayed clock sample during warmup: command delay "
+                              << command_delay << " ms exceeds minimal delay " << _min_command_delay
+                              << " ms by more than " << max_delay_over_min_ms << " ms");
+                }
+                else if (++_rejections_in_row <= max_rejections_in_a_row)
+                {
+                    LOG_DEBUG("time_diff_keeper: rejecting delayed clock sample: command delay " << command_delay
+                              << " ms exceeds minimal delay " << _min_command_delay << " ms by more than "
+                              << max_delay_over_min_ms << " ms");
+                    return false;
+                }
+                else
+                {
+                    LOG_WARNING("time_diff_keeper: accepting delayed clock sample (command delay " << command_delay
+                                << " ms, minimal delay " << _min_command_delay << " ms) after " << _rejections_in_row - 1
+                                << " consecutive rejections, to avoid a stale fit");
+                }
+            }
+            _rejections_in_row = 0;
             double system_time(system_time_finish - _min_command_delay);
             if (_is_ready)
             {
@@ -289,7 +326,9 @@ namespace librealsense
         _device_timestamp_reader(std::move(device_timestamp_reader)),
         _time_diff_keeper(timediff),
         _option_is_enabled(enable_option),
-        _ts_is_ready(false)
+        _ts_is_ready(false),
+        _last_hw_time_ms(-1),
+        _last_global_time_ms(0)
     {
     }
 
@@ -301,11 +340,55 @@ namespace librealsense
         {
             auto sp = _time_diff_keeper.lock();
             if (sp)
-                frame_time = sp->get_system_hw_time(frame_time, _ts_is_ready);
+            {
+                double hw_time = frame_time;
+                frame_time = sp->get_system_hw_time(hw_time, _ts_is_ready);
+                if (_ts_is_ready)
+                    frame_time = enforce_monotonicity(hw_time, frame_time);
+            }
             else
                 LOG_DEBUG("Notification: global_timestamp_reader - time_diff_keeper is being shut-down");
         }
         return frame_time;
+    }
+
+    // A frame that is later on the HW clock must never get an earlier global timestamp than the frame
+    // before it: a bad clock-sync sample can make the fit walk backwards faster than frames advance,
+    // reversing frame order in global time and breaking stream pairing downstream. When that happens,
+    // hold the last value. The clamp applies only while the HW clock advances continuously; on a HW
+    // rewind or a streaming gap the fit is trusted as-is and tracking restarts.
+    //
+    // The hold is bounded by max_monotonic_hold_ms so it bridges the small per-frame inversions it
+    // exists for, but a larger drop (the fit genuinely re-basing) is accepted as a single backward step
+    // rather than held. This trades one bounded ordering violation for never freezing a stream's
+    // timestamps at a stuck value - an unbounded hold could freeze a stream indefinitely, which is worse.
+    double global_timestamp_reader::enforce_monotonicity(double hw_time, double global_time)
+    {
+        static const double max_continuous_hw_gap_ms = 1000.;
+        static const double max_monotonic_hold_ms = 100.;
+        std::lock_guard<std::recursive_mutex> lock(_mtx);
+        double hw_gap = hw_time - _last_hw_time_ms;
+        if (_last_hw_time_ms >= 0 && hw_gap >= 0 && hw_gap < max_continuous_hw_gap_ms &&
+            global_time < _last_global_time_ms)
+        {
+            if (_last_global_time_ms - global_time > max_monotonic_hold_ms)
+            {
+                // Dropped further below the held value than the hold can bridge: the fit has re-based
+                // (or the held value was bad). Accept the computed value - one backward step - and
+                // resume tracking from it.
+                LOG_DEBUG("global_timestamp_reader: releasing monotonicity hold: computed global time "
+                          << global_time << " ms is more than " << max_monotonic_hold_ms
+                          << " ms below held value " << _last_global_time_ms
+                          << " ms; accepting one backward step");
+            }
+            else
+            {
+                global_time = _last_global_time_ms;
+            }
+        }
+        _last_hw_time_ms = hw_time;
+        _last_global_time_ms = global_time;
+        return global_time;
     }
 
 
@@ -323,6 +406,9 @@ namespace librealsense
     void global_timestamp_reader::reset()
     {
         _device_timestamp_reader->reset();
+        std::lock_guard<std::recursive_mutex> lock(_mtx);
+        _last_hw_time_ms = -1;
+        _last_global_time_ms = 0;
     }
 
     global_time_interface::global_time_interface() :

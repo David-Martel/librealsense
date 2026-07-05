@@ -85,6 +85,7 @@ namespace librealsense
         mutable std::recursive_mutex _enable_mtx; // Watch only 1 start/stop operation at a time.
         CLinearCoefficients _coefs;
         double _min_command_delay;
+        unsigned int _rejections_in_row; // Consecutive samples rejected for excessive command delay.
         bool _is_ready;
     };
 
@@ -101,11 +102,16 @@ namespace librealsense
         void reset() override;
 
     private:
+        double enforce_monotonicity(double hw_time, double global_time);
+
+    private:
         std::unique_ptr<frame_timestamp_reader> _device_timestamp_reader;
         std::weak_ptr<time_diff_keeper> _time_diff_keeper;
         mutable std::recursive_mutex _mtx;
         std::shared_ptr<global_time_option> _option_is_enabled;
         bool _ts_is_ready;
+        double _last_hw_time_ms;        // HW timestamp of the last frame (-1 if none yet).
+        double _last_global_time_ms;    // Global timestamp given to the last frame.
     };
 
     class global_time_interface
