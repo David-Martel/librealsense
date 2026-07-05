@@ -245,6 +245,21 @@ namespace librealsense
         _last_request_time = x;
     }
 
+    // Map a HW time onto the fit's current wrap epoch WITHOUT mutating shared state.
+    // The device clock is a 32-bit microsecond counter that wraps every ~71.6 minutes. Near a wrap,
+    // frames from different streams of the same device straddle the boundary (one reads ~2^32 us, the
+    // next ~0) and are converted interleaved. The fit is shared across those streams, so re-basing it
+    // per frame here would corrupt the others' conversions; instead just shift the queried value by
+    // whole wrap periods onto the samples' epoch and leave the fit untouched.
+    double CLinearCoefficients::to_fit_domain(double x) const
+    {
+        static const double max_device_time(pow(2, 32) * MICROSEC_TO_MILLISEC);
+        if (_last_values.empty())
+            return x;
+        double k = std::round((_last_values.front()._x - x) / max_device_time);
+        return x + k * max_device_time;
+    }
+
     time_diff_keeper::time_diff_keeper(global_time_interface* dev, const unsigned int sampling_interval_ms) :
         _device(dev),
         _poll_intervals_ms(sampling_interval_ms),
@@ -421,9 +436,11 @@ namespace librealsense
         is_ready = _is_ready;
         if (_is_ready)
         {
-            _coefs.update_samples_base(crnt_hw_time);
-            _coefs.update_last_sample_time(crnt_hw_time);
-            return _coefs.calc_value(crnt_hw_time);
+            // Read-only wrap alignment: only the polling thread (update_diff_time) may
+            // re-base the fit; see to_fit_domain().
+            double x = _coefs.to_fit_domain(crnt_hw_time);
+            _coefs.update_last_sample_time(x);
+            return _coefs.calc_value(x);
         }
         else
             return crnt_hw_time;

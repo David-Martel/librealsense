@@ -40,6 +40,7 @@ namespace librealsense
         void add_const_y_coefs(double dy);
         void refit_from_samples(const std::deque<CSample>& samples);
         bool update_samples_base(double x);
+        double to_fit_domain(double x) const;
         void update_last_sample_time(double x);
         double calc_value(double x) const;
         bool is_full() const;
