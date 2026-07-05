@@ -38,6 +38,7 @@ namespace librealsense
         void reset();
         void add_value(CSample val);
         void add_const_y_coefs(double dy);
+        void refit_from_samples(const std::deque<CSample>& samples);
         bool update_samples_base(double x);
         void update_last_sample_time(double x);
         double calc_value(double x) const;
@@ -46,6 +47,7 @@ namespace librealsense
     private:
         void calc_linear_coefs();
         void get_a_b(double x, double& a, double& b) const;
+        static bool theil_sen_fit(const std::deque<CSample>& values, const CSample& base_sample, double& a, double& b);
 
     private:
         unsigned int _buffer_size;
@@ -86,6 +88,8 @@ namespace librealsense
         CLinearCoefficients _coefs;
         double _min_command_delay;
         unsigned int _rejections_in_row; // Consecutive samples rejected for excessive command delay.
+        unsigned int _innovation_rejections_in_row; // Consecutive samples rejected for excessive innovation (value vs. fit prediction).
+        std::deque<CSample> _rejected_samples;   // Last re_fit_window (x, y) pairs rejected on value; refit source if rejections persist.
         bool _is_ready;
     };
 

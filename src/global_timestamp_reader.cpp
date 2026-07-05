@@ -1,7 +1,10 @@
 // License: Apache 2.0. See LICENSE file in root directory.
 // Copyright(c) 2015 RealSense, Inc. All Rights Reserved.
 #include "global_timestamp_reader.h"
+#include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <vector>
 
 using namespace std::chrono;
 
@@ -14,6 +17,26 @@ namespace librealsense
     // Reject these, but not forever - after too many in a row accept one, to keep the fit from going stale.
     static const double max_delay_over_min_ms = 15.;
     static const unsigned int max_rejections_in_a_row = 10;
+
+    // Clock-sync sample admission, value gate (innovation gate).
+    // The delay gate can't catch a sample that arrived quickly but carries a wrong device-clock reading.
+    // So each sample is also compared against the fit's own prediction: if the measured system time
+    // differs from the predicted one by more than max_innovation_ms it cannot be genuine clock drift
+    // (which is at most tens of ms between polls) and is rejected before it can move the fit.
+    //
+    // A rejected sample is not necessarily the wrong one, though - the fit may be. Two mechanisms keep a
+    // bad fit from rejecting good samples forever:
+    //  1. The fit is computed robustly (theil_sen_fit), so a minority of outlier samples can't skew it.
+    //  2. If the fit rejects every sample for max_consecutive_rejections polls in a row it is assumed
+    //     wrong (stale, or the device clock re-based) and rebuilt from the rejected samples themselves:
+    //     the last re_fit_window rejections are kept and passed to refit_from_samples(). This self-heals
+    //     within max_consecutive_rejections polls and never drops readiness.
+    static const double max_innovation_ms = 100.;
+    static const unsigned int max_consecutive_rejections = 60;
+    static const unsigned int re_fit_window = 15;
+
+    // _min_command_delay sentinel before any sample was measured.
+    static const double initial_min_command_delay_ms = 1000.;
 
     CSample& CSample::operator-=(const CSample& other)
     {
@@ -64,10 +87,57 @@ namespace librealsense
         }
     }
 
+    // Robust linear fit over a window of (x, y) samples: Theil-Sen - the median of all pairwise slopes,
+    // then the median of the intercepts that slope implies. Unlike least squares, a minority of outlier
+    // samples (up to ~29% of the window) can't move the result, which is why the fit tolerates the
+    // occasional bad clock reading. The window is small (<=16 samples) so the O(n^2) slope enumeration
+    // is cheap. Samples are centered on base_sample only for numerical conditioning; the result does not
+    // depend on that choice. Returns false without touching a, b if there aren't two samples with
+    // distinct x to form a slope.
+    bool CLinearCoefficients::theil_sen_fit(const std::deque<CSample>& values, const CSample& base_sample, double& a, double& b)
+    {
+        static const double min_dx_ms = 1e-6; // Guard degenerate/near-duplicate x pairs (would blow up the slope estimate).
+        std::vector<CSample> centered;
+        centered.reserve(values.size());
+        for (auto& s : values)
+        {
+            CSample c(s);
+            c -= base_sample;
+            centered.push_back(c);
+        }
+        size_t n = centered.size();
+        if (n < 2)
+            return false;
+        std::vector<double> slopes;
+        slopes.reserve(n * (n - 1) / 2);
+        for (size_t i = 0; i < n; ++i)
+        {
+            for (size_t j = i + 1; j < n; ++j)
+            {
+                double dx = centered[j]._x - centered[i]._x;
+                if (std::fabs(dx) < min_dx_ms)
+                    continue;
+                slopes.push_back((centered[j]._y - centered[i]._y) / dx);
+            }
+        }
+        if (slopes.empty())
+            return false;
+        std::sort(slopes.begin(), slopes.end());
+        size_t mid = slopes.size() / 2;
+        a = (slopes.size() % 2) ? slopes[mid] : (slopes[mid - 1] + slopes[mid]) / 2.0;
+
+        std::vector<double> intercepts;
+        intercepts.reserve(n);
+        for (auto& c : centered)
+            intercepts.push_back(c._y - a * c._x);
+        std::sort(intercepts.begin(), intercepts.end());
+        size_t imid = intercepts.size() / 2;
+        b = (intercepts.size() % 2) ? intercepts[imid] : (intercepts[imid - 1] + intercepts[imid]) / 2.0;
+        return true;
+    }
+
     void CLinearCoefficients::calc_linear_coefs()
     {
-        // Calculate linear coefficients, based on calculus described in: https://www.statisticshowto.datasciencecentral.com/probability-and-statistics/regression-analysis/find-a-linear-regression-equation/
-        // Calculate Std
         double n(static_cast<double>(_last_values.size()));
         double a(1);
         double b(0);
@@ -83,26 +153,7 @@ namespace librealsense
         }
         else
         {
-            double sum_x(0);
-            double sum_y(0);
-            double sum_xy(0);
-            double sum_x2(0);
-            for (auto sample = _last_values.begin(); sample != _last_values.end(); sample++)
-            {
-                CSample crnt_sample(*sample);
-                crnt_sample -= _base_sample;
-                sum_x += crnt_sample._x;
-                sum_y += crnt_sample._y;
-                sum_xy += (crnt_sample._x * crnt_sample._y);
-                sum_x2 += (crnt_sample._x * crnt_sample._x);
-            }
-            double denom = n * sum_x2 - sum_x * sum_x;
-            if( denom > std::numeric_limits< double >::epsilon() )
-            {
-                b = (sum_y * sum_x2 - sum_x * sum_xy) / denom;
-                a = (n * sum_xy - sum_x * sum_y) / denom;
-            }
-            else
+            if (!theil_sen_fit(_last_values, _base_sample, a, b))
             {
                 a = _dest_a;
                 b = _dest_b;
@@ -116,6 +167,25 @@ namespace librealsense
         _prev_b = _dest_b * dt + _prev_b * (1 - dt);
         _dest_a = a;
         _dest_b = b;
+        _prev_time = _last_request_time;
+    }
+
+    // Replace the fit outright from an explicit sample window, instead of blending a sample in gradually
+    // the way add_value() does. Used to rebuild the fit after it has been rejecting samples for too long
+    // (see max_consecutive_rejections), so a re-based device clock - or a fit that itself went bad - is
+    // corrected at once rather than over the next second. base_sample is re-anchored to the window so
+    // the fit is self-contained.
+    void CLinearCoefficients::refit_from_samples(const std::deque<CSample>& samples)
+    {
+        if (samples.empty())
+            return;
+        _last_values = samples;
+        _base_sample = samples.front();
+        double a(1), b(0);
+        theil_sen_fit(_last_values, _base_sample, a, b);
+        _dest_a = _prev_a = a;
+        _dest_b = _prev_b = b;
+        _last_request_time = samples.front()._x;
         _prev_time = _last_request_time;
     }
 
@@ -181,8 +251,9 @@ namespace librealsense
         _coefs(15),
         _users_count(0),
         _is_ready(false),
-        _min_command_delay(1000),
+        _min_command_delay(initial_min_command_delay_ms),
         _rejections_in_row(0),
+        _innovation_rejections_in_row(0),
         _active_object([this](dispatcher::cancellable_timer cancellable_timer)
             {
                 polling(cancellable_timer);
@@ -215,6 +286,8 @@ namespace librealsense
             std::lock_guard< std::recursive_mutex > lock( _read_mtx );
             _coefs.reset();
             _rejections_in_row = 0;
+            _innovation_rejections_in_row = 0;
+            _rejected_samples.clear();
         }
     }
 
@@ -271,7 +344,43 @@ namespace librealsense
             if (_is_ready)
             {
                 _coefs.update_samples_base(sample_hw_time);
+                // Value gate (see max_innovation_ms): compare the measured system time against the fit's
+                // prediction for this device time. If this sample also improved _min_command_delay above,
+                // calc_value() still returns the pre-shift prediction (the shift is applied on the next
+                // recompute); that error is a few ms at most, negligible against the gate.
+                double predicted_system_time = _coefs.calc_value(sample_hw_time);
+                double innovation = system_time - predicted_system_time;
+                if (std::fabs(innovation) > max_innovation_ms)
+                {
+                    ++_innovation_rejections_in_row;
+                    _rejected_samples.push_front(CSample(sample_hw_time, system_time));
+                    if (_rejected_samples.size() > re_fit_window)
+                        _rejected_samples.pop_back();
+
+                    if (_innovation_rejections_in_row < max_consecutive_rejections)
+                    {
+                        LOG_DEBUG("time_diff_keeper: rejecting clock sample on value: measured system time "
+                                  << system_time << " ms vs. predicted " << predicted_system_time
+                                  << " ms; innovation " << innovation << " ms exceeds "
+                                  << max_innovation_ms << " ms (" << _innovation_rejections_in_row
+                                  << " consecutive rejections)");
+                        return false;
+                    }
+
+                    // Rejected every sample for max_consecutive_rejections polls in a row: the fit is no
+                    // longer trustworthy (the device clock re-based, or the fit went bad). Rebuild it from
+                    // the rejected samples - they are consistent readings the fit fails to match - and
+                    // resume. Never drops _is_ready; only stop() does that.
+                    _coefs.refit_from_samples(_rejected_samples);
+                    LOG_WARNING("time_diff_keeper: clock fit re-based from rejected-sample window after "
+                                << _innovation_rejections_in_row << " consecutive innovation-gate rejections");
+                    _innovation_rejections_in_row = 0;
+                    _rejected_samples.clear();
+                    return true;
+                }
             }
+            _innovation_rejections_in_row = 0;
+            _rejected_samples.clear();
             CSample crnt_sample(sample_hw_time, system_time);
             _coefs.add_value(crnt_sample);
             _is_ready = true;
