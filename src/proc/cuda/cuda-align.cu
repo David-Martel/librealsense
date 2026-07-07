@@ -242,6 +242,8 @@ void align_cuda_helper::align_other_to_depth(unsigned char* h_aligned_out, const
     cuda_or_throw(cudaMemset(_d_aligned_out.get(), 0, aligned_size), "clear aligned other-to-depth");
 
     ensure_dev_buffer(_d_pixel_map, _pixel_map_capacity, static_cast<size_t>(depth_pixel_count * 2));
+    // Pre-fill the pixel map with the {-1,-1} invalid sentinel (see align_depth_to_other for rationale).
+    cuda_or_throw(cudaMemset(_d_pixel_map.get(), 0xff, sizeof(int2) * static_cast<size_t>(depth_pixel_count) * 2), "clear pixel map other-to-depth");
 
     // config threads
     dim3 threads(RS2_CUDA_THREADS_PER_BLOCK, RS2_CUDA_THREADS_PER_BLOCK);
@@ -289,6 +291,13 @@ void align_cuda_helper::align_depth_to_other(unsigned char* h_aligned_out, const
     cuda_or_throw(cudaMemset(_d_aligned_out.get(), 0xff, aligned_byte_size), "clear aligned depth-to-other");
 
     ensure_dev_buffer(_d_pixel_map, _pixel_map_capacity, static_cast<size_t>(depth_pixel_count * 2));
+    // Pre-fill the pixel map with the {-1,-1} invalid sentinel (0xff bytes -> int -1). Without this,
+    // any map entry that kernel_map_depth_to_other does not write (e.g. if the 2-corner z-grid launch
+    // is not honored on the target arch) is read as uninitialized device memory by kernel_depth_to_other;
+    // its bounds tests (p.x<0 / p.x>=width) then behave nondeterministically and can reject every pixel,
+    // which on the D435 manifested as 0 valid aligned-depth pixels. The output buffer above is already
+    // cleared the same way; the scratch map was not.
+    cuda_or_throw(cudaMemset(_d_pixel_map.get(), 0xff, sizeof(int2) * static_cast<size_t>(depth_pixel_count) * 2), "clear pixel map depth-to-other");
 
     // config threads
     dim3 threads(RS2_CUDA_THREADS_PER_BLOCK, RS2_CUDA_THREADS_PER_BLOCK);
