@@ -93,6 +93,7 @@ namespace librealsense
         unsigned int _innovation_rejections_in_row; // Consecutive samples rejected for excessive innovation (value vs. fit prediction).
         std::deque<CSample> _rejected_samples;   // Last re_fit_window (x, y) pairs rejected on value; refit source if rejections persist.
         bool _is_ready;
+        bool _first_sample_dropped; // the first (often slow) clock read after start is dropped
     };
 
     class global_timestamp_reader : public frame_timestamp_reader
