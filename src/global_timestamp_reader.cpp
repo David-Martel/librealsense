@@ -38,6 +38,9 @@ namespace librealsense
     // _min_command_delay sentinel before any sample was measured.
     static const double initial_min_command_delay_ms = 1000.;
 
+    // The device clock is a 32-bit microsecond counter; it wraps every 2^32 us (~71.6 minutes).
+    static const double max_device_time_ms = 4294967296. * MICROSEC_TO_MILLISEC;
+
     CSample& CSample::operator-=(const CSample& other)
     {
         _x -= other._x;
@@ -217,14 +220,13 @@ namespace librealsense
     // so that the global timestamp can be correctly computed
     bool CLinearCoefficients::update_samples_base(double x)
     {
-        static const double max_device_time(pow(2, 32) * MICROSEC_TO_MILLISEC);
         double base_x;
         if (_last_values.empty())
             return false;
-        if ((_last_values.front()._x - x) > max_device_time / 2)
-            base_x = max_device_time;
-        else if ((x - _last_values.front()._x) > max_device_time / 2)
-            base_x = -max_device_time;
+        if ((_last_values.front()._x - x) > max_device_time_ms / 2)
+            base_x = max_device_time_ms;
+        else if ((x - _last_values.front()._x) > max_device_time_ms / 2)
+            base_x = -max_device_time_ms;
         else
             return false;
         LOG_DEBUG(__FUNCTION__ << "(" << base_x << ")");
@@ -245,14 +247,12 @@ namespace librealsense
         _last_request_time = x;
     }
 
-    // Shift x by whole wrap periods onto the epoch of anchor. The device clock is a 32-bit
-    // microsecond counter that wraps every ~71.6 minutes; two readings of it can only be compared
-    // on a continuous axis after mapping them onto the same wrap epoch.
+    // Shift x by whole wrap periods onto the epoch of anchor. Two device-clock readings can only
+    // be compared on a continuous axis after mapping them onto the same wrap epoch.
     double CLinearCoefficients::align_to_epoch(double x, double anchor)
     {
-        static const double max_device_time(pow(2, 32) * MICROSEC_TO_MILLISEC);
-        double k = std::round((anchor - x) / max_device_time);
-        return x + k * max_device_time;
+        double k = std::round((anchor - x) / max_device_time_ms);
+        return x + k * max_device_time_ms;
     }
 
     // Map a HW time onto the fit's current wrap epoch WITHOUT mutating shared state.
@@ -370,6 +370,8 @@ namespace librealsense
                 // prediction for this device time. If this sample also improved _min_command_delay above,
                 // calc_value() still returns the pre-shift prediction (the shift is applied on the next
                 // recompute); that error is a few ms at most, negligible against the gate.
+                // update_samples_base above already re-based the fit into sample_hw_time's epoch, so
+                // calling calc_value with the raw value is in-domain (no to_fit_domain mapping needed).
                 double predicted_system_time = _coefs.calc_value(sample_hw_time);
                 double innovation = system_time - predicted_system_time;
                 if (std::fabs(innovation) > max_innovation_ms)
@@ -500,6 +502,11 @@ namespace librealsense
     // exists for, but a larger drop (the fit genuinely re-basing) is accepted as a single backward step
     // rather than held. This trades one bounded ordering violation for never freezing a stream's
     // timestamps at a stuck value - an unbounded hold could freeze a stream indefinitely, which is worse.
+    //
+    // Ownership: a global_timestamp_reader instance is per-sensor (only the time_diff_keeper is shared
+    // across the device), so depth and color frames never interleave through this state. Streams of the
+    // same sensor that do interleave with independent HW times (e.g. gyro+accel) hit the hw-rewind
+    // bypass below and simply restart tracking - no false hold.
     double global_timestamp_reader::enforce_monotonicity(double hw_time, double global_time)
     {
         static const double max_continuous_hw_gap_ms = 1000.;
