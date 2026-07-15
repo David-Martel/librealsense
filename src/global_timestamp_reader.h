@@ -41,6 +41,7 @@ namespace librealsense
         void refit_from_samples(const std::deque<CSample>& samples);
         bool update_samples_base(double x);
         double to_fit_domain(double x) const;
+        static double align_to_epoch(double x, double anchor);
         void update_last_sample_time(double x);
         double calc_value(double x) const;
         bool is_full() const;

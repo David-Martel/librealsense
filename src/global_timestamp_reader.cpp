@@ -245,19 +245,26 @@ namespace librealsense
         _last_request_time = x;
     }
 
-    // Map a HW time onto the fit's current wrap epoch WITHOUT mutating shared state.
-    // The device clock is a 32-bit microsecond counter that wraps every ~71.6 minutes. Near a wrap,
-    // frames from different streams of the same device straddle the boundary (one reads ~2^32 us, the
-    // next ~0) and are converted interleaved. The fit is shared across those streams, so re-basing it
-    // per frame here would corrupt the others' conversions; instead just shift the queried value by
-    // whole wrap periods onto the samples' epoch and leave the fit untouched.
-    double CLinearCoefficients::to_fit_domain(double x) const
+    // Shift x by whole wrap periods onto the epoch of anchor. The device clock is a 32-bit
+    // microsecond counter that wraps every ~71.6 minutes; two readings of it can only be compared
+    // on a continuous axis after mapping them onto the same wrap epoch.
+    double CLinearCoefficients::align_to_epoch(double x, double anchor)
     {
         static const double max_device_time(pow(2, 32) * MICROSEC_TO_MILLISEC);
+        double k = std::round((anchor - x) / max_device_time);
+        return x + k * max_device_time;
+    }
+
+    // Map a HW time onto the fit's current wrap epoch WITHOUT mutating shared state.
+    // Near a wrap, frames from different streams of the same device straddle the boundary (one
+    // reads ~2^32 us, the next ~0) and are converted interleaved. The fit is shared across those
+    // streams, so re-basing it per frame here would corrupt the others' conversions; instead just
+    // shift the queried value onto the samples' epoch and leave the fit untouched.
+    double CLinearCoefficients::to_fit_domain(double x) const
+    {
         if (_last_values.empty())
             return x;
-        double k = std::round((_last_values.front()._x - x) / max_device_time);
-        return x + k * max_device_time;
+        return align_to_epoch(x, _last_values.front()._x);
     }
 
     time_diff_keeper::time_diff_keeper(global_time_interface* dev, const unsigned int sampling_interval_ms) :
@@ -368,7 +375,12 @@ namespace librealsense
                 if (std::fabs(innovation) > max_innovation_ms)
                 {
                     ++_innovation_rejections_in_row;
-                    _rejected_samples.push_front(CSample(sample_hw_time, system_time));
+                    // A rejection streak can span the HW clock wrap; keep the window on one wrap
+                    // epoch so refit_from_samples() gets a continuous x-axis.
+                    double rejected_x = sample_hw_time;
+                    if (!_rejected_samples.empty())
+                        rejected_x = CLinearCoefficients::align_to_epoch(rejected_x, _rejected_samples.front()._x);
+                    _rejected_samples.push_front(CSample(rejected_x, system_time));
                     if (_rejected_samples.size() > re_fit_window)
                         _rejected_samples.pop_back();
 

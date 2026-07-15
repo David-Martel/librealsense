@@ -114,3 +114,55 @@ TEST_CASE( "linear_coefficients_interleaved_wrap", "[global-timestamp]" )
     for( uint64_t t = WRAP_USEC - 8 * PERIOD_USEC; t < ts; t += PERIOD_USEC )
         CHECK( query( coefs, t ) == Catch::Approx( to_sys_ms( t ) ).margin( 0.001 ) );
 }
+
+TEST_CASE( "align_to_epoch", "[global-timestamp]" )
+{
+    const double wrap_ms = WRAP_USEC * USEC_TO_MSEC;
+    // Same epoch: unchanged
+    CHECK( CLinearCoefficients::align_to_epoch( 5000., 6000. ) == Catch::Approx( 5000. ).margin( 0.001 ) );
+    // Value just after the wrap, anchor just before it: shifted up one period
+    CHECK( CLinearCoefficients::align_to_epoch( 20., wrap_ms - 20. ) == Catch::Approx( wrap_ms + 20. ).margin( 0.001 ) );
+    // Value just before the wrap, anchor just after it: shifted down one period
+    CHECK( CLinearCoefficients::align_to_epoch( wrap_ms - 20., 20. ) == Catch::Approx( -20. ).margin( 0.001 ) );
+}
+
+// A long innovation-rejection streak ends with the fit rebuilt from the rejected-sample window
+// (refit_from_samples). The window is collected on a single wrap epoch (see update_diff_time),
+// so a streak that spans the wrap instant must still rebuild a valid fit for both epochs.
+TEST_CASE( "refit_from_samples_across_wrap", "[global-timestamp]" )
+{
+    CLinearCoefficients coefs( 15 );
+
+    // Pre-existing fit state from well before the wrap
+    uint64_t ts = WRAP_USEC - 100 * PERIOD_USEC;
+    bool is_ready = false;
+    for( int i = 0; i < 6; ++i, ts += PERIOD_USEC )
+    {
+        add_sample( coefs, ts, is_ready );
+        is_ready = true;
+    }
+
+    // Rejection window straddling the wrap, collected the way update_diff_time collects it:
+    // each sample epoch-aligned onto the window before being stored (newest at front)
+    std::deque< CSample > window;
+    for( uint64_t t = WRAP_USEC - 7 * PERIOD_USEC; t <= WRAP_USEC + 7 * PERIOD_USEC; t += PERIOD_USEC )
+    {
+        double x = to_hw_ms( t );
+        if( ! window.empty() )
+            x = CLinearCoefficients::align_to_epoch( x, window.front()._x );
+        window.push_front( CSample( x, to_sys_ms( t ) ) );
+    }
+
+    coefs.refit_from_samples( window );
+
+    // The rebuilt fit must be valid on both sides of the wrap
+    for( uint64_t t = WRAP_USEC - 7 * PERIOD_USEC; t <= WRAP_USEC + 7 * PERIOD_USEC; t += PERIOD_USEC )
+        CHECK( query( coefs, t ) == Catch::Approx( to_sys_ms( t ) ).margin( 0.001 ) );
+
+    // And the clock-sync loop must be able to keep extending it
+    for( uint64_t t = WRAP_USEC + 8 * PERIOD_USEC; t <= WRAP_USEC + 12 * PERIOD_USEC; t += PERIOD_USEC )
+    {
+        add_sample( coefs, t, true );
+        CHECK( query( coefs, t ) == Catch::Approx( to_sys_ms( t ) ).margin( 0.001 ) );
+    }
+}
