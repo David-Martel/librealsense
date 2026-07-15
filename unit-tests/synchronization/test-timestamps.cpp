@@ -5,6 +5,8 @@
 // which first demonstrated with a test that the 32-bit hardware-timestamp wrap-around breaks
 // the global-time linear fit; extended with an interleaved-stream wrap case.
 
+//#cmake: static!
+
 #include "../catch.h"
 #include <src/global_timestamp_reader.h>
 #include <vector>
