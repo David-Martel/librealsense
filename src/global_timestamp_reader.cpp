@@ -305,9 +305,9 @@ namespace librealsense
         {
             LOG_DEBUG("time_diff_keeper::stop: stop object.");
             _active_object.stop();
+            std::lock_guard< std::recursive_mutex > lock( _read_mtx );
             _is_ready = false;
             _first_sample_dropped = false;
-            std::lock_guard< std::recursive_mutex > lock( _read_mtx );
             _coefs.reset();
             _rejections_in_row = 0;
             _innovation_rejections_in_row = 0;
@@ -331,6 +331,7 @@ namespace librealsense
             double system_time_finish = duration<double, std::milli>(system_clock::now().time_since_epoch()).count();
             double command_delay = (system_time_finish-system_time_start)/2;
 
+            std::lock_guard<std::recursive_mutex> lock(_read_mtx);
             // Drop the first clock read if it's slow - it can skew the few-point fit for ~2s.
             if( ! _first_sample_dropped )
             {
@@ -339,7 +340,6 @@ namespace librealsense
                     return false;
             }
 
-            std::lock_guard<std::recursive_mutex> lock(_read_mtx);
             if (command_delay < _min_command_delay)
             {
                 _coefs.add_const_y_coefs(command_delay - _min_command_delay);
