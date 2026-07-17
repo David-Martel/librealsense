@@ -36,6 +36,7 @@ import argparse
 import hashlib
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -118,6 +119,15 @@ def verified_flash_image(path):
         yield image_version_tuple, private_image
 
 
+def backup_artifact_is_valid(path):
+    """Return whether path is a regular, complete firmware backup."""
+    try:
+        metadata = os.stat(path, follow_symlinks=False)
+    except (OSError, TypeError):
+        return False
+    return stat.S_ISREG(metadata.st_mode) and metadata.st_size == EXPECTED_BACKUP_BYTES
+
+
 def backup_firmware(rs_fw_update, serial, current_fw, env, backup_root=None):
     """Back up firmware atomically and return its path, or None on failure."""
     if backup_root is None:
@@ -130,19 +140,25 @@ def backup_firmware(rs_fw_update, serial, current_fw, env, backup_root=None):
     except FileNotFoundError:
         pass
 
-    result = subprocess.run(
-        [rs_fw_update, "-s", serial, "-b", partial],
-        env=env,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            [rs_fw_update, "-s", serial, "-b", partial],
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        try:
+            os.unlink(partial)
+        except FileNotFoundError:
+            pass
+        return None
     diagnostic = f"{result.stdout}\n{result.stderr}"
-    backup_size = os.path.getsize(partial) if os.path.isfile(partial) else 0
     if (
         result.returncode != 0
         or "Creating backup file failed" in diagnostic
-        or backup_size != EXPECTED_BACKUP_BYTES
+        or not backup_artifact_is_valid(partial)
     ):
         try:
             os.unlink(partial)
@@ -151,7 +167,7 @@ def backup_firmware(rs_fw_update, serial, current_fw, env, backup_root=None):
         return None
 
     os.replace(partial, backup)
-    return backup
+    return backup if backup_artifact_is_valid(backup) else None
 
 
 def controller_green():
@@ -204,7 +220,7 @@ def flash_cameras(cams, img_ver, image_path, allow_downgrade):
         )
         print(f"\n>>> {camera['serial']}: back up current firmware before flashing")
         backup = backup_firmware(RS_FW_UPDATE, camera["serial"], camera["fw"], env)
-        if backup is None:
+        if not backup_artifact_is_valid(backup):
             print(
                 f"ABORT {camera['serial']}: firmware backup failed or was invalid; "
                 "camera was not flashed.",
