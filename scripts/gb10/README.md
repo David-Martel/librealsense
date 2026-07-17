@@ -76,7 +76,7 @@ percentile stats, `--display` (non-headless on-screen render + `x11grab` proof).
 ## Firmware
 | tool | what |
 |------|------|
-| `rs-gb10-fw-update.py` (`just fw-status`) | reports every linked camera's firmware vs the **latest D400 production firmware 5.17.0.10**; gated flash with `--flash --image <Signed_Image_UVC_5_17_0_10.bin>` (download from <https://dev.realsenseai.com/docs/firmware-releases-d400/>). **Safety:** refuses USB-2 links (brick risk), refuses on a dead controller, **refuses a downgrade** (parses image version) without `--allow-downgrade`, backs up current fw first, dry-run by default. **Context:** the death-era camera ran old FW 5.13.0.55; updating forward is a *candidate* (unconfirmed) `-110`-trigger fix (see `docs/gb10/FORK-VS-UPSTREAM-AND-CAMERA-FIRMWARE`). |
+| `rs-gb10-fw-update.py` (`just fw-status`) | reports every linked camera's firmware vs the **current Intel D435 support-matrix floor 5.17.3.10 (5.17.0.10 is stale)**; gated flash with `--flash --image <Signed_Image_UVC_5_17_3_10.bin>` (download from <https://dev.realsenseai.com/docs/firmware-releases-d400/>). **Safety:** refuses USB-2 links (brick risk), refuses on a dead controller, **refuses a downgrade** (parses image version) without `--allow-downgrade`, backs up current fw first, dry-run by default. **Context:** the death-era camera ran old FW 5.13.0.55; updating forward is a *candidate* (unconfirmed) `-110`-trigger fix (see `docs/gb10/FORK-VS-UPSTREAM-AND-CAMERA-FIRMWARE`). |
 
 **Firmware downgrade — verified from `src/fw-update/fw-update-device.cpp`:** the **host** does no version
 check (`rs-fw-update -f` streams any signed image), but the **device** enforces anti-rollback in DFU mode
