@@ -4,6 +4,7 @@
 import hashlib
 import importlib.util
 import io
+import os
 import subprocess
 import tempfile
 import types
@@ -18,6 +19,17 @@ SPEC = importlib.util.spec_from_file_location("rs_gb10_fw_update", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(MODULE)
+REAL_FSTAT = os.fstat
+
+
+def root_owned_fstat(fd):
+    """Return real lock metadata with the production root owner for tests."""
+    metadata = REAL_FSTAT(fd)
+    return types.SimpleNamespace(
+        st_mode=metadata.st_mode,
+        st_nlink=metadata.st_nlink,
+        st_uid=0,
+    )
 
 
 class FirmwareImageTests(unittest.TestCase):
@@ -180,6 +192,8 @@ class FirmwareBackupTests(unittest.TestCase):
     def test_missing_backup_return_never_reaches_flash_command(self):
         with tempfile.TemporaryDirectory() as tmp:
             with (
+                mock.patch.object(MODULE, "require_firmware_privileges"),
+                mock.patch.object(MODULE.os, "fstat", side_effect=root_owned_fstat),
                 mock.patch.object(MODULE, "require_camera_idle"),
                 mock.patch.object(MODULE, "backup_firmware", return_value=None),
                 mock.patch.object(MODULE.subprocess, "run") as run,
@@ -200,6 +214,8 @@ class FirmwareBackupTests(unittest.TestCase):
             truncated = Path(tmp) / "123-5.15.1.55.bin"
             truncated.write_bytes(b"truncated")
             with (
+                mock.patch.object(MODULE, "require_firmware_privileges"),
+                mock.patch.object(MODULE.os, "fstat", side_effect=root_owned_fstat),
                 mock.patch.object(MODULE, "require_camera_idle"),
                 mock.patch.object(MODULE, "backup_firmware", return_value=truncated),
                 mock.patch.object(MODULE.subprocess, "run") as run,
@@ -221,6 +237,8 @@ class FirmwareBackupTests(unittest.TestCase):
             backup.write_bytes(b"complete-backup")
             completed = subprocess.CompletedProcess([], 0)
             with (
+                mock.patch.object(MODULE, "require_firmware_privileges"),
+                mock.patch.object(MODULE.os, "fstat", side_effect=root_owned_fstat),
                 mock.patch.object(
                     MODULE, "EXPECTED_BACKUP_BYTES", len(backup.read_bytes())
                 ),
@@ -265,6 +283,8 @@ class FirmwareBackupTests(unittest.TestCase):
                 return subprocess.CompletedProcess([], 0)
 
             with (
+                mock.patch.object(MODULE, "require_firmware_privileges"),
+                mock.patch.object(MODULE.os, "fstat", side_effect=root_owned_fstat),
                 mock.patch.object(
                     MODULE, "EXPECTED_BACKUP_BYTES", len(backup.read_bytes())
                 ),
@@ -377,6 +397,70 @@ class SerialSelectionTests(unittest.TestCase):
         self.assertIn("matched 2 devices", stderr.getvalue())
 
 
+class PrivilegePreflightTests(unittest.TestCase):
+    def test_unprivileged_flash_fails_before_lock_creation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_path = Path(tmp) / "must-not-exist.lock"
+            with (
+                mock.patch.object(MODULE.os, "geteuid", return_value=1000),
+                self.assertRaisesRegex(MODULE.SafetyGateError, "effective uid 0"),
+            ):
+                MODULE.flash_cameras(
+                    [], MODULE.TARGET, "/absolute/image.bin", False, lock_path
+                )
+
+            self.assertFalse(lock_path.exists())
+
+    def test_effective_root_passes_privilege_preflight(self):
+        with mock.patch.object(MODULE.os, "geteuid", return_value=0):
+            MODULE.require_firmware_privileges()
+
+    def test_privileged_path_creates_and_holds_root_contract_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_path = Path(tmp) / "host.lock"
+            with (
+                mock.patch.object(MODULE.os, "geteuid", return_value=0),
+                mock.patch.object(MODULE.os, "fstat", side_effect=root_owned_fstat),
+                MODULE.firmware_maintenance_lock(lock_path=lock_path),
+            ):
+                self.assertEqual(lock_path.stat().st_mode & 0o777, 0o600)
+
+    def test_main_rejects_unprivileged_flash_before_sdk_import(self):
+        with (
+            mock.patch.object(
+                MODULE.sys,
+                "argv",
+                [str(SCRIPT), "--flash", "--image", "/absolute/image.bin"],
+            ),
+            mock.patch.object(MODULE.os, "geteuid", return_value=1000),
+            redirect_stderr(io.StringIO()) as stderr,
+        ):
+            rc = MODULE.main()
+
+        self.assertEqual(rc, 2)
+        self.assertIn("effective uid 0", stderr.getvalue())
+
+    def test_exact_fleet_sudo_invocation_has_no_implicit_runtime_paths(self):
+        command = MODULE.FLEET_SUDO_0060
+        self.assertEqual(command[:3], ("/usr/bin/sudo", "/usr/bin/env", "-i"))
+        self.assertNotIn("~", " ".join(command))
+        self.assertIn("--serial", command)
+        self.assertIn("327122076391", command)
+        assignments = [token for token in command if "=" in token]
+        for assignment in assignments:
+            _name, value = assignment.split("=", 1)
+            for path in value.split(":"):
+                self.assertTrue(Path(path).is_absolute(), assignment)
+        python_index = command.index("/usr/bin/python3.12")
+        self.assertTrue(Path(command[python_index]).is_absolute())
+        self.assertTrue(Path(command[python_index + 1]).is_absolute())
+        image_index = command.index("--image") + 1
+        self.assertTrue(Path(command[image_index]).is_absolute())
+        self.assertTrue(Path(MODULE.RS_FW_UPDATE).is_absolute())
+        self.assertTrue(Path(MODULE.BACKUP_ROOT).is_absolute())
+        self.assertTrue(Path(MODULE.JOURNALCTL).is_absolute())
+
+
 class MaintenanceLockTests(unittest.TestCase):
     def test_default_lock_is_one_host_wide_run_lock(self):
         self.assertEqual(Path(MODULE.LOCK_PATH).parent, Path("/run/lock"))
@@ -384,23 +468,29 @@ class MaintenanceLockTests(unittest.TestCase):
     def test_second_nonblocking_lock_is_rejected_until_release(self):
         with tempfile.TemporaryDirectory() as tmp:
             lock_path = Path(tmp) / "host.lock"
-            with MODULE.firmware_maintenance_lock(lock_path=lock_path):
-                with self.assertRaisesRegex(
-                    MODULE.SafetyGateError, "already holds the lock"
-                ):
-                    with MODULE.firmware_maintenance_lock(lock_path=lock_path):
-                        self.fail("contested lock was acquired")
+            with (
+                mock.patch.object(MODULE, "require_firmware_privileges"),
+                mock.patch.object(MODULE.os, "fstat", side_effect=root_owned_fstat),
+            ):
+                with MODULE.firmware_maintenance_lock(lock_path=lock_path):
+                    with self.assertRaisesRegex(
+                        MODULE.SafetyGateError, "already holds the lock"
+                    ):
+                        with MODULE.firmware_maintenance_lock(lock_path=lock_path):
+                            self.fail("contested lock was acquired")
 
-            with MODULE.firmware_maintenance_lock(lock_path=lock_path):
-                pass
+                with MODULE.firmware_maintenance_lock(lock_path=lock_path):
+                    pass
 
     def test_lock_with_unsafe_permissions_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
             lock_path = Path(tmp) / "host.lock"
             lock_path.touch(mode=0o600)
             lock_path.chmod(0o644)
-            with self.assertRaisesRegex(
-                MODULE.SafetyGateError, "current-user-owned 0600"
+            with (
+                mock.patch.object(MODULE, "require_firmware_privileges"),
+                mock.patch.object(MODULE.os, "fstat", side_effect=root_owned_fstat),
+                self.assertRaisesRegex(MODULE.SafetyGateError, "root-owned 0600"),
             ):
                 with MODULE.firmware_maintenance_lock(lock_path=lock_path):
                     self.fail("unsafe lock metadata was accepted")

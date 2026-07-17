@@ -38,12 +38,28 @@ Usage:
   rs-gb10-fw-update.py                       # report all linked cameras
   rs-gb10-fw-update.py --flash --image <Signed_Image_UVC_5_17_3_10.bin>
   rs-gb10-fw-update.py --flash --image <bin> --serial <S>
+
+Exact spark-0060 fleet invocation (all runtime paths are explicit):
+  /usr/bin/sudo /usr/bin/env -i \
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    PYTHONPATH=/opt/vigil/opt/librealsense-v2.58.1-dgx-spark-gb10/lib/\
+python3.12/site-packages \
+    LD_LIBRARY_PATH=/opt/vigil/opt/librealsense-v2.58.1-dgx-spark-gb10/lib \
+    LRS_RS_FW_UPDATE=/opt/vigil/opt/librealsense-v2.58.1-dgx-spark-gb10/bin/\
+rs-fw-update \
+    LRS_FW_BACKUP_ROOT=/home/damartel/realsense-gb10-validation/fw-backups \
+    /usr/bin/python3.12 \
+    /home/damartel/dev/repos/librealsense/scripts/gb10/rs-gb10-fw-update.py \
+    --flash --serial 327122076391 \
+    --image /home/damartel/realsense-gb10-validation/firmware/\
+Signed_Image_UVC_5_17_3_10.bin
 """
 
 import argparse
 import fcntl
 import hashlib
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -64,12 +80,31 @@ EXPECTED_IMAGE_SHA256 = (
 EXPECTED_BACKUP_BYTES = 2 * 1024 * 1024
 RS_FW_UPDATE = os.environ.get(
     "LRS_RS_FW_UPDATE",
-    os.path.expanduser(
-        "~/realsense-gb10-validation/build-gb10-full/Release/rs-fw-update"
-    ),
+    "/opt/vigil/opt/librealsense-v2.58.1-dgx-spark-gb10/bin/rs-fw-update",
+)
+BACKUP_ROOT = os.environ.get(
+    "LRS_FW_BACKUP_ROOT", "/home/damartel/realsense-gb10-validation/fw-backups"
 )
 LOCK_PATH = "/run/lock/realsense-gb10-firmware.lock"
+JOURNALCTL = "/usr/bin/journalctl"
 PF_KTHREAD = 0x00200000
+FLEET_SUDO_0060 = (
+    "/usr/bin/sudo",
+    "/usr/bin/env",
+    "-i",
+    "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+    "PYTHONPATH=/opt/vigil/opt/librealsense-v2.58.1-dgx-spark-gb10/lib/python3.12/site-packages",
+    "LD_LIBRARY_PATH=/opt/vigil/opt/librealsense-v2.58.1-dgx-spark-gb10/lib",
+    "LRS_RS_FW_UPDATE=/opt/vigil/opt/librealsense-v2.58.1-dgx-spark-gb10/bin/rs-fw-update",
+    "LRS_FW_BACKUP_ROOT=/home/damartel/realsense-gb10-validation/fw-backups",
+    "/usr/bin/python3.12",
+    "/home/damartel/dev/repos/librealsense/scripts/gb10/rs-gb10-fw-update.py",
+    "--flash",
+    "--serial",
+    "327122076391",
+    "--image",
+    "/home/damartel/realsense-gb10-validation/firmware/Signed_Image_UVC_5_17_3_10.bin",
+)
 
 
 class SafetyGateError(RuntimeError):
@@ -144,9 +179,20 @@ def validate_serial_selection(cameras, requested_serial):
         )
 
 
+def require_firmware_privileges():
+    """Require root before creating the host lock or inspecting process holders."""
+    if os.geteuid() != 0:
+        raise SafetyGateError(
+            "firmware flashing requires effective uid 0 before any maintenance "
+            "lock is created or holder scan runs. Exact spark-0060 invocation:\n  "
+            + shlex.join(FLEET_SUDO_0060)
+        )
+
+
 @contextmanager
 def firmware_maintenance_lock(lock_path=None):
     """Hold one nonblocking host lock across every selected camera operation."""
+    require_firmware_privileges()
     path = Path(lock_path or LOCK_PATH)
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -164,12 +210,12 @@ def firmware_maintenance_lock(lock_path=None):
         if (
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_nlink != 1
-            or metadata.st_uid != os.geteuid()
+            or metadata.st_uid != 0
             or stat.S_IMODE(metadata.st_mode) != 0o600
         ):
             raise SafetyGateError(
                 f"unsafe host firmware lock metadata at {path}; require a regular, "
-                "single-link, current-user-owned 0600 file"
+                "single-link, root-owned 0600 file"
             )
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -411,7 +457,7 @@ def backup_artifact_is_valid(path):
 def backup_firmware(rs_fw_update, serial, current_fw, env, backup_root=None):
     """Back up firmware atomically and return its path, or None on failure."""
     if backup_root is None:
-        backup_root = os.path.expanduser("~/realsense-gb10-validation/fw-backups")
+        backup_root = BACKUP_ROOT
     os.makedirs(backup_root, exist_ok=True)
     backup = os.path.join(backup_root, f"{serial}-{current_fw}.bin")
     partial = f"{backup}.partial-{os.getpid()}"
@@ -463,7 +509,7 @@ def backup_firmware(rs_fw_update, serial, current_fw, env, backup_root=None):
 
 def controller_green():
     result = subprocess.run(
-        ["journalctl", "-k", "-b", "--no-pager"],
+        [JOURNALCTL, "-k", "-b", "--no-pager"],
         capture_output=True,
         text=True,
         check=False,
@@ -480,6 +526,7 @@ def controller_green():
 
 def flash_cameras(cams, img_ver, image_path, allow_downgrade, lock_path=None):
     """Back up and flash selected cameras under one host maintenance lock."""
+    require_firmware_privileges()
     rc_all = 0
     with firmware_maintenance_lock(lock_path=lock_path):
         for camera in cams:
@@ -548,6 +595,13 @@ def main():
         help="permit flashing an image OLDER than a camera's current firmware",
     )
     args = ap.parse_args()
+
+    if args.flash:
+        try:
+            require_firmware_privileges()
+        except SafetyGateError as exc:
+            print(f"ABORT: {exc}", file=sys.stderr)
+            return 2
 
     import pyrealsense2 as rs
 
