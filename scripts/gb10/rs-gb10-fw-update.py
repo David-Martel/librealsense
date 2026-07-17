@@ -2,15 +2,17 @@
 """GB10 RealSense firmware status + safety-gated update for ALL linked cameras.
 
 WHY: the controller deaths (#1/#2/#3) were on a camera running OLD firmware 5.13.0.55; the
-surviving unit runs 5.15.1.55. The latest D400 production firmware is **5.17.0.10** (Jul 2025).
-Bringing every linked camera to a known-good recent firmware is a leading candidate for removing
-the `-110` control-transfer trigger (see docs/gb10/FORK-VS-UPSTREAM-AND-CAMERA-FIRMWARE).
+surviving unit runs 5.15.1.55. The current **Intel D435 support-matrix floor is 5.17.3.10+**
+(fleet finding 2026-07-17; 5.17.0.10 is now stale — do NOT target it). Bringing every linked
+camera to the signed matrix firmware is a leading candidate for removing the `-110`
+control-transfer trigger (see docs/gb10/FORK-VS-UPSTREAM-AND-CAMERA-FIRMWARE).
+NOTE: this tool only REPORTS/targets the version; flashing stays gated + operator/codex-led.
 
 This tool REPORTS by default (no device change). Flashing is gated behind --flash AND requires a
 signed image (--image) because a half-flash over a marginal link can brick the camera. Safety
 pre-flights per camera: USB-3 link (refuse USB-2), controller GREEN (no recent HC-died), and it
 backs up the current firmware first. Download signed images from Intel/RealSense
-(https://dev.realsenseai.com/docs/firmware-releases-d400/ ; file `Signed_Image_UVC_5_17_0_10.bin`).
+(https://dev.realsenseai.com/docs/firmware-releases-d400/ ; file `Signed_Image_UVC_5_17_3_10.bin`).
 
 DOWNGRADE — VERIFIED FROM librealsense SOURCE (src/fw-update/fw-update-device.cpp):
   * The HOST does NO version check — `rs-fw-update -f`/SDK `update()` streams ANY signed image
@@ -25,7 +27,7 @@ DOWNGRADE — VERIFIED FROM librealsense SOURCE (src/fw-update/fw-update-device.
 
 Usage:
   rs-gb10-fw-update.py                       # report all cameras' fw vs target (dry-run)
-  rs-gb10-fw-update.py --flash --image <Signed_Image_UVC_5_17_0_10.bin>   # flash (gated)
+  rs-gb10-fw-update.py --flash --image <Signed_Image_UVC_5_17_3_10.bin>   # flash (gated)
   rs-gb10-fw-update.py --flash --image <bin> --serial <S>                 # one camera
 """
 import argparse
@@ -33,7 +35,7 @@ import os
 import subprocess
 import sys
 
-TARGET = (5, 17, 0, 10)   # latest D400 production firmware (2026-06: 5.17.0.10)
+TARGET = (5, 17, 3, 10)   # current Intel D435 support-matrix floor (5.17.3.10+); 5.17.0.10 is now stale
 RS_FW_UPDATE = os.environ.get("LRS_RS_FW_UPDATE",
                               os.path.expanduser("~/realsense-gb10-validation/build-gb10-full/Release/rs-fw-update"))
 
@@ -47,7 +49,7 @@ def ver(s):
 
 def image_version(path):
     """Parse the firmware version from a signed-image filename, e.g.
-    Signed_Image_UVC_5_17_0_10.bin -> (5,17,0,10). Returns None if not parseable."""
+    Signed_Image_UVC_5_17_3_10.bin -> (5,17,3,10). Returns None if not parseable."""
     import re
     m = re.search(r"(\d+)[._](\d+)[._](\d+)[._](\d+)", os.path.basename(path))
     return tuple(int(g) for g in m.groups()) if m else None
@@ -93,7 +95,7 @@ def main():
     if not args.flash:
         n = sum(c["needs_update"] for c in cams)
         print(f"\n{n}/{len(cams)} camera(s) below {target_str}. Re-run with "
-              f"--flash --image <Signed_Image_UVC_5_17_0_10.bin> to update (gated).")
+              f"--flash --image <Signed_Image_UVC_5_17_3_10.bin> to update (gated).")
         return 0
 
     # ---- flash path (gated) ----
@@ -111,7 +113,7 @@ def main():
     img_ver = image_version(args.image)
     if img_ver is None:
         print(f"ERROR: cannot parse a firmware version from '{os.path.basename(args.image)}' — expected a name "
-              f"like Signed_Image_UVC_5_17_0_10.bin. rs-fw-update -f flashes ANY image regardless of version, so "
+              f"like Signed_Image_UVC_5_17_3_10.bin. rs-fw-update -f flashes ANY image regardless of version, so "
               f"the downgrade guard cannot run; aborting.", file=sys.stderr)
         return 2
     print(f"Image version: {'.'.join(map(str, img_ver))}")

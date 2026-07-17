@@ -121,7 +121,7 @@ if [[ -n "$USB_DESC" ]] && awk -v a="$USB_DESC" -v b="$THRESH_USB_DESC_MIN" 'BEG
 else
   rec "sdk.usb_descriptor" FAIL "${USB_DESC:-none}" ">=${THRESH_USB_DESC_MIN}" "SDK sees sub-USB3 link"
 fi
-[[ -n "$FW" ]] && rec "sdk.firmware" INFO "$FW" "latest 5.17.0.9 / stable 5.16.0.1" "update only over a GREEN USB3 link"
+[[ -n "$FW" ]] && rec "sdk.firmware" INFO "$FW" "Intel matrix floor 5.17.3.10" "update only over a GREEN USB3 link"
 
 # ---------- 3. usbfs headroom (info/advisory) ----------
 USBFS="$(cat /sys/module/usbcore/parameters/usbfs_memory_mb 2>/dev/null)"
