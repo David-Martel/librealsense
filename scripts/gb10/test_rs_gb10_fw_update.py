@@ -3,9 +3,12 @@
 
 import hashlib
 import importlib.util
+import io
 import subprocess
 import tempfile
+import types
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -65,21 +68,22 @@ class FirmwareBackupTests(unittest.TestCase):
             "usb": "3.2",
             "usb3": True,
             "needs_update": True,
+            "physical_port": "/sys/devices/test-camera",
         }
 
-    def test_failed_backup_never_replaces_existing_backup(self):
+    def test_existing_backup_is_never_overwritten(self):
         with tempfile.TemporaryDirectory() as tmp:
             backup = Path(tmp) / "123-5.15.1.55.bin"
             backup.write_bytes(b"previous-good-backup")
-            result = subprocess.CompletedProcess([], 1)
-            with mock.patch.object(MODULE.subprocess, "run", return_value=result):
-                created = MODULE.backup_firmware(
-                    "rs-fw-update", "123", "5.15.1.55", {}, tmp
-                )
+            with mock.patch.object(MODULE.subprocess, "run") as run:
+                with self.assertRaisesRegex(
+                    MODULE.SafetyGateError, "will not be overwritten"
+                ):
+                    MODULE.backup_firmware("rs-fw-update", "123", "5.15.1.55", {}, tmp)
 
-            self.assertIsNone(created)
             self.assertEqual(backup.read_bytes(), b"previous-good-backup")
             self.assertEqual(list(Path(tmp).glob("*.partial-*")), [])
+            run.assert_not_called()
 
     def test_successful_nonempty_backup_is_installed_atomically(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -97,6 +101,29 @@ class FirmwareBackupTests(unittest.TestCase):
                 )
 
             self.assertEqual(Path(created).read_bytes(), b"current-firmware")
+            self.assertEqual(list(Path(tmp).glob("*.partial-*")), [])
+
+    def test_backup_appearing_during_install_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            backup = Path(tmp) / "123-5.15.1.55.bin"
+
+            def fake_run(args, **_kwargs):
+                Path(args[-1]).write_bytes(b"current-firmware")
+                return subprocess.CompletedProcess(args, 0)
+
+            def concurrent_create(_source, destination, **_kwargs):
+                Path(destination).write_bytes(b"concurrent-backup")
+                raise FileExistsError(destination)
+
+            with (
+                mock.patch.object(MODULE, "EXPECTED_BACKUP_BYTES", 16),
+                mock.patch.object(MODULE.subprocess, "run", side_effect=fake_run),
+                mock.patch.object(MODULE.os, "link", side_effect=concurrent_create),
+                self.assertRaisesRegex(MODULE.SafetyGateError, "appeared concurrently"),
+            ):
+                MODULE.backup_firmware("rs-fw-update", "123", "5.15.1.55", {}, tmp)
+
+            self.assertEqual(backup.read_bytes(), b"concurrent-backup")
             self.assertEqual(list(Path(tmp).glob("*.partial-*")), [])
 
     def test_success_exit_with_truncated_backup_is_rejected(self):
@@ -150,13 +177,19 @@ class FirmwareBackupTests(unittest.TestCase):
             self.assertEqual(list(Path(tmp).iterdir()), [])
 
     def test_missing_backup_return_never_reaches_flash_command(self):
-        with (
-            mock.patch.object(MODULE, "backup_firmware", return_value=None),
-            mock.patch.object(MODULE.subprocess, "run") as run,
-        ):
-            rc = MODULE.flash_cameras(
-                [self.camera()], MODULE.TARGET, "/verified/image.bin", False
-            )
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.object(MODULE, "require_camera_idle"),
+                mock.patch.object(MODULE, "backup_firmware", return_value=None),
+                mock.patch.object(MODULE.subprocess, "run") as run,
+            ):
+                rc = MODULE.flash_cameras(
+                    [self.camera()],
+                    MODULE.TARGET,
+                    "/verified/image.bin",
+                    False,
+                    lock_root=tmp,
+                )
 
         self.assertEqual(rc, 1)
         run.assert_not_called()
@@ -166,11 +199,16 @@ class FirmwareBackupTests(unittest.TestCase):
             truncated = Path(tmp) / "123-5.15.1.55.bin"
             truncated.write_bytes(b"truncated")
             with (
+                mock.patch.object(MODULE, "require_camera_idle"),
                 mock.patch.object(MODULE, "backup_firmware", return_value=truncated),
                 mock.patch.object(MODULE.subprocess, "run") as run,
             ):
                 rc = MODULE.flash_cameras(
-                    [self.camera()], MODULE.TARGET, "/verified/image.bin", False
+                    [self.camera()],
+                    MODULE.TARGET,
+                    "/verified/image.bin",
+                    False,
+                    lock_root=tmp,
                 )
 
         self.assertEqual(rc, 1)
@@ -186,13 +224,18 @@ class FirmwareBackupTests(unittest.TestCase):
                     MODULE, "EXPECTED_BACKUP_BYTES", len(backup.read_bytes())
                 ),
                 mock.patch.object(MODULE, "backup_firmware", return_value=backup),
+                mock.patch.object(MODULE, "require_camera_idle") as idle,
                 mock.patch.object(MODULE, "RS_FW_UPDATE", "rs-fw-update"),
                 mock.patch.object(
                     MODULE.subprocess, "run", return_value=completed
                 ) as run,
             ):
                 rc = MODULE.flash_cameras(
-                    [self.camera()], MODULE.TARGET, "/verified/image.bin", False
+                    [self.camera()],
+                    MODULE.TARGET,
+                    "/verified/image.bin",
+                    False,
+                    lock_root=tmp,
                 )
 
         self.assertEqual(rc, 0)
@@ -201,6 +244,46 @@ class FirmwareBackupTests(unittest.TestCase):
             run.call_args.args[0],
             ["rs-fw-update", "-s", "123", "-f", "/verified/image.bin"],
         )
+        self.assertEqual(idle.call_count, 2)
+
+    def test_maintenance_lock_covers_backup_and_flash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            backup = Path(tmp) / "123-5.15.1.55.bin"
+            backup.write_bytes(b"complete-backup")
+
+            def assert_lock_held(*_args, **_kwargs):
+                with self.assertRaises(MODULE.SafetyGateError):
+                    with MODULE.camera_maintenance_lock("123", lock_root=tmp):
+                        self.fail("maintenance lock was not held")
+                return backup
+
+            def assert_lock_held_during_flash(*_args, **_kwargs):
+                assert_lock_held()
+                return subprocess.CompletedProcess([], 0)
+
+            with (
+                mock.patch.object(
+                    MODULE, "EXPECTED_BACKUP_BYTES", len(backup.read_bytes())
+                ),
+                mock.patch.object(
+                    MODULE, "backup_firmware", side_effect=assert_lock_held
+                ),
+                mock.patch.object(MODULE, "require_camera_idle"),
+                mock.patch.object(
+                    MODULE.subprocess,
+                    "run",
+                    side_effect=assert_lock_held_during_flash,
+                ),
+            ):
+                rc = MODULE.flash_cameras(
+                    [self.camera()],
+                    MODULE.TARGET,
+                    "/verified/image.bin",
+                    False,
+                    lock_root=tmp,
+                )
+
+        self.assertEqual(rc, 0)
 
     def test_symlink_backup_is_invalid_even_when_target_has_expected_size(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -212,6 +295,173 @@ class FirmwareBackupTests(unittest.TestCase):
                 MODULE, "EXPECTED_BACKUP_BYTES", len(target.read_bytes())
             ):
                 self.assertFalse(MODULE.backup_artifact_is_valid(link))
+
+
+class SerialSelectionTests(unittest.TestCase):
+    @staticmethod
+    def fake_rs(serials):
+        camera_info = types.SimpleNamespace(
+            serial_number="serial",
+            firmware_version="firmware",
+            usb_type_descriptor="usb",
+            physical_port="port",
+            name="name",
+        )
+
+        class Device:
+            def __init__(self, serial):
+                self.info = {
+                    "serial": serial,
+                    "firmware": "5.15.1.55",
+                    "usb": "3.2",
+                    "port": "/sys/devices/test-camera",
+                    "name": "Intel RealSense D435",
+                }
+
+            def supports(self, _key):
+                return True
+
+            def get_info(self, key):
+                return self.info[key]
+
+        devices = [Device(serial) for serial in serials]
+        return types.SimpleNamespace(
+            camera_info=camera_info,
+            context=lambda: types.SimpleNamespace(query_devices=lambda: devices),
+        )
+
+    def test_requested_serial_must_match_one_camera(self):
+        MODULE.validate_serial_selection([{"serial": "123"}], "123")
+
+    def test_requested_serial_matching_zero_cameras_is_rejected(self):
+        with self.assertRaisesRegex(MODULE.SafetyGateError, "matched 0 devices"):
+            MODULE.validate_serial_selection([], "missing")
+
+    def test_requested_serial_matching_multiple_cameras_is_rejected(self):
+        cameras = [{"serial": "123"}, {"serial": "123"}]
+        with self.assertRaisesRegex(MODULE.SafetyGateError, "matched 2 devices"):
+            MODULE.validate_serial_selection(cameras, "123")
+
+    def test_no_serial_preserves_multi_camera_mode(self):
+        MODULE.validate_serial_selection([{"serial": "1"}, {"serial": "2"}], None)
+
+    def test_main_rejects_requested_serial_with_zero_sdk_matches(self):
+        fake_rs = self.fake_rs(["other"])
+        with (
+            mock.patch.dict(MODULE.sys.modules, {"pyrealsense2": fake_rs}),
+            mock.patch.object(MODULE.sys, "argv", [str(SCRIPT), "--serial", "missing"]),
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(io.StringIO()) as stderr,
+        ):
+            rc = MODULE.main()
+
+        self.assertEqual(rc, 2)
+        self.assertIn("matched 0 devices", stderr.getvalue())
+
+    def test_main_rejects_requested_serial_with_multiple_sdk_matches(self):
+        fake_rs = self.fake_rs(["123", "123"])
+        with (
+            mock.patch.dict(MODULE.sys.modules, {"pyrealsense2": fake_rs}),
+            mock.patch.object(MODULE.sys, "argv", [str(SCRIPT), "--serial", "123"]),
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(io.StringIO()) as stderr,
+        ):
+            rc = MODULE.main()
+
+        self.assertEqual(rc, 2)
+        self.assertIn("matched 2 devices", stderr.getvalue())
+
+
+class MaintenanceLockTests(unittest.TestCase):
+    def test_second_nonblocking_lock_is_rejected_until_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with MODULE.camera_maintenance_lock("123", lock_root=tmp):
+                with self.assertRaisesRegex(
+                    MODULE.SafetyGateError, "already in a firmware maintenance"
+                ):
+                    with MODULE.camera_maintenance_lock("123", lock_root=tmp):
+                        self.fail("contested lock was acquired")
+
+            with MODULE.camera_maintenance_lock("123", lock_root=tmp):
+                pass
+
+
+class CameraHolderTests(unittest.TestCase):
+    @staticmethod
+    def fake_camera_filesystem(tmp):
+        root = Path(tmp)
+        sys_root = root / "sys"
+        dev_root = root / "dev"
+        proc_root = root / "proc"
+        usb = sys_root / "bus" / "usb" / "devices" / "2-3"
+        interface = usb / "2-3:1.0"
+        port = interface / "video4linux" / "video0"
+        port.mkdir(parents=True)
+        (usb / "serial").write_text("123\n")
+        (usb / "busnum").write_text("2\n")
+        (usb / "devnum").write_text("5\n")
+
+        video_class = sys_root / "class" / "video4linux" / "video0"
+        video_class.mkdir(parents=True)
+        (video_class / "device").symlink_to(interface, target_is_directory=True)
+
+        usb_node = dev_root / "bus" / "usb" / "002" / "005"
+        usb_node.parent.mkdir(parents=True)
+        usb_node.touch()
+        video_node = dev_root / "video0"
+        video_node.parent.mkdir(parents=True, exist_ok=True)
+        video_node.touch()
+        proc_root.mkdir()
+        camera = {
+            "serial": "123",
+            "physical_port": str(port),
+        }
+        return camera, sys_root, dev_root, proc_root, video_node
+
+    def test_open_camera_node_reports_holder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            camera, sys_root, dev_root, proc_root, video_node = (
+                self.fake_camera_filesystem(tmp)
+            )
+            process = proc_root / "4242"
+            descriptors = process / "fd"
+            descriptors.mkdir(parents=True)
+            (process / "cmdline").write_bytes(b"camera-agent\0--stream\0")
+            (descriptors / "7").symlink_to(video_node)
+
+            nodes, holders = MODULE.camera_holders(
+                camera,
+                proc_root=proc_root,
+                sys_root=sys_root,
+                dev_root=dev_root,
+            )
+
+        self.assertEqual(len(nodes), 2)
+        self.assertEqual(holders, {4242: "camera-agent --stream"})
+
+    def test_no_open_camera_nodes_is_clear(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            camera, sys_root, dev_root, proc_root, _video_node = (
+                self.fake_camera_filesystem(tmp)
+            )
+            nodes, holders = MODULE.camera_holders(
+                camera,
+                proc_root=proc_root,
+                sys_root=sys_root,
+                dev_root=dev_root,
+            )
+
+        self.assertEqual(len(nodes), 2)
+        self.assertEqual(holders, {})
+
+    def test_missing_usb_device_node_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            camera, sys_root, dev_root, _proc_root, _video_node = (
+                self.fake_camera_filesystem(tmp)
+            )
+            (dev_root / "bus" / "usb" / "002" / "005").unlink()
+            with self.assertRaisesRegex(MODULE.SafetyGateError, "missing device nodes"):
+                MODULE.camera_device_nodes(camera, sys_root=sys_root, dev_root=dev_root)
 
 
 class ControllerHealthTests(unittest.TestCase):
