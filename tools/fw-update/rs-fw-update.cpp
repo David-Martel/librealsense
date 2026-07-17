@@ -11,6 +11,7 @@
 #include <cstring>
 #include <iostream>
 #include <fstream>
+#include <memory>
 #include <thread>
 #include <mutex>
 #include <chrono>
@@ -32,14 +33,19 @@
 
 using rsutils::json;
 
-std::condition_variable cv;
-std::mutex mutex;
-std::string selected_serial_number;
+struct update_state
+{
+    std::condition_variable cv;
+    std::mutex mutex;
+    std::string selected_serial_number;
+    std::string update_serial_number;
+    bool recovery_device_found = false;
+    bool done = false;
 
-rs2::device new_device;
-rs2::update_device new_fw_update_device;
-
-bool done = false;
+    // Keep handles last so they release before callback synchronization state.
+    rs2::device new_device;
+    rs2::update_device new_fw_update_device;
+};
 
 std::vector<uint8_t> read_fw_file(std::string file_path)
 {
@@ -148,19 +154,23 @@ void list_devices(rs2::context ctx)
 }
 
 
-void waiting_for_device_to_reconnect(rs2::context& ctx, rs2::cli::value<std::string>& serial_number_arg)
+void waiting_for_device_to_reconnect(
+    update_state& state,
+    rs2::context& ctx,
+    rs2::cli::value<std::string>& serial_number_arg)
 {
     std::cout << std::endl << "Waiting for device to reconnect..." << std::endl;
-    std::unique_lock<std::mutex> lk(mutex);
-    cv.wait_for(lk, std::chrono::seconds(WAIT_FOR_DEVICE_TIMEOUT), [&] { return !done || new_device; });
+    std::unique_lock<std::mutex> lk(state.mutex);
+    state.cv.wait_for(lk, std::chrono::seconds(WAIT_FOR_DEVICE_TIMEOUT),
+        [&] { return !state.done || state.new_device; });
 
-    if (done)
+    if (state.done)
     {
         auto devs = ctx.query_devices();
         for (auto&& d : devs)
         {
             auto sn = d.supports(RS2_CAMERA_INFO_SERIAL_NUMBER) ? d.get_info(RS2_CAMERA_INFO_SERIAL_NUMBER) : "unknown";
-            if (serial_number_arg.isSet() && sn != selected_serial_number)
+            if (serial_number_arg.isSet() && sn != state.selected_serial_number)
                 continue;
 
             auto fw = d.supports(RS2_CAMERA_INFO_FIRMWARE_VERSION) ? d.get_info(RS2_CAMERA_INFO_FIRMWARE_VERSION) : "unknown";
@@ -181,7 +191,10 @@ bool is_fw_compatible(const rs2::device& dev, const std::vector< uint8_t >& fw_i
     return true;
 }
 
-int update_recovery_device(rs2::context& ctx, rs2::cli::value<std::string>& file_arg)
+int update_recovery_device(
+    const std::shared_ptr<update_state>& state,
+    rs2::context& ctx,
+    rs2::cli::value<std::string>& file_arg)
 {
     std::vector<uint8_t> fw_image = read_firmware_data(file_arg.isSet(), file_arg.getValue());
 
@@ -194,7 +207,7 @@ int update_recovery_device(rs2::context& ctx, rs2::cli::value<std::string>& file
         if (!d.is_in_recovery_mode())
             continue;
         auto sn = d.get_info(RS2_CAMERA_INFO_FIRMWARE_UPDATE_ID);
-        if (!selected_serial_number.empty() && sn != selected_serial_number)
+        if (!state->selected_serial_number.empty() && sn != state->selected_serial_number)
             continue;
         if (recovery_device)
         {
@@ -212,8 +225,8 @@ int update_recovery_device(rs2::context& ctx, rs2::cli::value<std::string>& file
     {
         auto update_serial_number = recovery_device.get_info(RS2_CAMERA_INFO_FIRMWARE_UPDATE_ID);
         bool d457_recovery_device = rs2::fw_update::is_mipi_recovery_device(recovery_device);
-        volatile bool recovery_device_found = false;
-        ctx.set_devices_changed_callback([&](rs2::event_information& info) {
+        state->recovery_device_found = false;
+        ctx.set_devices_changed_callback([state, update_serial_number](rs2::event_information& info) {
             for (auto&& d : info.get_new_devices())
             {
                 if (d.is_in_recovery_mode())
@@ -222,10 +235,10 @@ int update_recovery_device(rs2::context& ctx, rs2::cli::value<std::string>& file
                 if (recovery_sn == update_serial_number)
                 {
                     {
-                        std::lock_guard< std::mutex > lk(mutex);
-                        recovery_device_found = true;
+                        std::lock_guard< std::mutex > lk(state->mutex);
+                        state->recovery_device_found = true;
                     }
-                    cv.notify_one();
+                    state->cv.notify_one();
                     break;
                 }
             }
@@ -243,10 +256,10 @@ int update_recovery_device(rs2::context& ctx, rs2::cli::value<std::string>& file
         std::cout << "Waiting for new device..." << std::endl;
         if (!d457_recovery_device)
         {
-            std::unique_lock< std::mutex > lk(mutex);
-            if (!recovery_device_found
-                && !cv.wait_for(lk, std::chrono::seconds(WAIT_FOR_DEVICE_TIMEOUT), [&]() {
-                    return recovery_device_found;
+            std::unique_lock< std::mutex > lk(state->mutex);
+            if (!state->recovery_device_found
+                && !state->cv.wait_for(lk, std::chrono::seconds(WAIT_FOR_DEVICE_TIMEOUT), [state]() {
+                    return state->recovery_device_found;
                     }))
             {
                 std::cout << "... timed out!" << std::endl;
@@ -306,7 +319,7 @@ void backup_flash(rs2::device& d, rs2::cli::value<std::string>& backup_arg)
     }
 }
 
-void update_unsigned_fw(rs2::device& d, const std::vector<uint8_t>& fw_image)
+void update_unsigned_fw(update_state& state, rs2::device& d, const std::vector<uint8_t>& fw_image)
 {
     std::cout << std::endl << "Unsigned Firmware update started. Please don't disconnect device!" << std::endl << std::endl;
 
@@ -322,10 +335,10 @@ void update_unsigned_fw(rs2::device& d, const std::vector<uint8_t>& fw_image)
         d.as<rs2::updatable>().update_unsigned(fw_image, [&](const float progress) {});
 
     std::cout << std::endl << std::endl << "Unsigned Firmware update done" << std::endl;
-    done = true;
+    state.done = true;
 }
 
-int update_signed_fw(rs2::device& d, const std::vector<uint8_t>& fw_image)
+int update_signed_fw(update_state& state, rs2::device& d, const std::vector<uint8_t>& fw_image)
 {
     if (!is_fw_compatible(d, fw_image))
         return EXIT_FAILURE;
@@ -340,22 +353,29 @@ int update_signed_fw(rs2::device& d, const std::vector<uint8_t>& fw_image)
     // this if statement is also relevant for mipi devices
     if (d.is< rs2::update_device >())
     {
-        new_fw_update_device = d;
+        std::lock_guard<std::mutex> lk(state.mutex);
+        state.new_fw_update_device = d;
     }
     else
     {
-        std::unique_lock<std::mutex> lk(mutex);
-        if (!cv.wait_for(lk, std::chrono::seconds(WAIT_FOR_DEVICE_TIMEOUT), [&] { return new_fw_update_device; }))
+        std::unique_lock<std::mutex> lk(state.mutex);
+        if (!state.cv.wait_for(lk, std::chrono::seconds(WAIT_FOR_DEVICE_TIMEOUT),
+            [&state] { return state.new_fw_update_device; }))
         {
             std::cout << std::endl << "Failed to locate a device in FW update mode" << std::endl;
             return EXIT_FAILURE;
         }
     }
 
-    new_device = rs2::device();  // otherwise the wait will exit right away
-    update(new_fw_update_device, fw_image);
+    rs2::update_device fw_update_device;
+    {
+        std::lock_guard<std::mutex> lk(state.mutex);
+        state.new_device = rs2::device();  // otherwise the wait will exit right away
+        fw_update_device = state.new_fw_update_device;
+    }
+    update(fw_update_device, fw_image);
 
-    done = true;
+    state.done = true;
     return EXIT_SUCCESS;
 }
 
@@ -363,6 +383,9 @@ int main(int argc, char** argv)
 try
 {
     using rs2::cli;
+    // Device-change callbacks share ownership because unsubscribe does not
+    // quiesce callbacks already copied by the signal dispatcher.
+    auto state = std::make_shared<update_state>();
     cli cmd("librealsense rs-fw-update tool");
 
     cli::flag list_devices_arg('l', "list_devices", "List all available devices");
@@ -405,21 +428,18 @@ try
 
     if (serial_number_arg.isSet())
     {
-        selected_serial_number = serial_number_arg.getValue();
-        std::cout << std::endl << "Search for device with serial number: " << selected_serial_number << std::endl;
+        state->selected_serial_number = serial_number_arg.getValue();
+        std::cout << std::endl << "Search for device with serial number: " << state->selected_serial_number << std::endl;
     }
-
-
-    std::string update_serial_number;
 
     // Recovery
     if (recover_arg.isSet())
     {
-        update_recovery_device(ctx, file_arg);
+        update_recovery_device(state, ctx, file_arg);
     }
 
     // Update device
-    ctx.set_devices_changed_callback([&](rs2::event_information& info)
+    ctx.set_devices_changed_callback([state](rs2::event_information& info)
         {
             if (info.get_new_devices().size() == 0)
             {
@@ -428,14 +448,14 @@ try
 
             for (auto&& d : info.get_new_devices())
             {
-                std::lock_guard<std::mutex> lk(mutex);
-                if (d.is_in_recovery_mode() && (d.get_info(RS2_CAMERA_INFO_FIRMWARE_UPDATE_ID) == update_serial_number))
-                    new_fw_update_device = d;
+                std::lock_guard<std::mutex> lk(state->mutex);
+                if (d.is_in_recovery_mode()
+                    && (d.get_info(RS2_CAMERA_INFO_FIRMWARE_UPDATE_ID) == state->update_serial_number))
+                    state->new_fw_update_device = d;
                 else
-                    new_device = d;
+                    state->new_device = d;
             }
-            if (new_fw_update_device || new_device)
-                cv.notify_one();
+            state->cv.notify_one();
         });
 
     auto devs = ctx.query_devices();
@@ -469,7 +489,7 @@ try
         if (!d.is< rs2::updatable >() || !d.supports(RS2_CAMERA_INFO_FIRMWARE_UPDATE_ID))
             continue;
 
-        if (devs.size() > 1 && selected_serial_number.empty())
+        if (devs.size() > 1 && state->selected_serial_number.empty())
         {
             std::cout << "Please use the serial number argument to specify which device needs firmware update. " << std::endl;
             return EXIT_FAILURE;
@@ -479,7 +499,7 @@ try
         {
             auto sn = d.get_info(d.supports(RS2_CAMERA_INFO_SERIAL_NUMBER) ? RS2_CAMERA_INFO_SERIAL_NUMBER
                 : RS2_CAMERA_INFO_FIRMWARE_UPDATE_ID);
-            if (sn != selected_serial_number)
+            if (sn != state->selected_serial_number)
                 continue;
         }
 
@@ -492,7 +512,10 @@ try
         }
 
         device_found = true;
-        update_serial_number = d.get_info(RS2_CAMERA_INFO_FIRMWARE_UPDATE_ID);
+        {
+            std::lock_guard<std::mutex> lk(state->mutex);
+            state->update_serial_number = d.get_info(RS2_CAMERA_INFO_FIRMWARE_UPDATE_ID);
+        }
 
         if (backup_arg.isSet())
         {
@@ -510,11 +533,11 @@ try
 
             if (unsigned_arg.isSet())
             {
-                update_unsigned_fw(d, fw_image);
+                update_unsigned_fw(*state, d, fw_image);
             }
             else
             {
-                int result = update_signed_fw(d, fw_image);
+                int result = update_signed_fw(*state, d, fw_image);
                 if (result != EXIT_SUCCESS)
                     return result;
             }
@@ -532,7 +555,7 @@ try
         return EXIT_FAILURE;
     }
 
-    waiting_for_device_to_reconnect(ctx, serial_number_arg);
+    waiting_for_device_to_reconnect(*state, ctx, serial_number_arg);
 
 
     return EXIT_SUCCESS;
