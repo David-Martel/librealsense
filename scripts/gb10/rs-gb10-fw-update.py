@@ -16,11 +16,13 @@ camera. Per-camera preflights require a USB-3 link, a green controller, the
 published image SHA-256, and a verified nonempty firmware backup. Download the
 signed image from https://dev.realsenseai.com/docs/firmware-releases-d400/.
 
-The wrapper holds a cooperative per-camera maintenance lock and scans visible
+The wrapper holds a cooperative host-wide maintenance lock and scans visible
 Linux process descriptors for holders of the camera's usbfs, V4L2, media, and
 hidraw nodes before backup and again before flash. A non-cooperating process can
 still open the device after either scan; stop camera services for the entire
-maintenance window. Descriptor visibility may also be limited across users.
+maintenance window. The holder gate fails closed when a live non-kernel process
+has an inaccessible descriptor table; run firmware maintenance with sufficient
+privilege to inspect every userspace process.
 
 DOWNGRADE — VERIFIED FROM librealsense SOURCE
 (src/fw-update/fw-update-device.cpp):
@@ -66,7 +68,8 @@ RS_FW_UPDATE = os.environ.get(
         "~/realsense-gb10-validation/build-gb10-full/Release/rs-fw-update"
     ),
 )
-LOCK_ROOT = os.path.expanduser("~/.local/state/realsense-gb10-validation/locks")
+LOCK_PATH = "/run/lock/realsense-gb10-firmware.lock"
+PF_KTHREAD = 0x00200000
 
 
 class SafetyGateError(RuntimeError):
@@ -142,32 +145,41 @@ def validate_serial_selection(cameras, requested_serial):
 
 
 @contextmanager
-def camera_maintenance_lock(serial, lock_root=None):
-    """Hold a nonblocking per-camera lock across backup and flash."""
-    root = Path(lock_root or LOCK_ROOT)
-    lock_name = f"{hashlib.sha256(str(serial).encode()).hexdigest()}.lock"
+def firmware_maintenance_lock(lock_path=None):
+    """Hold one nonblocking host lock across every selected camera operation."""
+    path = Path(lock_path or LOCK_PATH)
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
-        root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        fd = os.open(root / lock_name, flags, 0o600)
+        fd = os.open(path, flags, 0o600)
     except OSError as exc:
         raise SafetyGateError(
-            f"cannot establish camera {serial} maintenance lock at {root}: {exc}"
+            f"cannot establish host firmware lock at {path}: {exc}; use the same "
+            "account that created the 0600 lock or remove it only after proving "
+            "no maintenance operation is active"
         ) from exc
     locked = False
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise SafetyGateError(f"maintenance lock is not a regular file: {root}")
+        metadata = os.fstat(fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise SafetyGateError(
+                f"unsafe host firmware lock metadata at {path}; require a regular, "
+                "single-link, current-user-owned 0600 file"
+            )
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise SafetyGateError(
-                f"camera {serial} is already in a firmware maintenance operation"
+                "another host firmware maintenance operation already holds the lock"
             ) from exc
         locked = True
         os.ftruncate(fd, 0)
-        os.write(fd, f"pid={os.getpid()} serial={serial}\n".encode())
+        os.write(fd, f"pid={os.getpid()}\n".encode())
         os.fsync(fd)
         yield
     finally:
@@ -189,10 +201,17 @@ def _usb_device_root(camera, sys_root):
     sys_root = Path(sys_root)
     usb_devices = sys_root / "bus" / "usb" / "devices"
     physical_port = str(camera.get("physical_port", "")).strip()
+    firmware_update_id = str(camera.get("firmware_update_id", "")).strip()
+    if firmware_update_id == "?":
+        firmware_update_id = ""
     candidates = []
     if physical_port and physical_port != "?":
         port_path = Path(physical_port)
         candidates.extend((port_path, usb_devices / physical_port))
+        if "/" not in physical_port and "-" in physical_port:
+            compact_parent, compact_suffix = physical_port.rsplit("-", 1)
+            if compact_suffix.isdigit():
+                candidates.append(usb_devices / compact_parent)
         if port_path.is_absolute():
             try:
                 candidates.append(sys_root / port_path.relative_to("/sys"))
@@ -211,10 +230,15 @@ def _usb_device_root(camera, sys_root):
                     if (parent / "serial").is_file()
                     else ""
                 )
-                if device_serial != str(camera["serial"]):
+                if firmware_update_id and device_serial != firmware_update_id:
                     break
                 return parent
 
+    if not firmware_update_id:
+        raise SafetyGateError(
+            f"camera {camera['serial']} has neither a resolvable physical port nor "
+            "a firmware update ID; cannot prove the target USB device"
+        )
     matches = []
     try:
         entries = list(usb_devices.iterdir())
@@ -225,7 +249,7 @@ def _usb_device_root(camera, sys_root):
     for entry in entries:
         serial_path = entry / "serial"
         try:
-            if serial_path.read_text(encoding="utf-8").strip() == str(camera["serial"]):
+            if serial_path.read_text(encoding="utf-8").strip() == firmware_update_id:
                 matches.append(entry.resolve(strict=True))
         except OSError:
             continue
@@ -233,7 +257,7 @@ def _usb_device_root(camera, sys_root):
     if len(matches) != 1:
         raise SafetyGateError(
             f"camera {camera['serial']} mapped to {len(matches)} USB sysfs devices; "
-            "cannot prove the target is idle"
+            f"firmware update ID {firmware_update_id!r} is not unique"
         )
     return matches[0]
 
@@ -281,12 +305,29 @@ def _file_identity(path):
     return ("inode", metadata.st_dev, metadata.st_ino)
 
 
+def _is_kernel_thread(process):
+    """Return True for a kernel thread, False for userspace, or None if gone."""
+    try:
+        raw = (process / "stat").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False if process.exists() else None
+    except OSError:
+        return False
+    end_name = raw.rfind(")")
+    fields = raw[end_name + 2 :].split() if end_name >= 0 else []
+    try:
+        flags = int(fields[6])
+    except (IndexError, ValueError):
+        return False
+    return bool(flags & PF_KTHREAD)
+
+
 def camera_holders(camera, proc_root="/proc", sys_root="/sys", dev_root="/dev"):
     """Find visible processes with an open descriptor for the target camera.
 
-    Linux may hide another user's descriptors. This catches normal fleet agents
-    running as the operator account but cannot close the race where an unrelated
-    process opens a node after the scan.
+    Linux may hide another user's descriptors. Any inaccessible live userspace
+    descriptor table makes the result incomplete and aborts the operation. This
+    still cannot close the race where a process opens a node after the scan.
     """
     nodes = camera_device_nodes(camera, sys_root=sys_root, dev_root=dev_root)
     try:
@@ -304,17 +345,26 @@ def camera_holders(camera, proc_root="/proc", sys_root="/sys", dev_root="/dev"):
             f"cannot inspect process table at {proc_root}: {exc}"
         ) from exc
     holders = {}
+    incomplete = set()
     for process in processes:
         if not process.name.isdigit() or int(process.name) == os.getpid():
             continue
         try:
             descriptors = list((process / "fd").iterdir())
-        except (FileNotFoundError, PermissionError):
+        except FileNotFoundError:
+            continue
+        except OSError:
+            kernel_thread = _is_kernel_thread(process)
+            if kernel_thread is False:
+                incomplete.add(int(process.name))
             continue
         for descriptor in descriptors:
             try:
                 identity = _file_identity(descriptor)
-            except (FileNotFoundError, PermissionError):
+            except FileNotFoundError:
+                continue
+            except OSError:
+                incomplete.add(int(process.name))
                 continue
             if identity not in identities:
                 continue
@@ -325,6 +375,13 @@ def camera_holders(camera, proc_root="/proc", sys_root="/sys", dev_root="/dev"):
                 command_text = ""
             holders[int(process.name)] = command_text or "unknown"
             break
+    if incomplete:
+        sample = ", ".join(str(pid) for pid in sorted(incomplete)[:8])
+        raise SafetyGateError(
+            f"process descriptor visibility is incomplete for {len(incomplete)} "
+            f"live userspace process(es), including pid(s) {sample}; rerun with "
+            "sufficient privilege to inspect all /proc file descriptors"
+        )
     return nodes, holders
 
 
@@ -421,58 +478,61 @@ def controller_green():
     )
 
 
-def flash_cameras(cams, img_ver, image_path, allow_downgrade, lock_root=None):
-    """Back up and flash each selected camera through the verified image copy."""
+def flash_cameras(cams, img_ver, image_path, allow_downgrade, lock_path=None):
+    """Back up and flash selected cameras under one host maintenance lock."""
     rc_all = 0
-    for camera in cams:
-        # rs-fw-update itself flashes any supplied image regardless of version.
-        if img_ver < ver(camera["fw"]) and not allow_downgrade:
-            print(
-                f"REFUSE {camera['serial']}: image "
-                f"{'.'.join(map(str, img_ver))} is OLDER than current "
-                f"{camera['fw']} — silent downgrade. "
-                "Pass --allow-downgrade to override.",
-                file=sys.stderr,
-            )
-            rc_all = 1
-            continue
-        if img_ver == ver(camera["fw"]):
-            print(f"skip {camera['serial']} (already at image version {camera['fw']})")
-            continue
-        if not camera["usb3"]:
-            print(
-                f"REFUSE {camera['serial']}: USB-2 link ({camera['usb']}) — "
-                "a half-flash over a marginal link can brick the camera. "
-                "Move to a native USB-3 port first.",
-                file=sys.stderr,
-            )
-            rc_all = 1
-            continue
-        with camera_maintenance_lock(camera["serial"], lock_root=lock_root):
-            env = dict(os.environ)
-            env["LD_LIBRARY_PATH"] = (
-                os.path.dirname(RS_FW_UPDATE) + ":" + env.get("LD_LIBRARY_PATH", "")
-            )
-            require_camera_idle(camera)
-            print(f"\n>>> {camera['serial']}: back up current firmware before flashing")
-            backup = backup_firmware(RS_FW_UPDATE, camera["serial"], camera["fw"], env)
-            if not backup_artifact_is_valid(backup):
-                print(
-                    f"ABORT {camera['serial']}: firmware backup failed or was invalid; "
-                    "camera was not flashed.",
-                    file=sys.stderr,
-                )
-                rc_all = 1
-                continue
-            print(f"    backup verified: {backup} ({os.path.getsize(backup)} bytes)")
-            require_camera_idle(camera)
-            print(f"    flashing {os.path.basename(image_path)}")
-            rc = subprocess.run(
-                [RS_FW_UPDATE, "-s", camera["serial"], "-f", image_path], env=env
-            ).returncode
-            print(f"    rs-fw-update exit={rc}")
-            rc_all = rc_all or rc
+    with firmware_maintenance_lock(lock_path=lock_path):
+        for camera in cams:
+            rc_all = _flash_camera(camera, img_ver, image_path, allow_downgrade, rc_all)
     return rc_all
+
+
+def _flash_camera(camera, img_ver, image_path, allow_downgrade, rc_all):
+    """Run every safety gate and optionally flash one selected camera."""
+    # rs-fw-update itself flashes any supplied image regardless of version.
+    if img_ver < ver(camera["fw"]) and not allow_downgrade:
+        print(
+            f"REFUSE {camera['serial']}: image "
+            f"{'.'.join(map(str, img_ver))} is OLDER than current "
+            f"{camera['fw']} — silent downgrade. "
+            "Pass --allow-downgrade to override.",
+            file=sys.stderr,
+        )
+        return 1
+    if img_ver == ver(camera["fw"]):
+        print(f"skip {camera['serial']} (already at image version {camera['fw']})")
+        return rc_all
+    if not camera["usb3"]:
+        print(
+            f"REFUSE {camera['serial']}: USB-2 link ({camera['usb']}) — "
+            "a half-flash over a marginal link can brick the camera. "
+            "Move to a native USB-3 port first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    env = dict(os.environ)
+    env["LD_LIBRARY_PATH"] = (
+        os.path.dirname(RS_FW_UPDATE) + ":" + env.get("LD_LIBRARY_PATH", "")
+    )
+    require_camera_idle(camera)
+    print(f"\n>>> {camera['serial']}: back up current firmware before flashing")
+    backup = backup_firmware(RS_FW_UPDATE, camera["serial"], camera["fw"], env)
+    if not backup_artifact_is_valid(backup):
+        print(
+            f"ABORT {camera['serial']}: firmware backup failed or was invalid; "
+            "camera was not flashed.",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"    backup verified: {backup} ({os.path.getsize(backup)} bytes)")
+    require_camera_idle(camera)
+    print(f"    flashing {os.path.basename(image_path)}")
+    rc = subprocess.run(
+        [RS_FW_UPDATE, "-s", camera["serial"], "-f", image_path], env=env
+    ).returncode
+    print(f"    rs-fw-update exit={rc}")
+    return rc_all or rc
 
 
 def main():
@@ -510,6 +570,7 @@ def main():
         fw = get_info(rs.camera_info.firmware_version)
         usb = get_info(rs.camera_info.usb_type_descriptor)
         physical_port = get_info(rs.camera_info.physical_port)
+        firmware_update_id = get_info(rs.camera_info.firmware_update_id)
         need = ver(fw) < TARGET
         usb3 = str(usb).startswith("3")
         cams.append(
@@ -520,6 +581,7 @@ def main():
                 "usb3": usb3,
                 "needs_update": need,
                 "physical_port": physical_port,
+                "firmware_update_id": firmware_update_id,
             }
         )
         print(

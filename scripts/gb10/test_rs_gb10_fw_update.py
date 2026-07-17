@@ -69,6 +69,7 @@ class FirmwareBackupTests(unittest.TestCase):
             "usb3": True,
             "needs_update": True,
             "physical_port": "/sys/devices/test-camera",
+            "firmware_update_id": "404543020690",
         }
 
     def test_existing_backup_is_never_overwritten(self):
@@ -188,7 +189,7 @@ class FirmwareBackupTests(unittest.TestCase):
                     MODULE.TARGET,
                     "/verified/image.bin",
                     False,
-                    lock_root=tmp,
+                    lock_path=Path(tmp) / "host.lock",
                 )
 
         self.assertEqual(rc, 1)
@@ -208,7 +209,7 @@ class FirmwareBackupTests(unittest.TestCase):
                     MODULE.TARGET,
                     "/verified/image.bin",
                     False,
-                    lock_root=tmp,
+                    lock_path=Path(tmp) / "host.lock",
                 )
 
         self.assertEqual(rc, 1)
@@ -235,7 +236,7 @@ class FirmwareBackupTests(unittest.TestCase):
                     MODULE.TARGET,
                     "/verified/image.bin",
                     False,
-                    lock_root=tmp,
+                    lock_path=Path(tmp) / "host.lock",
                 )
 
         self.assertEqual(rc, 0)
@@ -253,7 +254,9 @@ class FirmwareBackupTests(unittest.TestCase):
 
             def assert_lock_held(*_args, **_kwargs):
                 with self.assertRaises(MODULE.SafetyGateError):
-                    with MODULE.camera_maintenance_lock("123", lock_root=tmp):
+                    with MODULE.firmware_maintenance_lock(
+                        lock_path=Path(tmp) / "host.lock"
+                    ):
                         self.fail("maintenance lock was not held")
                 return backup
 
@@ -280,7 +283,7 @@ class FirmwareBackupTests(unittest.TestCase):
                     MODULE.TARGET,
                     "/verified/image.bin",
                     False,
-                    lock_root=tmp,
+                    lock_path=Path(tmp) / "host.lock",
                 )
 
         self.assertEqual(rc, 0)
@@ -305,6 +308,7 @@ class SerialSelectionTests(unittest.TestCase):
             firmware_version="firmware",
             usb_type_descriptor="usb",
             physical_port="port",
+            firmware_update_id="firmware_update_id",
             name="name",
         )
 
@@ -315,6 +319,7 @@ class SerialSelectionTests(unittest.TestCase):
                     "firmware": "5.15.1.55",
                     "usb": "3.2",
                     "port": "/sys/devices/test-camera",
+                    "firmware_update_id": "404543020690",
                     "name": "Intel RealSense D435",
                 }
 
@@ -373,39 +378,59 @@ class SerialSelectionTests(unittest.TestCase):
 
 
 class MaintenanceLockTests(unittest.TestCase):
+    def test_default_lock_is_one_host_wide_run_lock(self):
+        self.assertEqual(Path(MODULE.LOCK_PATH).parent, Path("/run/lock"))
+
     def test_second_nonblocking_lock_is_rejected_until_release(self):
         with tempfile.TemporaryDirectory() as tmp:
-            with MODULE.camera_maintenance_lock("123", lock_root=tmp):
+            lock_path = Path(tmp) / "host.lock"
+            with MODULE.firmware_maintenance_lock(lock_path=lock_path):
                 with self.assertRaisesRegex(
-                    MODULE.SafetyGateError, "already in a firmware maintenance"
+                    MODULE.SafetyGateError, "already holds the lock"
                 ):
-                    with MODULE.camera_maintenance_lock("123", lock_root=tmp):
+                    with MODULE.firmware_maintenance_lock(lock_path=lock_path):
                         self.fail("contested lock was acquired")
 
-            with MODULE.camera_maintenance_lock("123", lock_root=tmp):
+            with MODULE.firmware_maintenance_lock(lock_path=lock_path):
                 pass
+
+    def test_lock_with_unsafe_permissions_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_path = Path(tmp) / "host.lock"
+            lock_path.touch(mode=0o600)
+            lock_path.chmod(0o644)
+            with self.assertRaisesRegex(
+                MODULE.SafetyGateError, "current-user-owned 0600"
+            ):
+                with MODULE.firmware_maintenance_lock(lock_path=lock_path):
+                    self.fail("unsafe lock metadata was accepted")
 
 
 class CameraHolderTests(unittest.TestCase):
     @staticmethod
-    def fake_camera_filesystem(tmp):
+    def fake_camera_filesystem(
+        tmp,
+        sdk_serial="327122076391",
+        firmware_update_id="404543020690",
+        physical_port="4-3.2-8",
+    ):
         root = Path(tmp)
         sys_root = root / "sys"
         dev_root = root / "dev"
         proc_root = root / "proc"
-        usb = sys_root / "bus" / "usb" / "devices" / "2-3"
-        interface = usb / "2-3:1.0"
+        usb = sys_root / "bus" / "usb" / "devices" / "4-3.2"
+        interface = usb / "4-3.2:1.0"
         port = interface / "video4linux" / "video0"
         port.mkdir(parents=True)
-        (usb / "serial").write_text("123\n")
-        (usb / "busnum").write_text("2\n")
+        (usb / "serial").write_text(f"{firmware_update_id}\n")
+        (usb / "busnum").write_text("4\n")
         (usb / "devnum").write_text("5\n")
 
         video_class = sys_root / "class" / "video4linux" / "video0"
         video_class.mkdir(parents=True)
         (video_class / "device").symlink_to(interface, target_is_directory=True)
 
-        usb_node = dev_root / "bus" / "usb" / "002" / "005"
+        usb_node = dev_root / "bus" / "usb" / "004" / "005"
         usb_node.parent.mkdir(parents=True)
         usb_node.touch()
         video_node = dev_root / "video0"
@@ -413,10 +438,38 @@ class CameraHolderTests(unittest.TestCase):
         video_node.touch()
         proc_root.mkdir()
         camera = {
-            "serial": "123",
-            "physical_port": str(port),
+            "serial": sdk_serial,
+            "firmware_update_id": firmware_update_id,
+            "physical_port": physical_port,
         }
         return camera, sys_root, dev_root, proc_root, video_node
+
+    def test_compact_port_maps_mismatched_0060_sdk_and_usb_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            camera, sys_root, dev_root, _proc_root, _video_node = (
+                self.fake_camera_filesystem(tmp)
+            )
+            nodes = MODULE.camera_device_nodes(
+                camera, sys_root=sys_root, dev_root=dev_root
+            )
+
+        self.assertEqual(len(nodes), 2)
+
+    def test_firmware_update_id_maps_mismatched_3066_ids_without_port(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            camera, sys_root, dev_root, _proc_root, _video_node = (
+                self.fake_camera_filesystem(
+                    tmp,
+                    sdk_serial="347622075921",
+                    firmware_update_id="344223022564",
+                    physical_port="?",
+                )
+            )
+            nodes = MODULE.camera_device_nodes(
+                camera, sys_root=sys_root, dev_root=dev_root
+            )
+
+        self.assertEqual(len(nodes), 2)
 
     def test_open_camera_node_reports_holder(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -459,9 +512,50 @@ class CameraHolderTests(unittest.TestCase):
             camera, sys_root, dev_root, _proc_root, _video_node = (
                 self.fake_camera_filesystem(tmp)
             )
-            (dev_root / "bus" / "usb" / "002" / "005").unlink()
+            (dev_root / "bus" / "usb" / "004" / "005").unlink()
             with self.assertRaisesRegex(MODULE.SafetyGateError, "missing device nodes"):
                 MODULE.camera_device_nodes(camera, sys_root=sys_root, dev_root=dev_root)
+
+    def test_inaccessible_userspace_fd_table_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            camera, sys_root, dev_root, proc_root, _video_node = (
+                self.fake_camera_filesystem(tmp)
+            )
+            process = proc_root / "4242"
+            process.mkdir()
+            (process / "fd").write_text("not a directory")
+            (process / "stat").write_text("4242 (camera-agent) S 1 1 1 0 0 0\n")
+
+            with self.assertRaisesRegex(
+                MODULE.SafetyGateError, "descriptor visibility is incomplete"
+            ):
+                MODULE.camera_holders(
+                    camera,
+                    proc_root=proc_root,
+                    sys_root=sys_root,
+                    dev_root=dev_root,
+                )
+
+    def test_inaccessible_kernel_thread_fd_table_is_not_userspace_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            camera, sys_root, dev_root, proc_root, _video_node = (
+                self.fake_camera_filesystem(tmp)
+            )
+            process = proc_root / "2"
+            process.mkdir()
+            (process / "fd").write_text("not a directory")
+            (process / "stat").write_text(
+                f"2 (kthreadd) S 0 0 0 0 0 {MODULE.PF_KTHREAD}\n"
+            )
+
+            _nodes, holders = MODULE.camera_holders(
+                camera,
+                proc_root=proc_root,
+                sys_root=sys_root,
+                dev_root=dev_root,
+            )
+
+        self.assertEqual(holders, {})
 
 
 class ControllerHealthTests(unittest.TestCase):
