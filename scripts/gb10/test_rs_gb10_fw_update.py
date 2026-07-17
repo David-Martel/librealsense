@@ -57,6 +57,16 @@ class FirmwareImageTests(unittest.TestCase):
 
 
 class FirmwareBackupTests(unittest.TestCase):
+    @staticmethod
+    def camera():
+        return {
+            "serial": "123",
+            "fw": "5.15.1.55",
+            "usb": "3.2",
+            "usb3": True,
+            "needs_update": True,
+        }
+
     def test_failed_backup_never_replaces_existing_backup(self):
         with tempfile.TemporaryDirectory() as tmp:
             backup = Path(tmp) / "123-5.15.1.55.bin"
@@ -126,6 +136,82 @@ class FirmwareBackupTests(unittest.TestCase):
 
             self.assertIsNone(created)
             self.assertEqual(list(Path(tmp).iterdir()), [])
+
+    def test_backup_command_launch_failure_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(
+                MODULE.subprocess, "run", side_effect=OSError("cannot execute")
+            ):
+                created = MODULE.backup_firmware(
+                    "rs-fw-update", "123", "5.15.1.55", {}, tmp
+                )
+
+            self.assertIsNone(created)
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+
+    def test_missing_backup_return_never_reaches_flash_command(self):
+        with (
+            mock.patch.object(MODULE, "backup_firmware", return_value=None),
+            mock.patch.object(MODULE.subprocess, "run") as run,
+        ):
+            rc = MODULE.flash_cameras(
+                [self.camera()], MODULE.TARGET, "/verified/image.bin", False
+            )
+
+        self.assertEqual(rc, 1)
+        run.assert_not_called()
+
+    def test_invalid_backup_return_never_reaches_flash_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            truncated = Path(tmp) / "123-5.15.1.55.bin"
+            truncated.write_bytes(b"truncated")
+            with (
+                mock.patch.object(MODULE, "backup_firmware", return_value=truncated),
+                mock.patch.object(MODULE.subprocess, "run") as run,
+            ):
+                rc = MODULE.flash_cameras(
+                    [self.camera()], MODULE.TARGET, "/verified/image.bin", False
+                )
+
+        self.assertEqual(rc, 1)
+        run.assert_not_called()
+
+    def test_valid_backup_preserves_flash_command_behavior(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            backup = Path(tmp) / "123-5.15.1.55.bin"
+            backup.write_bytes(b"complete-backup")
+            completed = subprocess.CompletedProcess([], 0)
+            with (
+                mock.patch.object(
+                    MODULE, "EXPECTED_BACKUP_BYTES", len(backup.read_bytes())
+                ),
+                mock.patch.object(MODULE, "backup_firmware", return_value=backup),
+                mock.patch.object(MODULE, "RS_FW_UPDATE", "rs-fw-update"),
+                mock.patch.object(
+                    MODULE.subprocess, "run", return_value=completed
+                ) as run,
+            ):
+                rc = MODULE.flash_cameras(
+                    [self.camera()], MODULE.TARGET, "/verified/image.bin", False
+                )
+
+        self.assertEqual(rc, 0)
+        run.assert_called_once()
+        self.assertEqual(
+            run.call_args.args[0],
+            ["rs-fw-update", "-s", "123", "-f", "/verified/image.bin"],
+        )
+
+    def test_symlink_backup_is_invalid_even_when_target_has_expected_size(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "target.bin"
+            target.write_bytes(b"complete-backup")
+            link = Path(tmp) / "backup.bin"
+            link.symlink_to(target)
+            with mock.patch.object(
+                MODULE, "EXPECTED_BACKUP_BYTES", len(target.read_bytes())
+            ):
+                self.assertFalse(MODULE.backup_artifact_is_valid(link))
 
 
 class ControllerHealthTests(unittest.TestCase):
