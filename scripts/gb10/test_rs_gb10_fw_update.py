@@ -5,11 +5,12 @@ import hashlib
 import importlib.util
 import io
 import os
+import stat
 import subprocess
 import tempfile
 import types
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -23,13 +24,30 @@ REAL_FSTAT = os.fstat
 
 
 def root_owned_fstat(fd):
-    """Return real lock metadata with the production root owner for tests."""
+    """Return full real metadata with the production root owner for tests."""
     metadata = REAL_FSTAT(fd)
-    return types.SimpleNamespace(
-        st_mode=metadata.st_mode,
-        st_nlink=metadata.st_nlink,
-        st_uid=0,
-    )
+    values = list(metadata)
+    values[4] = 0
+    return os.stat_result(values)
+
+
+def trusted_root_fstat(fd):
+    """Model root-owned, non-writable directory ancestry in a temp tree."""
+    metadata = root_owned_fstat(fd)
+    if stat.S_ISDIR(metadata.st_mode):
+        values = list(metadata)
+        values[0] &= ~(stat.S_IWGRP | stat.S_IWOTH)
+        return os.stat_result(values)
+    return metadata
+
+
+@contextmanager
+def trusted_backup_test_environment():
+    with (
+        mock.patch.object(MODULE, "require_firmware_privileges"),
+        mock.patch.object(MODULE.os, "fstat", side_effect=trusted_root_fstat),
+    ):
+        yield
 
 
 class FirmwareImageTests(unittest.TestCase):
@@ -88,7 +106,10 @@ class FirmwareBackupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             backup = Path(tmp) / "123-5.15.1.55.bin"
             backup.write_bytes(b"previous-good-backup")
-            with mock.patch.object(MODULE.subprocess, "run") as run:
+            with (
+                trusted_backup_test_environment(),
+                mock.patch.object(MODULE.subprocess, "run") as run,
+            ):
                 with self.assertRaisesRegex(
                     MODULE.SafetyGateError, "will not be overwritten"
                 ):
@@ -106,6 +127,7 @@ class FirmwareBackupTests(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0)
 
             with (
+                trusted_backup_test_environment(),
                 mock.patch.object(MODULE, "EXPECTED_BACKUP_BYTES", 16),
                 mock.patch.object(MODULE.subprocess, "run", side_effect=fake_run),
             ):
@@ -125,10 +147,11 @@ class FirmwareBackupTests(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0)
 
             def concurrent_create(_source, destination, **_kwargs):
-                Path(destination).write_bytes(b"concurrent-backup")
+                backup.write_bytes(b"concurrent-backup")
                 raise FileExistsError(destination)
 
             with (
+                trusted_backup_test_environment(),
                 mock.patch.object(MODULE, "EXPECTED_BACKUP_BYTES", 16),
                 mock.patch.object(MODULE.subprocess, "run", side_effect=fake_run),
                 mock.patch.object(MODULE.os, "link", side_effect=concurrent_create),
@@ -147,6 +170,7 @@ class FirmwareBackupTests(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
 
             with (
+                trusted_backup_test_environment(),
                 mock.patch.object(MODULE, "EXPECTED_BACKUP_BYTES", 16),
                 mock.patch.object(MODULE.subprocess, "run", side_effect=fake_run),
             ):
@@ -167,6 +191,7 @@ class FirmwareBackupTests(unittest.TestCase):
                 )
 
             with (
+                trusted_backup_test_environment(),
                 mock.patch.object(MODULE, "EXPECTED_BACKUP_BYTES", 16),
                 mock.patch.object(MODULE.subprocess, "run", side_effect=fake_run),
             ):
@@ -179,8 +204,11 @@ class FirmwareBackupTests(unittest.TestCase):
 
     def test_backup_command_launch_failure_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(
-                MODULE.subprocess, "run", side_effect=OSError("cannot execute")
+            with (
+                trusted_backup_test_environment(),
+                mock.patch.object(
+                    MODULE.subprocess, "run", side_effect=OSError("cannot execute")
+                ),
             ):
                 created = MODULE.backup_firmware(
                     "rs-fw-update", "123", "5.15.1.55", {}, tmp
@@ -243,6 +271,9 @@ class FirmwareBackupTests(unittest.TestCase):
                     MODULE, "EXPECTED_BACKUP_BYTES", len(backup.read_bytes())
                 ),
                 mock.patch.object(MODULE, "backup_firmware", return_value=backup),
+                mock.patch.object(
+                    MODULE, "backup_artifact_is_valid", return_value=True
+                ),
                 mock.patch.object(MODULE, "require_camera_idle") as idle,
                 mock.patch.object(MODULE, "RS_FW_UPDATE", "rs-fw-update"),
                 mock.patch.object(
@@ -291,6 +322,9 @@ class FirmwareBackupTests(unittest.TestCase):
                 mock.patch.object(
                     MODULE, "backup_firmware", side_effect=assert_lock_held
                 ),
+                mock.patch.object(
+                    MODULE, "backup_artifact_is_valid", return_value=True
+                ),
                 mock.patch.object(MODULE, "require_camera_idle"),
                 mock.patch.object(
                     MODULE.subprocess,
@@ -318,6 +352,85 @@ class FirmwareBackupTests(unittest.TestCase):
                 MODULE, "EXPECTED_BACKUP_BYTES", len(target.read_bytes())
             ):
                 self.assertFalse(MODULE.backup_artifact_is_valid(link))
+
+    def test_world_writable_backup_ancestry_fails_before_updater(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            backup_root = Path(tmp) / "backups"
+            with (
+                mock.patch.object(MODULE, "require_firmware_privileges"),
+                mock.patch.object(MODULE.os, "fstat", side_effect=root_owned_fstat),
+                mock.patch.object(MODULE.subprocess, "run") as run,
+                self.assertRaisesRegex(
+                    MODULE.SafetyGateError, "unsafe firmware backup directory"
+                ),
+            ):
+                MODULE.backup_firmware(
+                    "rs-fw-update", "123", "5.15.1.55", {}, backup_root
+                )
+
+        run.assert_not_called()
+
+    def test_symlink_backup_root_fails_before_updater(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "target"
+            target.mkdir()
+            backup_root = Path(tmp) / "backup-link"
+            backup_root.symlink_to(target, target_is_directory=True)
+            with (
+                trusted_backup_test_environment(),
+                mock.patch.object(MODULE.subprocess, "run") as run,
+                self.assertRaisesRegex(MODULE.SafetyGateError, "cannot securely open"),
+            ):
+                MODULE.backup_firmware(
+                    "rs-fw-update", "123", "5.15.1.55", {}, backup_root
+                )
+
+        run.assert_not_called()
+
+    def test_precreated_partial_symlink_is_never_opened_or_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            token = "deadbeefdeadbeef"
+            partial = Path(tmp) / f".123-5.15.1.55.bin.partial-{os.getpid()}-{token}"
+            victim = Path(tmp) / "victim"
+            victim.write_bytes(b"do-not-truncate")
+            partial.symlink_to(victim)
+            with (
+                trusted_backup_test_environment(),
+                mock.patch.object(MODULE.secrets, "token_hex", return_value=token),
+                mock.patch.object(MODULE.subprocess, "run") as run,
+                self.assertRaisesRegex(
+                    MODULE.SafetyGateError, "securely create exclusive"
+                ),
+            ):
+                MODULE.backup_firmware("rs-fw-update", "123", "5.15.1.55", {}, tmp)
+
+            self.assertEqual(victim.read_bytes(), b"do-not-truncate")
+            self.assertTrue(partial.is_symlink())
+            run.assert_not_called()
+
+    def test_same_size_partial_replacement_is_rejected_by_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+
+            def replace_partial(args, **_kwargs):
+                partial = Path(args[-1])
+                partial.unlink()
+                partial.write_bytes(b"forged-firmware")
+                return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+            with (
+                trusted_backup_test_environment(),
+                mock.patch.object(MODULE, "EXPECTED_BACKUP_BYTES", 15),
+                mock.patch.object(
+                    MODULE.subprocess, "run", side_effect=replace_partial
+                ),
+                self.assertRaisesRegex(MODULE.SafetyGateError, "identity changed"),
+            ):
+                MODULE.backup_firmware("rs-fw-update", "123", "5.15.1.55", {}, tmp)
+
+            self.assertFalse((Path(tmp) / "123-5.15.1.55.bin").exists())
+            replacements = list(Path(tmp).glob(".*.partial-*"))
+            self.assertEqual(len(replacements), 1)
+            self.assertEqual(replacements[0].read_bytes(), b"forged-firmware")
 
 
 class SerialSelectionTests(unittest.TestCase):
@@ -458,6 +571,11 @@ class PrivilegePreflightTests(unittest.TestCase):
         self.assertTrue(Path(command[image_index]).is_absolute())
         self.assertTrue(Path(MODULE.RS_FW_UPDATE).is_absolute())
         self.assertTrue(Path(MODULE.BACKUP_ROOT).is_absolute())
+        self.assertEqual(
+            Path(MODULE.BACKUP_ROOT),
+            Path("/var/lib/vigil/realsense-fw-backups"),
+        )
+        self.assertIn("LRS_FW_BACKUP_ROOT=/var/lib/vigil/realsense-fw-backups", command)
         self.assertTrue(Path(MODULE.JOURNALCTL).is_absolute())
 
 

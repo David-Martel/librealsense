@@ -47,7 +47,7 @@ python3.12/site-packages \
     LD_LIBRARY_PATH=/opt/vigil/opt/librealsense-v2.58.1-dgx-spark-gb10/lib \
     LRS_RS_FW_UPDATE=/opt/vigil/opt/librealsense-v2.58.1-dgx-spark-gb10/bin/\
 rs-fw-update \
-    LRS_FW_BACKUP_ROOT=/home/damartel/realsense-gb10-validation/fw-backups \
+    LRS_FW_BACKUP_ROOT=/var/lib/vigil/realsense-fw-backups \
     /usr/bin/python3.12 \
     /home/damartel/dev/repos/librealsense/scripts/gb10/rs-gb10-fw-update.py \
     --flash --serial 327122076391 \
@@ -59,6 +59,8 @@ import argparse
 import fcntl
 import hashlib
 import os
+import re
+import secrets
 import shlex
 import shutil
 import stat
@@ -83,7 +85,7 @@ RS_FW_UPDATE = os.environ.get(
     "/opt/vigil/opt/librealsense-v2.58.1-dgx-spark-gb10/bin/rs-fw-update",
 )
 BACKUP_ROOT = os.environ.get(
-    "LRS_FW_BACKUP_ROOT", "/home/damartel/realsense-gb10-validation/fw-backups"
+    "LRS_FW_BACKUP_ROOT", "/var/lib/vigil/realsense-fw-backups"
 )
 LOCK_PATH = "/run/lock/realsense-gb10-firmware.lock"
 JOURNALCTL = "/usr/bin/journalctl"
@@ -96,7 +98,7 @@ FLEET_SUDO_0060 = (
     "PYTHONPATH=/opt/vigil/opt/librealsense-v2.58.1-dgx-spark-gb10/lib/python3.12/site-packages",
     "LD_LIBRARY_PATH=/opt/vigil/opt/librealsense-v2.58.1-dgx-spark-gb10/lib",
     "LRS_RS_FW_UPDATE=/opt/vigil/opt/librealsense-v2.58.1-dgx-spark-gb10/bin/rs-fw-update",
-    "LRS_FW_BACKUP_ROOT=/home/damartel/realsense-gb10-validation/fw-backups",
+    "LRS_FW_BACKUP_ROOT=/var/lib/vigil/realsense-fw-backups",
     "/usr/bin/python3.12",
     "/home/damartel/dev/repos/librealsense/scripts/gb10/rs-gb10-fw-update.py",
     "--flash",
@@ -445,66 +447,244 @@ def require_camera_idle(camera):
     )
 
 
+def _backup_metadata_is_valid(metadata, *, expected_identity=None):
+    """Return whether metadata satisfies the privileged backup contract."""
+    identity = (metadata.st_dev, metadata.st_ino)
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_nlink == 1
+        and metadata.st_uid == 0
+        and stat.S_IMODE(metadata.st_mode) == 0o600
+        and metadata.st_size == EXPECTED_BACKUP_BYTES
+        and (expected_identity is None or identity == expected_identity)
+    )
+
+
 def backup_artifact_is_valid(path):
-    """Return whether path is a regular, complete firmware backup."""
+    """Return whether path is a complete root-owned firmware backup."""
     try:
         metadata = os.stat(path, follow_symlinks=False)
     except (OSError, TypeError):
         return False
-    return stat.S_ISREG(metadata.st_mode) and metadata.st_size == EXPECTED_BACKUP_BYTES
+    return _backup_metadata_is_valid(metadata)
+
+
+def _validate_backup_directory(metadata, path):
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise SafetyGateError(
+            f"unsafe firmware backup directory component {path}; require a "
+            "root-owned directory with no group/world write permission"
+        )
+
+
+@contextmanager
+def trusted_backup_directory(path):
+    """Open a root-controlled backup directory without following symlinks."""
+    require_firmware_privileges()
+    root = Path(path)
+    if not root.is_absolute() or any(part in (".", "..") for part in root.parts):
+        raise SafetyGateError(
+            f"firmware backup root must be an absolute normalized path: {root}"
+        )
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open("/", flags)
+    traversed = Path("/")
+    try:
+        _validate_backup_directory(os.fstat(descriptor), traversed)
+        for component in root.parts[1:]:
+            traversed /= component
+            try:
+                child = os.open(component, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                try:
+                    child = os.open(component, flags, dir_fd=descriptor)
+                except OSError as exc:
+                    raise SafetyGateError(
+                        f"cannot securely open firmware backup directory component "
+                        f"{traversed}: {exc}"
+                    ) from exc
+            except OSError as exc:
+                raise SafetyGateError(
+                    f"cannot securely open firmware backup directory component "
+                    f"{traversed}: {exc}"
+                ) from exc
+            try:
+                _validate_backup_directory(os.fstat(child), traversed)
+            except Exception:
+                os.close(child)
+                raise
+            os.close(descriptor)
+            descriptor = child
+        yield descriptor, root
+    finally:
+        os.close(descriptor)
+
+
+def _safe_backup_field(value, label):
+    value = str(value)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value):
+        raise SafetyGateError(f"unsafe {label} for firmware backup filename: {value!r}")
+    return value
+
+
+def _open_backup_file(directory_fd, name, flags, mode=None):
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    if mode is None:
+        return os.open(name, flags, dir_fd=directory_fd)
+    return os.open(name, flags, mode, dir_fd=directory_fd)
+
+
+def _path_identity(directory_fd, name):
+    descriptor = _open_backup_file(directory_fd, name, os.O_RDONLY)
+    try:
+        metadata = os.fstat(descriptor)
+        return (metadata.st_dev, metadata.st_ino), metadata
+    finally:
+        os.close(descriptor)
+
+
+def _unlink_if_identity(directory_fd, name, expected_identity):
+    """Remove only the partial created by this process."""
+    try:
+        actual_identity, _metadata = _path_identity(directory_fd, name)
+    except OSError:
+        return
+    if actual_identity == expected_identity:
+        os.unlink(name, dir_fd=directory_fd)
 
 
 def backup_firmware(rs_fw_update, serial, current_fw, env, backup_root=None):
-    """Back up firmware atomically and return its path, or None on failure."""
+    """Back up firmware into trusted storage and return its path on success."""
     if backup_root is None:
         backup_root = BACKUP_ROOT
-    os.makedirs(backup_root, exist_ok=True)
-    backup = os.path.join(backup_root, f"{serial}-{current_fw}.bin")
-    partial = f"{backup}.partial-{os.getpid()}"
-    if os.path.lexists(backup):
-        raise SafetyGateError(
-            f"backup already exists and will not be overwritten: {backup}"
-        )
-    if os.path.lexists(partial):
-        raise SafetyGateError(
-            f"stale partial backup requires operator inspection: {partial}"
-        )
+    serial = _safe_backup_field(serial, "serial")
+    current_fw = _safe_backup_field(current_fw, "firmware version")
+    backup_name = f"{serial}-{current_fw}.bin"
+    partial_name = f".{backup_name}.partial-{os.getpid()}-{secrets.token_hex(8)}"
 
-    try:
-        result = subprocess.run(
-            [rs_fw_update, "-s", serial, "-b", partial],
-            env=env,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except OSError:
+    with trusted_backup_directory(backup_root) as (directory_fd, root):
         try:
-            os.unlink(partial)
+            _path_identity(directory_fd, backup_name)
         except FileNotFoundError:
             pass
-        return None
-    diagnostic = f"{result.stdout}\n{result.stderr}"
-    if (
-        result.returncode != 0
-        or "Creating backup file failed" in diagnostic
-        or not backup_artifact_is_valid(partial)
-    ):
-        try:
-            os.unlink(partial)
-        except FileNotFoundError:
-            pass
-        return None
+        except OSError as exc:
+            raise SafetyGateError(
+                f"cannot securely inspect firmware backup destination "
+                f"{root / backup_name}: {exc}"
+            ) from exc
+        else:
+            raise SafetyGateError(
+                f"backup already exists and will not be overwritten: "
+                f"{root / backup_name}"
+            )
 
-    try:
-        os.link(partial, backup, follow_symlinks=False)
-    except FileExistsError as exc:
-        os.unlink(partial)
-        raise SafetyGateError(
-            f"backup appeared concurrently and was not overwritten: {backup}"
-        ) from exc
-    os.unlink(partial)
-    return backup if backup_artifact_is_valid(backup) else None
+        create_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+        try:
+            partial_fd = _open_backup_file(
+                directory_fd, partial_name, create_flags, mode=0o600
+            )
+        except OSError as exc:
+            raise SafetyGateError(
+                f"cannot securely create exclusive firmware backup partial in "
+                f"{root}: {exc}"
+            ) from exc
+        initial_metadata = os.fstat(partial_fd)
+        initial_identity = (initial_metadata.st_dev, initial_metadata.st_ino)
+        if (
+            not stat.S_ISREG(initial_metadata.st_mode)
+            or initial_metadata.st_nlink != 1
+            or initial_metadata.st_uid != 0
+            or stat.S_IMODE(initial_metadata.st_mode) != 0o600
+        ):
+            os.close(partial_fd)
+            _unlink_if_identity(directory_fd, partial_name, initial_identity)
+            raise SafetyGateError(
+                "new firmware backup partial did not satisfy the root-owned 0600 "
+                "single-link file contract"
+            )
+
+        partial_path = root / partial_name
+        try:
+            try:
+                result = subprocess.run(
+                    [rs_fw_update, "-s", serial, "-b", str(partial_path)],
+                    env=env,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+            except OSError:
+                return None
+
+            diagnostic = f"{result.stdout}\n{result.stderr}"
+            descriptor_metadata = os.fstat(partial_fd)
+            try:
+                path_identity, path_metadata = _path_identity(
+                    directory_fd, partial_name
+                )
+            except OSError as exc:
+                raise SafetyGateError(
+                    "firmware backup partial disappeared or became inaccessible "
+                    "during the updater run"
+                ) from exc
+            if path_identity != initial_identity:
+                raise SafetyGateError(
+                    "firmware backup partial identity changed during the updater run"
+                )
+            os.fsync(partial_fd)
+            if (
+                result.returncode != 0
+                or "Creating backup file failed" in diagnostic
+                or not _backup_metadata_is_valid(
+                    descriptor_metadata, expected_identity=initial_identity
+                )
+                or not _backup_metadata_is_valid(
+                    path_metadata, expected_identity=initial_identity
+                )
+            ):
+                return None
+
+            try:
+                os.link(
+                    partial_name,
+                    backup_name,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as exc:
+                raise SafetyGateError(
+                    f"backup appeared concurrently and was not overwritten: "
+                    f"{root / backup_name}"
+                ) from exc
+            final_identity, _final_metadata = _path_identity(directory_fd, backup_name)
+            if final_identity != initial_identity:
+                raise SafetyGateError(
+                    "installed firmware backup identity does not match verified partial"
+                )
+            os.unlink(partial_name, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+            _identity, final_metadata = _path_identity(directory_fd, backup_name)
+            if not _backup_metadata_is_valid(
+                final_metadata, expected_identity=initial_identity
+            ):
+                raise SafetyGateError(
+                    "installed firmware backup failed final metadata validation"
+                )
+            return str(root / backup_name)
+        finally:
+            os.close(partial_fd)
+            _unlink_if_identity(directory_fd, partial_name, initial_identity)
 
 
 def controller_green():
