@@ -8,7 +8,6 @@ import time
 
 pytestmark = [
     pytest.mark.device_each("D455"),
-    pytest.mark.context("weekly"),
 ]
 
 FPS = 30
