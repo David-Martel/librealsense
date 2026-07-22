@@ -77,12 +77,8 @@ if(RS2_GB10_USB_TUNING)
     message(STATUS "GB10 USB multistream mitigations enabled (RS2_GB10_USB_TUNING=1)")
 endif()
 
-# GB10 / DGX Spark pointcloud shared-memory experiment (opt-in; OFF upstream). When enabled, the
-# CUDA pointcloud path gains a runtime-selectable zero-copy ladder (RS2_PC_MODE 0/1/2, default 0 =
-# unmodified). Lets us measure what unified memory buys without diverging from upstream by default.
 if(RS2_GB10_PC_ZEROCOPY)
-    target_compile_definitions(${LRS_TARGET} PRIVATE RS2_GB10_PC_ZEROCOPY=1)
-    message(STATUS "GB10 pointcloud zero-copy ladder enabled (RS2_GB10_PC_ZEROCOPY=1; RS2_PC_MODE 0/1/2)")
+    message(FATAL_ERROR "RS2_GB10_PC_ZEROCOPY is retired; v2.58.3 uses per-instance persistent CUDA pointcloud buffers")
 endif()
 
 # GB10 / DGX Spark YUYV->color cached-buffer experiment (opt-in; OFF upstream). When enabled, the

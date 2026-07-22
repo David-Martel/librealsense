@@ -43,12 +43,9 @@ FORCE_RSUSB="${LRS_GB10_FORCE_RSUSB:-ON}"
 # Enable GB10-specific USB mitigations (P2 URB pool depth + P4 watchdog rate-limit + stop settle).
 # Set LRS_GB10_USB_TUNING=0 to produce a vanilla build without the GB10 defaults baked in.
 GB10_USB_TUNING="${LRS_GB10_USB_TUNING:-1}"
-# CUDA cached-buffer ladders, PROMOTED TO DEFAULT (measured: pointcloud 3.3x faster, conversion
-# ~NEON-parity; both byte-identical to baseline, max-abs-diff 0). Default ON here: the ladder is
-# compiled in AND the runtime default is mode 1 (cached) -- see rs2_pc_mode()/rs2_conv_mode().
-# These defines are #if-guarded, so an UPSTREAM cmake build without them is byte-identical; only this
-# GB10 build profile bakes the cached path in. Set =0 to opt back out to the per-frame-malloc baseline.
-GB10_PC_ZEROCOPY="${LRS_GB10_PC_ZEROCOPY:-1}"
+# v2.58.3 owns persistent pointcloud buffers per helper instance.  Keep the retired process-static
+# GB10 ladder explicitly disabled so stale build environments cannot reintroduce it.
+GB10_PC_ZEROCOPY="${LRS_GB10_PC_ZEROCOPY:-0}"
 GB10_CONV_CACHE="${LRS_GB10_CONV_CACHE:-1}"
 # Opt-in to building the unit-test target alongside the SDK (off by default in GB10 builds to
 # avoid requiring Catch2 unless the user explicitly wants tests).
@@ -92,9 +89,8 @@ Useful environment:
                            Python install dir, default under the GB10 prefix
   LRS_GB10_USB_TUNING      Bake in GB10 USB mitigations (RS2_GB10_USB_TUNING=1),
                            default 1 (ON). Set to 0 for a vanilla build.
-  LRS_GB10_PC_ZEROCOPY     Pointcloud cached-buffer ladder, default 1 (ON +
-                           runtime mode 1 = cached, 3.3x faster). Set 0 to opt out
-                           (or RS2_PC_MODE=0 at runtime for the malloc baseline).
+  LRS_GB10_PC_ZEROCOPY     Retired process-static pointcloud ladder; must remain 0.
+                           v2.58.3 reuses per-instance CUDA buffers by default.
   LRS_GB10_CONV_CACHE      YUYV->color cached-buffer ladder, default 1 (ON +
                            runtime mode 1 = cached, ~NEON-parity). Set 0 to opt out
                            (or RS2_CONV_MODE=0 at runtime for the malloc baseline).
