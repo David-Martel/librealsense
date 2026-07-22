@@ -460,7 +460,7 @@ try
 
     auto devs = ctx.query_devices();
 
-    if (selected_serial_number.empty() && devs.size() > 1)
+    if (state->selected_serial_number.empty() && devs.size() > 1)
     {
         std::cout << std::endl << "Several devices are connected, serial number must be selected using -s <serial_number>" << std::endl;
         return EXIT_FAILURE;
@@ -546,7 +546,7 @@ try
 
     if (!device_found)
     {
-        if (!selected_serial_number.empty())
+        if (!state->selected_serial_number.empty())
             std::cout << std::endl << "Couldn't find the requested serial number" << std::endl;
         else if (devs.size() == 1)
         {

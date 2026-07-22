@@ -26,11 +26,18 @@ fi
 GENERATOR="${LRS_GB10_GENERATOR:-Ninja}"
 # Toolchain arch: default -mcpu=native (best perf on THIS host, but binaries are host-CPU-specific and
 # GCC 13.3 silently degrades 'native' to an armv8-a baseline on Cortex-X925). Set LRS_GB10_REPRODUCIBLE=1
-# for an explicit, portable, reproducible GB10 arch (-mcpu=cortex-x925) instead of 'native'.
+# for an explicit GB10 ISA and a GCC-13-supported tuning target. GCC 13.3 rejects both
+# -mcpu=cortex-x925 and -mcpu=cortex-a725; both Spark core classes expose Armv9.2-A, SVE2, BF16, and I8MM.
 if [[ "${LRS_GB10_REPRODUCIBLE:-0}" == "1" ]]; then
-  ARCH_FLAG="${LRS_GB10_ARCH:--mcpu=cortex-x925}"
+  ARCH_FLAG="${LRS_GB10_ARCH:--march=armv9.2-a+sve2+bf16+i8mm -mtune=neoverse-v2}"
 else
   ARCH_FLAG="${LRS_GB10_ARCH:--mcpu=native}"
+fi
+read -r -a ARCH_ARGS <<< "$ARCH_FLAG"
+CXX_COMPILER="${CXX:-c++}"
+if ! printf 'int main() { return 0; }\n' | "$CXX_COMPILER" "${ARCH_ARGS[@]}" -x c++ -c -o /dev/null -; then
+  echo "ERROR: C++ compiler '$CXX_COMPILER' rejects LRS_GB10_ARCH='$ARCH_FLAG'" >&2
+  exit 1
 fi
 NATIVE_FLAGS="${LRS_GB10_NATIVE_FLAGS:--O3 -DNDEBUG $ARCH_FLAG -ffunction-sections -fdata-sections}"
 LINK_FLAGS="${LRS_GB10_LINK_FLAGS:--Wl,--gc-sections}"
