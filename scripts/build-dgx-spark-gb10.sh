@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="${LRS_GB10_BUILD_DIR:-/opt/vigil/build/librealsense-v2.58.1-dgx-spark-gb10}"
-PREFIX="${LRS_GB10_PREFIX:-/opt/vigil/opt/librealsense-v2.58.1-dgx-spark-gb10}"
+BUILD_DIR="${LRS_GB10_BUILD_DIR:-/opt/vigil/build/librealsense-v2.58.3-dgx-spark-gb10}"
+PREFIX="${LRS_GB10_PREFIX:-/opt/vigil/opt/librealsense-v2.58.3-dgx-spark-gb10}"
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 CUDA_ARCH="${LRS_GB10_CUDA_ARCH:-121}"
 JOBS="${LRS_GB10_JOBS:-$(nproc)}"
