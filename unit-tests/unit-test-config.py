@@ -384,7 +384,7 @@ if len(shared_tests):
     handle.write( 'else()\n' )
     for test in shared_tests:
         handle.write( '    add_subdirectory( ' + test + ' )\n' )
-        log.d( '... including:', sdir )
+        log.d( '... including:', test )
         n_tests += 1
     handle.write( 'endif()\n' )
 if len(static_tests):
@@ -393,7 +393,7 @@ if len(static_tests):
     handle.write( 'else()\n' )
     for test in static_tests:
         handle.write( '    add_subdirectory( ' + test + ' )\n' )
-        log.d( '... including:', sdir )
+        log.d( '... including:', test )
         n_tests += 1
     handle.write( 'endif()\n' )
 handle.close()
@@ -402,4 +402,3 @@ print( 'Generated ' + str(n_tests) + ' unit-tests' )
 if log.n_errors():
     sys.exit(1)
 sys.exit(0)
-
