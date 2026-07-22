@@ -117,14 +117,34 @@ namespace librealsense
         else
         {
             auto color_devs_info_mi0 = filter_by_mi(group.uvc_devices, 0);
-            // one uvc device is seen over Windows and 3 uvc devices are seen over linux
-            if (color_devs_info_mi0.size() == 1 || color_devs_info_mi0.size() == 3)
+            // Color is part of the depth sensor when MI0 enumerates as:
+            // 1 UVC device on Windows, 3 UVC devices on Linux, or 2 UVC devices for RS401_GMSL on MIPI.
+            if (color_devs_info_mi0.size() == 1 || color_devs_info_mi0.size() == 3
+                || (_is_mipi_device && _pid == ds::RS401_GMSL_PID && color_devs_info_mi0.size() == 2))
             {
                 // means color end point is part of the depth sensor (e.g. D405, D401_GMSL)
                 color_devs_info = color_devs_info_mi0;
                 _color_device_idx = _depth_device_idx;
                 d400_device::_color_stream = _color_stream;
                 _separate_color = false;
+
+                // D401 GMSL exposes color through the depth sensor, but color streams from a dedicated
+                // v4l2 node (video-rs-color) that also owns the RGB controls (saturation, white balance,
+                // sharpness, ...) - the depth/front node does not. The depth sensor wraps all mi0 nodes in
+                // a multi_pins_uvc_device that routes every control to the front (depth) node, so RGB
+                // controls never reach the color node. Bind a raw endpoint to the color node for them.
+                if (_is_mipi_device && _pid == ds::RS401_GMSL_PID)
+                {
+                    auto color_node = std::find_if(color_devs_info_mi0.begin(), color_devs_info_mi0.end(),
+                        [](const platform::uvc_device_info& info) { return info.device_path.find("color") != std::string::npos; });
+                    if (color_node != color_devs_info_mi0.end())
+                    {
+                        auto color_uvc_node = get_backend()->create_uvc_device(*color_node);
+                        if (color_uvc_node)
+                            _raw_color_ep = std::make_shared<uvc_sensor>("Raw RGB Camera", color_uvc_node,
+                                std::unique_ptr<frame_timestamp_reader>(new ds_timestamp_reader()), this);
+                    }
+                }
             }
             else
                 throw invalid_value_exception( rsutils::string::from() << "RS4XX: RGB modules inconsistency - "
@@ -175,6 +195,12 @@ namespace librealsense
     {
         auto& color_ep = get_color_sensor();
 
+        // MIPI RGB controls require FW >= 5.17.3.15 and d4xx kernel driver >= 1.0.4.9.
+        const bool mipi_rgb_controls_supported = _is_mipi_device
+            && _fw_version >= firmware_version("5.17.3.15")
+            && supports_info(RS2_CAMERA_INFO_MIPI_DRIVER_VERSION)
+            && rsutils::version(get_info(RS2_CAMERA_INFO_MIPI_DRIVER_VERSION)) >= rsutils::version("1.0.4.9");
+
         if (!_is_mipi_device)
         {
             _ds_color_common->register_color_options();
@@ -188,11 +214,38 @@ namespace librealsense
                     { 2.f, "60Hz" },
                     { 3.f, "Auto" }, }));
         }
+        else if (mipi_rgb_controls_supported)
+        {
+            // RGB controls registered for USB but not yet for MIPI (no FW/kernel support):
+            //   RS2_OPTION_BRIGHTNESS, RS2_OPTION_CONTRAST, RS2_OPTION_GAMMA,
+            //   RS2_OPTION_BACKLIGHT_COMPENSATION, RS2_OPTION_HUE
+            // For D401 GMSL the color node differs from the depth (front) node, so route the RGB
+            // controls to the dedicated color endpoint; other devices use the shared raw color sensor.
+            auto raw_color_ep = _raw_color_ep ? _raw_color_ep : get_raw_color_sensor();
+
+            color_ep.register_option(RS2_OPTION_SATURATION, std::make_shared<uvc_pu_option>(raw_color_ep, RS2_OPTION_SATURATION));
+            color_ep.register_option(RS2_OPTION_SHARPNESS, std::make_shared<uvc_pu_option>(raw_color_ep, RS2_OPTION_SHARPNESS));
+
+            auto white_balance_option = std::make_shared<uvc_pu_option>(raw_color_ep, RS2_OPTION_WHITE_BALANCE);
+            auto auto_white_balance_option = std::make_shared<uvc_pu_option>(raw_color_ep, RS2_OPTION_ENABLE_AUTO_WHITE_BALANCE);
+            color_ep.register_option(RS2_OPTION_ENABLE_AUTO_WHITE_BALANCE, auto_white_balance_option);
+            color_ep.register_option(RS2_OPTION_WHITE_BALANCE,
+                std::make_shared<auto_disabling_control>(
+                    white_balance_option,
+                    auto_white_balance_option));
+
+            color_ep.register_option(RS2_OPTION_POWER_LINE_FREQUENCY,
+                std::make_shared<uvc_pu_option>(raw_color_ep, RS2_OPTION_POWER_LINE_FREQUENCY,
+                    std::map<float, std::string>{ { 0.f, "Disabled"},
+                    { 1.f, "50Hz" },
+                    { 2.f, "60Hz" },
+                    { 3.f, "Auto" }, }));
+        }
 
         if (_separate_color)
         {
-            // Currently disabled for certain sensors
-            if (!_is_mipi_device)
+            // Auto exposure priority is supported on all RGB sensors except D401/GMSL
+            if (!_is_mipi_device || (mipi_rgb_controls_supported && _pid != ds::RS401_GMSL_PID))
             {
                 color_ep.register_pu(RS2_OPTION_AUTO_EXPOSURE_PRIORITY);
             }
@@ -242,7 +295,17 @@ namespace librealsense
                 offsetof(md_rgb_mode, rgb_mode) +
                 offsetof(md_rgb_normal_mode, intel_rgb_control);
 
-            color_ep.register_metadata(RS2_FRAME_METADATA_AUTO_EXPOSURE, make_attribute_parser(&md_rgb_control::ae_mode, md_rgb_control_attributes::ae_mode_attribute, md_prop_offset));
+            // FW < 5.17.3.0 reports ae_mode as 1=on/0=off; FW >= 5.17.3.0 reports
+            // the UVC-spec values 1=Manual, 8=Aperture Priority.
+            if (_fw_version >= firmware_version(5, 17, 3, 0))
+            {
+                color_ep.register_metadata(RS2_FRAME_METADATA_AUTO_EXPOSURE, make_attribute_parser(&md_rgb_control::ae_mode, md_rgb_control_attributes::ae_mode_attribute, md_prop_offset,
+                    [](rs2_metadata_type param) { return (param != 1); }));
+            }
+            else
+            {
+                color_ep.register_metadata(RS2_FRAME_METADATA_AUTO_EXPOSURE, make_attribute_parser(&md_rgb_control::ae_mode, md_rgb_control_attributes::ae_mode_attribute, md_prop_offset));
+            }
         }
 
         _ds_color_common->register_metadata();
@@ -255,7 +318,7 @@ namespace librealsense
         // attributes of md_rgb_control
         auto raw_color_ep = get_raw_color_sensor();
 
-        if (!_is_mipi_device)
+        if ( !_is_mipi_device || platform::get_jetson_driver_version() >= rsutils::version("1.0.4.9"))
         {
             color_ep.register_processing_block(processing_block_factory::create_pbf_vector<yuy2_converter>(RS2_FORMAT_YUYV, map_supported_color_formats(RS2_FORMAT_YUYV), RS2_STREAM_COLOR));
             color_ep.register_processing_block(processing_block_factory::create_id_pbf(RS2_FORMAT_RAW16, RS2_STREAM_COLOR));
@@ -276,6 +339,7 @@ namespace librealsense
             }
             else
             {
+                // MIPI on x86 (ADL-P)
                 color_ep.register_processing_block(processing_block_factory::create_pbf_vector<yuy2_converter>(RS2_FORMAT_YUYV, map_supported_color_formats(RS2_FORMAT_YUYV), RS2_STREAM_COLOR));
             }
         }        

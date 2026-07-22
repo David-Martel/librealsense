@@ -14,7 +14,9 @@
 #include <realdds/topics/device-info-msg.h>
 #include <realdds/topics/image-msg.h>
 #include <realdds/topics/imu-msg.h>
+#include <realdds/topics/string-msg.h>
 #include <realdds/topics/dds-topic-names.h>
+#include <src/object-detection-frame.h>
 
 #include <src/core/options-registry.h>
 #include <src/core/frame-callback.h>
@@ -34,10 +36,12 @@
 #include <dds/rs-dds-device-proxy.h>
 #include <dds/rs-dds-embedded-decimation-filter.h>
 #include <dds/rs-dds-embedded-temporal-filter.h>
+#include <dds/rs-dds-embedded-close-range-filter.h>
 
 #include <src/ds/ds-private.h>
 
 #include "rs-dds-depth-sensor-proxy.h"
+#include "rs-dds-inference-sensor-proxy.h"
 
 #include <cmath>
 
@@ -52,7 +56,6 @@ dds_sensor_proxy::dds_sensor_proxy( std::string const & sensor_name,
                                     software_device * owner,
                                     std::shared_ptr< realdds::dds_device > const & dev )
     : software_sensor( sensor_name, owner )
-    , global_time_interface()
     , _dev( dev )
     , _name( sensor_name )
     , _md_enabled( dev->supports_metadata() )
@@ -204,6 +207,11 @@ void dds_sensor_proxy::register_converters()
 
     // Confidence
     _formats_converter.register_converter( processing_block_factory::create_id_pbf( RS2_FORMAT_RAW8, RS2_STREAM_CONFIDENCE ) );
+
+    // Inference
+    _formats_converter.register_converter( { { { RS2_FORMAT_Y8, RS2_STREAM_OBJECT_DETECTION } },
+                                             { { RS2_FORMAT_Y8, RS2_STREAM_OBJECT_DETECTION } },
+                                            []() { return std::make_shared< identity_processing_block >(); } } );
 }
 
 
@@ -242,8 +250,8 @@ dds_sensor_proxy::find_profile( sid_index sidx, realdds::dds_video_stream_profil
 }
 
 
-std::shared_ptr< realdds::dds_motion_stream_profile >
-dds_sensor_proxy::find_profile( sid_index sidx, realdds::dds_motion_stream_profile const & profile ) const
+std::shared_ptr< realdds::dds_stream_profile >
+dds_sensor_proxy::find_profile( sid_index sidx, realdds::dds_stream_profile const & profile ) const
 {
     auto it = _streams.find( sidx );
     if( it == _streams.end() )
@@ -255,14 +263,13 @@ dds_sensor_proxy::find_profile( sid_index sidx, realdds::dds_motion_stream_profi
         auto & stream = it->second;
         for( auto & sp : stream->profiles() )
         {
-            auto msp = std::static_pointer_cast< realdds::dds_motion_stream_profile >( sp );
-            if( profile.frequency() == msp->frequency() )
+            if( profile.frequency() == sp->frequency() )
             {
-                return msp;
+                return sp;
             }
         }
     }
-    return std::shared_ptr< realdds::dds_motion_stream_profile >();
+    return std::shared_ptr< realdds::dds_stream_profile >();
 }
 
 
@@ -293,6 +300,14 @@ realdds::dds_stream_profiles dds_sensor_proxy::find_dds_profiles( const libreals
             else
                 LOG_ERROR( "no profile found in stream for rs2 profile " << sp );
         }
+        else if( sp->get_stream_type() == RS2_STREAM_OBJECT_DETECTION )
+        {
+            auto inference_profile = find_profile( sidx, realdds::dds_inference_stream_profile( source_profiles[i]->get_framerate() ) );
+            if( inference_profile )
+                realdds_profiles.push_back( inference_profile );
+            else
+                LOG_ERROR( "no profile found in stream for rs2 profile " << sp );
+        }
         else
         {
             LOG_ERROR( "unknown stream profile type for rs2 profile " << sp );
@@ -304,9 +319,13 @@ realdds::dds_stream_profiles dds_sensor_proxy::find_dds_profiles( const libreals
 
 void dds_sensor_proxy::open( const stream_profiles & profiles )
 {
-    _formats_converter.prepare_to_convert( profiles );
     _active_converted_profiles = profiles;
-    const auto & source_profiles = _formats_converter.get_active_source_profiles();
+    auto source_profiles = profiles; // Start with user requested profiles
+    if( get_format_conversion() != format_conversion::raw )
+    {
+        _formats_converter.prepare_to_convert( profiles );
+        source_profiles = _formats_converter.get_active_source_profiles(); // Override with profiles that should be opened on the device
+    }
     // TODO - register processing block options?
 
     for( size_t i = 0; i < source_profiles.size(); ++i )
@@ -362,12 +381,11 @@ void dds_sensor_proxy::handle_video_data( std::vector< uint8_t > && buffer,
         = static_cast< rs2_time_t >( realdds::time_to_double( dds_sample.reception_timestamp ) * SECONDS_TO_MILLISEC );
     data.timestamp               // in ms
         = static_cast< rs2_time_t >( realdds::time_to_double( timestamp ) * SECONDS_TO_MILLISEC );
+    data.last_timestamp = streaming.last_timestamp.exchange( data.timestamp );
     data.timestamp_domain;  // from metadata, or leave default (hardware domain)
     data.depth_units;       // from metadata
     data.frame_number;      // filled in only once metadata is known
     data.raw_size = static_cast< uint32_t >( buffer.size() );
-
-    update_timestamp_if_needed( data, streaming );
 
     auto vid_profile = dynamic_cast< video_stream_profile_interface * >( profile.get() );
     if( ! vid_profile )
@@ -378,11 +396,10 @@ void dds_sensor_proxy::handle_video_data( std::vector< uint8_t > && buffer,
     auto stride = static_cast< int >(height > 0 ? data.raw_size / height : data.raw_size );
     auto expected_bpp = get_image_bpp(vid_profile->get_format()) / 8;
     auto expected_size = height * width * expected_bpp;
-    if (data.raw_size != expected_size)
-        throw invalid_value_exception(rsutils::string::from() << "Received frame with unexpected size " << data.raw_size << ", expected " << expected_size);
+    if( data.raw_size != expected_size )
+        throw invalid_value_exception( rsutils::string::from() << "Received frame with unexpected size " << data.raw_size << ", expected " << expected_size );
 
-
-    auto new_frame_interface = allocate_new_video_frame( vid_profile, stride, expected_bpp, std::move( data ) );
+    auto new_frame_interface = allocate_new_video_frame( vid_profile, stride, expected_bpp, std::move( data ) );    
     if( ! new_frame_interface )
         return;
 
@@ -414,12 +431,11 @@ void dds_sensor_proxy::handle_motion_data( realdds::topics::imu_msg && imu,
         = static_cast< rs2_time_t >( realdds::time_to_double( sample.reception_timestamp ) * SECONDS_TO_MILLISEC );
     data.timestamp               // in ms
         = static_cast< rs2_time_t >( realdds::time_to_double( imu.timestamp() ) * SECONDS_TO_MILLISEC );
+    data.last_timestamp = streaming.last_timestamp.exchange( data.timestamp );
     data.timestamp_domain;  // leave default (hardware domain)
     data.last_frame_number = streaming.last_frame_number.fetch_add( 1 );
     data.frame_number = data.last_frame_number + 1;
     data.raw_size = sizeof( rs2_combined_motion );
-
-    update_timestamp_if_needed( data, streaming );
 
     auto new_frame_interface = allocate_new_frame( RS2_EXTENSION_MOTION_FRAME, profile.get(), std::move( data ) );
     if( ! new_frame_interface )
@@ -462,6 +478,122 @@ void dds_sensor_proxy::handle_new_metadata( std::string const & stream_name,
             throw std::runtime_error( "missing metadata header/timestamp" );
     }
     // else we're not streaming -- must be another client that's subscribed
+}
+
+
+void dds_sensor_proxy::handle_inference_data( realdds::topics::string_msg && msg,
+                                              realdds::dds_sample && sample,
+                                              const std::shared_ptr< stream_profile_interface > & profile,
+                                              streaming_impl & streaming )
+{
+    json j;
+    try
+    {
+        j = json::parse( msg.data() );
+    }
+    catch( json::exception const & e )
+    {
+        LOG_ERROR( "Failed to parse inference JSON: " << e.what() );
+        return;
+    }
+
+    frame_additional_data data;                   // with NO metadata by default!
+    data.system_time = time_service::get_time();  // time of arrival in system clock
+    data.backend_timestamp                        // time when the underlying backend (DDS) received it
+        = static_cast< rs2_time_t >( realdds::time_to_double( sample.reception_timestamp ) * SECONDS_TO_MILLISEC );
+    if( auto ts_j = j.nested( "timestamp_us" ) )  // timestamp as provided by the inference engine, convert to millisec
+        data.timestamp = ts_j.get< double >() * MICROSEC_TO_MILLISEC;
+    data.last_timestamp = streaming.last_timestamp.exchange( data.timestamp );
+    data.timestamp_domain;                        // leave default (hardware domain)
+    // If frame_id supplied, we try to use it. If not supplied, we use an increasing counter.
+    if( j.nested( "frame_id" ).get_ex( data.frame_number ) )
+    {
+        data.last_frame_number = streaming.last_frame_number.exchange( data.frame_number );
+        if( data.frame_number != data.last_frame_number + 1 && data.last_frame_number )
+            LOG_DEBUG( get_string( profile->get_stream_type() ) << " frame drop? Expecting " << data.last_frame_number + 1 << ", got " << data.frame_number );
+    }
+    else
+    {
+        data.last_frame_number = streaming.last_frame_number.fetch_add( 1 );
+        data.frame_number = data.last_frame_number + 1;
+    }
+
+    frame_interface * new_frame_interface;
+    auto n_detections = j.nested( "number_of_detections" ).default_value< uint16_t >( 0 );
+    auto detections_j = j.nested( "detections" );
+    if( ! detections_j.is_array() || detections_j.size() != n_detections )
+    {
+        LOG_ERROR( "Invalid detections array received" );
+        return;
+    }
+    
+    // Compute total buffer size: payload base (without detection entries) + detection entries
+    size_t const base_size = sizeof( object_detection_frame::object_detection_payload )
+                           - sizeof( object_detection_frame::object_detection_entry );
+    size_t const detections_size = n_detections * sizeof( object_detection_frame::object_detection_entry );
+    size_t const total_size = base_size + detections_size;
+
+    data.raw_size = static_cast< uint32_t >( total_size );
+
+    if (n_detections > 0)
+    {
+        new_frame_interface = allocate_new_frame( RS2_EXTENSION_OBJECT_DETECTION_FRAME, profile.get(), std::move( data ) );
+    }
+    else
+    {
+        // Currently only object detection frames are supported in inference streams, but in future, when we have more
+        // types of inference frames, we will want to allocate the correct type. For now, we allocate the same
+        // object detection frame type.
+        new_frame_interface = allocate_new_frame( RS2_EXTENSION_OBJECT_DETECTION_FRAME, profile.get(), std::move( data ) );
+        //new_frame_interface = allocate_new_frame( RS2_EXTENSION_INFERENCE_FRAME, profile.get(), std::move( data ) );
+    }
+    if( ! new_frame_interface )
+    {
+        LOG_ERROR( "Failed to allocate new frame" );
+        return;
+    }
+
+    auto new_frame = static_cast< frame * >( new_frame_interface );
+    new_frame->data.resize( total_size );
+    auto * payload = reinterpret_cast< object_detection_frame::object_detection_payload * >( new_frame->data.data() );
+
+    // Fill payload fields
+    payload->timestamp_ms = new_frame->additional_data.timestamp;
+    payload->frame_id = new_frame->additional_data.frame_number;
+    payload->number_of_detections = n_detections;
+    payload->source = static_cast< uint8_t >( object_detection_frame::source::RGB ); // Currently only RGB is supported.
+    j.nested( "source_frame_id" ).get_ex( payload->source_frame_id );
+
+    // Fill detection entries
+    for( uint16_t idx = 0; idx < n_detections; ++idx )
+    {
+        auto & entry = payload->detections[idx];
+        auto const & det = detections_j[idx];
+
+        entry.detection_id = idx;  // For future use - currently not supported by detection engines
+        det.nested( "class_id" ).get_ex( entry.detection_type );
+        det.nested( "confidence" ).get_ex( entry.confidence );
+        det.nested( "x1" ).get_ex( entry.top_left_x );
+        det.nested( "y1" ).get_ex( entry.top_left_y );
+        det.nested( "x2" ).get_ex( entry.bottom_right_x );
+        det.nested( "y2" ).get_ex( entry.bottom_right_y );
+        det.nested( "distance" ).get_ex( entry.distance );
+    }
+    
+    // Fill header
+    payload->header.magic_number = object_detection_frame::MAGIC_NUMBER;
+    j.nested( "version" ).get_ex( payload->header.version );
+    payload->header.data_type = static_cast< uint8_t >( inference_frame::type::OBJECT_DETECTION );
+    payload->header.flags = 0;
+    payload->header.size  = static_cast< uint32_t >( total_size - sizeof( object_detection_frame::object_detection_frame_header ) );
+    payload->header.spare = 0;
+    uint8_t * payload_data = reinterpret_cast< uint8_t * >( payload ) + sizeof( object_detection_frame::object_detection_frame_header );
+    payload->header.crc32 = rsutils::number::calc_crc32( payload_data, payload->header.size );
+
+    // No metadata for inference streams, therefore no syncer
+    invoke_new_frame( new_frame,
+                      nullptr,    // pixels are already inside new_frame->data
+                      nullptr );  // so no deleter is necessary
 }
 
 
@@ -508,8 +640,7 @@ void dds_sensor_proxy::add_frame_metadata( frame * const f,
     // purposes, so we ignore here. The domain is optional, and really only rs-dds-adapter communicates it
     // because the source is librealsense...
     f->additional_data.timestamp;
-    if( ! _handle_global_timestamp_locally )
-        md_header.nested( realdds::topics::metadata::header::key::timestamp_domain ).get_ex( f->additional_data.timestamp_domain );
+    md_header.nested( realdds::topics::metadata::header::key::timestamp_domain ).get_ex( f->additional_data.timestamp_domain );
 
     if( ! md.empty() )
     {
@@ -538,9 +669,6 @@ void dds_sensor_proxy::start( rs2_frame_callback_sptr callback )
 {
     // Remove leftovers from previous starts.
     _streaming_by_name.clear();
-
-    if( _handle_global_timestamp_locally )
-        enable_time_diff_keeper( true );
 
     for( auto & profile : sensor_base::get_active_streams() )
     {
@@ -587,16 +715,29 @@ void dds_sensor_proxy::start( rs2_frame_callback_sptr callback )
                         handle_motion_data( std::move( imu ), std::move( sample ), profile, streaming );
                 } );
         }
+        else if( auto dds_inference_stream = std::dynamic_pointer_cast< realdds::dds_inference_stream >( dds_stream ) )
+        {
+            dds_inference_stream->on_data_available(
+                [profile, this, &streaming]( realdds::topics::string_msg && msg, realdds::dds_sample && sample )
+                {
+                    if( _is_streaming )
+                        handle_inference_data( std::move( msg ), std::move( sample ), profile, streaming );
+                } );
+        }
         else
             throw std::runtime_error( "Unsupported stream type" );
 
         dds_stream->start_streaming();
     }
 
-    _formats_converter.set_frames_callback( callback );
-    const auto && process_cb = make_frame_callback( [&, this]( frame_holder f ) {
-        _formats_converter.convert_frame( f );
-    } );
+    rs2_frame_callback_sptr process_cb = callback;
+    if( get_format_conversion() != format_conversion::raw )
+    {
+        _formats_converter.set_frames_callback( callback );
+        process_cb = make_frame_callback( [&, this]( frame_holder f ) {
+            _formats_converter.convert_frame( f );
+        } );
+    }
 
     software_sensor::start( process_cb );
 }
@@ -630,6 +771,10 @@ void dds_sensor_proxy::stop()
         {
             dds_motion_stream->on_data_available( nullptr );
         }
+        else if( auto dds_inference_stream = std::dynamic_pointer_cast< realdds::dds_inference_stream >( dds_stream ) )
+        {
+            dds_inference_stream->on_data_available( nullptr );
+        }
         else
             throw std::runtime_error( "Unsupported stream type" );
     }
@@ -641,15 +786,16 @@ void dds_sensor_proxy::stop()
     // and after software_sensor::stop cause to make sure _is_streaming is false
     // Removed here, same reason of killing on_frame_ready lambda instance. Moved to start()
     //_streaming_by_name.clear();
-
-    if( _handle_global_timestamp_locally )
-        enable_time_diff_keeper( false );
 }
 
 
 void dds_sensor_proxy::close()
 {
-    const auto & source_profiles = _formats_converter.get_active_source_profiles();
+    auto source_profiles = _active_converted_profiles;
+    if( get_format_conversion() != format_conversion::raw )
+    {
+        source_profiles = _formats_converter.get_active_source_profiles();
+    }
     realdds::dds_stream_profiles realdds_profiles = find_dds_profiles( source_profiles );
 
     try
@@ -703,7 +849,11 @@ void dds_sensor_proxy::add_option( std::shared_ptr< realdds::dds_option > option
     }
 
     if( get_option_handler( option_id ) )
-        throw std::runtime_error( "option '" + option->get_name() + "' already exists in sensor" );
+    {
+        // Option might already be registered by another stream of this sensor, in that case, we just ignore it.
+        LOG_DEBUG( "option '" + option->get_name() + "' already exists in sensor '" + get_name() + "'" );
+        return;
+    }
 
     //LOG_DEBUG( "... option -> " << option->get_name() );
     auto opt = std::make_shared< rs_dds_option >(
@@ -738,65 +888,12 @@ void dds_sensor_proxy::add_option( std::shared_ptr< realdds::dds_option > option
     }
 }
 
+
 void dds_sensor_proxy::add_local_options()
 {
-    // If device has global time option (e.g. rs-dds-adapter), we don't add local handling.
-    auto global_timestamp_option = _options_by_id.find( RS2_OPTION_GLOBAL_TIME_ENABLED );
-    if( global_timestamp_option == _options_by_id.end() )
-    {
-        auto global_timestamp_option = std::make_shared< global_time_option >(); // Default to enabled
-        register_option( RS2_OPTION_GLOBAL_TIME_ENABLED, global_timestamp_option );
-        // options_watcher registration not needed for this option as it's local only
-        _handle_global_timestamp_locally = true;
-    }
-}
-
-
-void dds_sensor_proxy::update_timestamp_if_needed( librealsense::frame_additional_data & data, streaming_impl & streaming )
-{
-    if( _handle_global_timestamp_locally &&
-        // If handling locally then we know the option is of global_time_option type
-        std::dynamic_pointer_cast< global_time_option >( _options_by_id[RS2_OPTION_GLOBAL_TIME_ENABLED] )->is_true() )
-    {
-        // Override with global timestamp if time keeper ready
-        // Timekeeper updates clock wraps around every 32bit microseconds. Truncate our 64bit input to match.
-        static constexpr const uint64_t TRUNCATION_LIMIT = 0x100000000ULL;
-        uint64_t timestamp_us = static_cast< uint64_t >( data.timestamp * MILLISEC_TO_MICROSEC );
-        uint64_t truncated_timestamp_us = timestamp_us % TRUNCATION_LIMIT;
-        double truncated_timestamp_ms = truncated_timestamp_us * MICROSEC_TO_MILLISEC;
-        bool is_tf_ready = false;
-        double updated_timestamp_ms = _tf_keeper->get_system_hw_time( truncated_timestamp_ms, is_tf_ready );
-        if( is_tf_ready )
-        {
-            data.timestamp = updated_timestamp_ms;
-            data.timestamp_domain = RS2_TIMESTAMP_DOMAIN_GLOBAL_TIME; // timestamp not changed if not ready, so leave domain
-        }
-    }
-
-    // Update here when final data.timestamp is set
-    data.last_timestamp = streaming.last_timestamp.exchange( data.timestamp );
-}
-
-
-double dds_sensor_proxy::get_device_time_ms()
-{
-    if( auto device_proxy = dynamic_cast< debug_interface * >( _owner ) )
-    {
-        auto cmd = device_proxy->build_command( ds::MRD, ds::REGISTER_CLOCK_0, ds::REGISTER_CLOCK_0 + 4 );
-        auto res = device_proxy->send_receive_raw_data( cmd );
-
-        if( res.size() < ( sizeof( int32_t ) * 2 ) ) // opcode + timestamp
-            throw std::runtime_error( "Invalid response size getting device time" );
-
-        uint32_t const & code = *reinterpret_cast< uint32_t const * >( res.data() );
-        if( code != ds::MRD )
-            throw std::runtime_error( rsutils::string::from() << "Error getting device time: " << code );
-
-        uint32_t ts_micro = *reinterpret_cast< uint32_t const * >( res.data() + sizeof( code ) );
-        return ts_micro * MICROSEC_TO_MILLISEC;
-    }
-    else
-        throw std::runtime_error( "Expected owner to be dds-device-proxy" );
+    // It was decided not to handle global timestamp locally. Network and setup variance does not enable accurate estimation.
+    // The proper way to sync cameras will be using either the existing External Sync mode or the envisioned "GenLock mode".
+    // If device has global time option (e.g. rs-dds-adapter), we can keep it (actual handling is by the remote device).
 }
 
 
@@ -874,13 +971,20 @@ void dds_sensor_proxy::set_frames_callback( rs2_frame_callback_sptr callback )
 {
     // This callback is mutable, might be modified.
     // For instance, record_sensor modifies this callback in order to hook it to record frames.
-    _formats_converter.set_frames_callback( callback );
+
+    if( get_format_conversion() != format_conversion::raw )
+        _formats_converter.set_frames_callback( callback );
+    else
+        software_sensor::set_frames_callback( callback );
 }
 
 
 rs2_frame_callback_sptr dds_sensor_proxy::get_frames_callback() const
 {
-    return _formats_converter.get_frames_callback();
+    if( get_format_conversion() != format_conversion::raw )
+        return _formats_converter.get_frames_callback();
+    else
+        return software_sensor::get_frames_callback();
 }
 
 
@@ -904,6 +1008,20 @@ void dds_sensor_proxy::add_embedded_filter( std::shared_ptr< realdds::dds_embedd
     else if (auto temporal_filter = std::dynamic_pointer_cast< dds_temporal_filter >(embedded_filter))
     {
         rs_embedded_filter = std::make_shared< rs_dds_embedded_temporal_filter >(
+            embedded_filter,
+            [=](json options_value)
+            {
+                // Send the new value to the remote device; the local value gets cached automatically as part of the reply
+                _dev->set_embedded_filter(embedded_filter, std::move(options_value));
+            },
+            [=]() -> json
+            {
+                return _dev->query_embedded_filter(embedded_filter);
+            });
+    }
+    else if (auto close_range_filter = std::dynamic_pointer_cast< dds_close_range_filter >(embedded_filter))
+    {
+        rs_embedded_filter = std::make_shared< rs_dds_embedded_close_range_filter >(
             embedded_filter,
             [=](json options_value)
             {

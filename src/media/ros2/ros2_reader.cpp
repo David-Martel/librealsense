@@ -13,9 +13,13 @@
 #include <src/color-sensor.h>
 #include <src/safety-sensor.h>
 #include <src/depth-mapping-sensor.h>
+#include <src/inference-sensor.h>
 #include <src/points.h>
 #include <src/labeled-points.h>
 #include <src/context.h>
+#include <src/object-detection-frame.h>
+#include <rsutils/json.h>
+#include <rsutils/number/crc32.h>
 
 #include <cstring>
 
@@ -89,27 +93,9 @@ namespace librealsense
         }
     }
 
-    ros2_reader::ros2_reader(const std::string& file, const std::shared_ptr<context> ctx) :
-        m_metadata_parser_map(md_constant_parser::create_metadata_parser_map()),
-        m_total_duration(0),
-        m_file_path(file),
-        m_context(ctx)
+    ros2_reader::ros2_reader(const std::string& file, const std::shared_ptr<context> ctx)
+        : ros2_reader_base(file, ctx)
     {
-        try
-        {
-            reset(); //Note: calling a virtual function inside c'tor, safe while base function is pure virtual
-            m_total_duration = get_file_duration();
-        }
-        catch (const std::exception& e)
-        {
-            //Rethrowing with better clearer message
-            throw io_exception( rsutils::string::from() << "Failed to create ros reader: " << e.what() );
-        }
-    }
-
-    device_snapshot ros2_reader::query_device_description(const nanoseconds& time)
-    {
-        return read_device_description(time);
     }
 
     std::shared_ptr< serialized_data > ros2_reader::read_next_data()
@@ -172,76 +158,7 @@ namespace librealsense
         return std::make_shared<serialized_end_of_file>();
     }
 
-    void ros2_reader::seek_to_time(const nanoseconds& seek_time)
-    {
-        // read all messages up to the requested time, updating the last frame is done inside the read function
-
-        if (seek_time > m_total_duration)
-        {
-            throw invalid_value_exception( rsutils::string::from()
-                                           << "Requested time is out of playback length. (Requested = "
-                                           << seek_time.count() << ", Duration = " << m_total_duration.count() << ")" );
-        }
-
-        reset();
-
-        auto msg = peek_next_cached();
-        while (msg && nanoseconds(msg->time_stamp) < seek_time)
-        {
-            read_next_cached();
-            msg = peek_next_cached();
-        }
-    }
-
-    std::vector<std::shared_ptr<serialized_data>> ros2_reader::fetch_last_frames(const nanoseconds& seek_time)
-    {
-        std::vector<std::shared_ptr<serialized_data>> frames;
-        for (auto&& kv : _last_frame_cache)
-        {
-            // Filter by enabled streams
-            if (_enabled_streams.empty() || _enabled_streams.count(kv.first))
-            {
-                if (kv.second) frames.push_back(kv.second);
-            }
-        }
-        return frames;
-    }
-    nanoseconds ros2_reader::query_duration() const
-    {
-        return m_total_duration;
-    }
-
-    void ros2_reader::reset()
-    {
-        _storage = std::make_shared< rosbag2_storage_plugins::SqliteStorage >();
-        _storage->open(m_file_path, rosbag2_storage::storage_interfaces::IOFlag::READ_ONLY);
-        m_frame_source = std::make_shared<frame_source>(32);
-        m_frame_source->init(m_metadata_parser_map);
-        _cache_valid = false;
-
-        // Reapply streaming filter if it was previously set
-        if (!_streaming_filter_topics.empty())
-        {
-            _storage->set_filter({ _streaming_filter_topics });
-        }
-    }
-
-    void ros2_reader::enable_stream(const std::vector<device_serializer::stream_identifier>& stream_ids)
-    {
-        for (const auto& id : stream_ids) _enabled_streams.insert(id);
-    }
-
-    void ros2_reader::disable_stream(const std::vector<device_serializer::stream_identifier>& stream_ids)
-    {
-        for (const auto& id : stream_ids) _enabled_streams.erase(id);
-    }
-
-    const std::string& ros2_reader::get_file_name() const 
-    {
-        return m_file_path;
-    }
-
-    std::shared_ptr< serialized_frame > ros2_reader::create_frame(const std::shared_ptr<rosbag2_storage::SerializedBagMessage> msg)
+    std::shared_ptr< serialized_frame > ros2_reader::create_frame(const std::shared_ptr<rosbag2_storage::SerializedBagMessage>& msg)
     {
         nanoseconds timestamp(msg->time_stamp);
         stream_identifier stream_id = ros2_topic::get_stream_identifier(msg->topic_name);
@@ -250,11 +167,65 @@ namespace librealsense
         frame_additional_data additional_data{};
         read_frame_metadata(additional_data);
 
-        bool is_imu_topic = (msg->topic_name.find("/imu/") != std::string::npos);
+        bool is_imu_topic       = (msg->topic_name.find("/" + std::string(ros2_topic::ros_imu_type_str())              + "/") != std::string::npos);
+        bool is_inference_topic = (msg->topic_name.find("/" + std::string(ros2_topic::ros_object_detection_type_str()) + "/") != std::string::npos);
 
         std::vector<uint8_t> data;
 
-        if (is_imu_topic)
+        if (is_inference_topic)
+        {
+            // Inference frames are stored as a JSON string (std_msgs/msg/String).
+            // Re-parse using the same format written by ros2_writer and construct the binary payload.
+            auto json_str = deserialize_message<cdr_string>(msg).value;
+            auto j = rsutils::json::parse( json_str );
+
+            auto n_detections = j.value( "number_of_detections", uint16_t(0) );
+
+            size_t const base_size = sizeof( object_detection_frame::object_detection_payload )
+                                   - sizeof( object_detection_frame::object_detection_entry );
+            size_t const total_size = base_size + n_detections * sizeof( object_detection_frame::object_detection_entry );
+
+            data.resize( total_size );
+            auto * payload = reinterpret_cast< object_detection_frame::object_detection_payload * >( data.data() );
+
+            payload->frame_id             = j.value( "frame_id", uint64_t(0) );
+            payload->number_of_detections = n_detections;
+            payload->source               = static_cast< uint8_t >( object_detection_frame::source::RGB );
+            payload->source_frame_id      = j.value( "source_frame_id", uint32_t(0) );
+            payload->timestamp_ms         = j.value( "timestamp_us", 0.0 ) * MICROSEC_TO_MILLISEC;
+
+            auto dets_j = j.find( "detections" );
+            if( dets_j != j.end() && dets_j->is_array() )
+            {
+                for( uint16_t i = 0; i < n_detections && i < dets_j->size(); ++i )
+                {
+                    auto const & det = (*dets_j)[i];
+                    auto & e         = payload->detections[i];
+                    e.detection_id   = i;
+                    e.detection_type = det.value( "class_id",    uint8_t(0) );
+                    e.confidence     = det.value( "confidence",  uint8_t(0) );
+                    e.top_left_x     = det.value( "x1",          uint16_t(0) );
+                    e.top_left_y     = det.value( "y1",          uint16_t(0) );
+                    e.bottom_right_x = det.value( "x2",          uint16_t(0) );
+                    e.bottom_right_y = det.value( "y2",          uint16_t(0) );
+                    e.distance       = det.value( "distance",    0.0f );
+                }
+            }
+
+            // Fill header so object_detection_frame::validate() passes
+            payload->header.magic_number = object_detection_frame::MAGIC_NUMBER;
+            payload->header.version      = static_cast< uint16_t >( j.value( "version", 1 ) );
+            payload->header.data_type    = static_cast< uint8_t >( inference_frame::type::OBJECT_DETECTION );
+            payload->header.flags        = 0;
+            payload->header.spare        = 0;
+            payload->header.size         = static_cast< uint32_t >( total_size - sizeof( object_detection_frame::object_detection_frame_header ) );
+            uint8_t * payload_data       = reinterpret_cast< uint8_t * >( payload ) + sizeof( object_detection_frame::object_detection_frame_header );
+            payload->header.crc32        = rsutils::number::calc_crc32( payload_data, payload->header.size );
+
+            // Update additional_data fields from the JSON payload
+            additional_data.frame_number = static_cast< unsigned long long >( payload->frame_id );
+        }
+        else if (is_imu_topic)
         {
             auto imu = deserialize_message<sensor_msgs::msg::Imu>(msg);
 
@@ -304,15 +275,7 @@ namespace librealsense
             return std::make_shared<serialized_invalid_frame>(timestamp, stream_id);
         }
 
-        auto result = std::make_shared<serialized_frame>(timestamp, stream_id, std::move(frame));
-        _last_frame_cache[stream_id] = result;
-        return result;
-    }
-
-    nanoseconds ros2_reader::get_file_duration()
-    {
-        auto meta = _storage->get_metadata();
-        return nanoseconds(meta.duration.count());
+        return std::make_shared<serialized_frame>(timestamp, stream_id, std::move(frame));
     }
 
     std::shared_ptr<stream_profile_interface> ros2_reader::read_next_stream_profile()
@@ -330,19 +293,34 @@ namespace librealsense
 
         stream_identifier stream_id = ros2_topic::get_stream_identifier(msg->topic_name);
 
-        msg = read_next_cached();
-        if (!msg)
-            return nullptr;
-        
-        auto intrinsics_kv = parse_msg_payload(msg);
+        // Peek at the next message — if it's intrinsics data, consume and use it;
+        // otherwise this is a bare stream profile (e.g. inference) with no extra intrinsics.
+        auto next = peek_next_cached();
+        if (next && (next->topic_name.find("imu_intrinsic") != std::string::npos
+                  || next->topic_name.find("camera_info")  != std::string::npos))
+        {
+            read_next_cached(); // consume
+            auto intrinsics_kv = parse_msg_payload(next);
 
-        if (msg->topic_name.find("imu_intrinsic") != std::string::npos)
-        {
-            return create_motion_profile(stream_id, format, fps, intrinsics_kv);
+            if (next->topic_name.find("imu_intrinsic") != std::string::npos)
+            {
+                return create_motion_profile(stream_id, format, fps, intrinsics_kv);
+            }
+            else
+            {
+                return create_video_stream_profile(stream_id, format, fps, intrinsics_kv);
+            }
         }
-        else if (msg->topic_name.find("camera_info") != std::string::npos)
+
+        // Bare stream profile — e.g. inference streams
+        if (stream_id.stream_type == RS2_STREAM_OBJECT_DETECTION)
         {
-            return create_video_stream_profile(stream_id, format, fps, intrinsics_kv);
+            auto profile = std::make_shared<inference_stream_profile>();
+            profile->set_framerate(fps);
+            profile->set_format(format);
+            profile->set_stream_index(int(stream_id.stream_index));
+            profile->set_stream_type(stream_id.stream_type);
+            return profile;
         }
 
         return nullptr;
@@ -447,32 +425,6 @@ namespace librealsense
         return sensor_options;
     }
 
-    frame_holder ros2_reader::alloc_and_move_frame(std::vector<uint8_t>&& data,
-        const stream_identifier& stream_id,
-        frame_additional_data additional_data) const
-    {
-        auto frame_ext = frame_source::stream_to_frame_types(stream_id.stream_type);
-        frame_interface* frame = m_frame_source->alloc_frame(
-            { stream_id.stream_type, stream_id.stream_index, frame_ext },
-            data.size(),
-            std::move(additional_data),
-            true);
-
-        if (frame == nullptr)
-        {
-            LOG_WARNING("Failed to allocate new frame");
-            return frame_holder{};
-        }
-
-        // Move the deserialized data directly — avoids a full memcpy of image data
-        auto base_frame = static_cast<librealsense::frame*>(frame);
-        base_frame->data = std::move(data);
-
-        setup_frame(frame, stream_id);
-
-        return frame_holder{ frame };
-    }
-
     std::shared_ptr<processing_block_interface> ros2_reader::create_processing_block(const std::string& name_in, bool& depth_to_disparity, std::shared_ptr<options_interface> options)
     {
         std::string name = name_in;
@@ -570,6 +522,9 @@ namespace librealsense
     {
         for (auto& sensor_snap : m_initial_device_description.get_sensors_snapshots())
         {
+            if (sensor_snap.get_sensor_index() != sid.sensor_index)
+                continue;
+
             for (auto& stream_profile : sensor_snap.get_stream_profiles())
             {
                 if (stream_profile->get_stream_type() != sid.stream_type ||
@@ -595,6 +550,16 @@ namespace librealsense
                 int height = vsp->get_height();
                 int bpp = get_image_bpp(vsp->get_format());
                 int stride = width * bpp / 8;
+                // derive bpp/stride from the recorded payload,
+                // else use the values computed above
+                auto data_size = static_cast<librealsense::frame*>(frame_ptr)->data.size();
+                auto pixels = static_cast<size_t>(width) * height;
+                if (pixels > 0 && data_size % pixels == 0)
+                {
+                    int bpp_bytes = static_cast<int>(data_size / pixels);
+                    bpp = bpp_bytes * 8;
+                    stride = width * bpp_bytes;
+                }
                 video_frame_ptr->assign(width, height, stride, bpp);
                 return;
             }
@@ -773,6 +738,22 @@ namespace librealsense
         void update(std::shared_ptr< extension_snapshot > ext) override {}
     };
 
+    class inference_sensor_snapshot
+        : public virtual inference_sensor
+        , public extension_snapshot
+    {
+    public:
+        void update(std::shared_ptr< extension_snapshot > ext) override {}
+    };
+
+    class object_detection_sensor_snapshot
+        : public virtual object_detection_sensor
+        , public inference_sensor_snapshot
+    {
+    public:
+        void update(std::shared_ptr< extension_snapshot > ext) override {}
+    };
+
     }  // namespace
 
 
@@ -820,6 +801,15 @@ namespace librealsense
         {
             sensor_extensions[RS2_EXTENSION_DEPTH_MAPPING_SENSOR] = std::make_shared<depth_mapping_sensor_snapshot>();
         }
+        else if (is_object_detection_sensor(sensor_name))
+        {
+            sensor_extensions[RS2_EXTENSION_OBJECT_DETECTION_SENSOR] = std::make_shared<object_detection_sensor_snapshot>();
+            sensor_extensions[RS2_EXTENSION_INFERENCE_SENSOR] = std::make_shared<inference_sensor_snapshot>();
+        }
+        else if (is_inference_module_sensor(sensor_name))
+        {
+            sensor_extensions[RS2_EXTENSION_INFERENCE_SENSOR] = std::make_shared<inference_sensor_snapshot>();
+        }
     }
 
 
@@ -858,9 +848,19 @@ namespace librealsense
         return (sensor_name.compare("Depth Mapping Camera") == 0);
     }
 
+    bool ros2_reader::is_inference_module_sensor(const std::string& sensor_name)
+    {
+        return (sensor_name.compare("Inference Sensor") == 0);
+    }
+
+    bool ros2_reader::is_object_detection_sensor(const std::string& sensor_name)
+    {
+        return (sensor_name.compare("Object Detection Sensor") == 0);
+    }
+
     // Helpers ---------------------------------------------------------------------
 
-    bool ros2_reader::is_stream_topic(const std::string& topic, stream_identifier& id)
+    bool ros2_reader::is_stream_topic(const std::string& topic, stream_identifier& id) const
     {
         // Format: /device_N/sensor_N/StreamType_Idx/<ros_type>/data
         if (topic.find("/device_") != 0)
@@ -1039,29 +1039,25 @@ namespace librealsense
         return m_initial_device_description;
     }
 
-    void ros2_reader::prepare_for_streaming()
+    std::vector<std::string> ros2_reader::get_stream_topics() const
     {
-        // Reopen storage to reset the filter, and apply relevant filters for streaming
-        _storage = std::make_shared< rosbag2_storage_plugins::SqliteStorage >();
-        _storage->open(m_file_path, rosbag2_storage::storage_interfaces::IOFlag::READ_ONLY);
+        // /device_N/sensor_N/StreamType_Idx/<ros_type>/(data|metadata)
+        auto re = std::regex((rsutils::string::from() << "^/device_" << get_device_index() << "/sensor_\\d+/[^/]+/[^/]+/(data|metadata)$").str());
+        return filter_topics_by_regex(re);
+    }
 
-        // Stream topics: /device_N/sensor_N/StreamType_Idx/<ros_type>/(data|metadata)
-        auto stream_topics_regex = std::regex((rsutils::string::from() << "^/device_" << get_device_index() << "/sensor_\\d+/[^/]+/[^/]+/(data|metadata)$").str());
-        auto stream_topics = filter_topics_by_regex(stream_topics_regex);
+    std::vector<std::string> ros2_reader::get_option_topics() const
+    {
+        // /device_{device_index}/sensor_{sensor_index}/option/{option_name}/value
+        auto re = std::regex((rsutils::string::from() << "^/device_" << get_device_index() << "/sensor_\\d+/option/[^/]+/value$").str());
+        return filter_topics_by_regex(re);
+    }
 
-        // Option topics: /device_{device_index}/sensor_{sensor_index}/option/{option_name}/value
-        auto option_topics_regex = std::regex((rsutils::string::from() << "^/device_" << get_device_index() << "/sensor_\\d+/option/[^/]+/value$").str());
-        auto option_topics = filter_topics_by_regex(option_topics_regex);
-
-        // Notification topics: /device_{device_index}/sensor_{sensor_index}/notification/{notification_type}
-        auto notification_topics_regex = std::regex((rsutils::string::from() << "^/device_" << get_device_index() << "/sensor_\\d+/notification/[^/]+$").str());
-        auto notification_topics = filter_topics_by_regex(notification_topics_regex);
-
-        _streaming_filter_topics.insert(_streaming_filter_topics.end(), stream_topics.begin(), stream_topics.end());
-        _streaming_filter_topics.insert(_streaming_filter_topics.end(), option_topics.begin(), option_topics.end());
-        _streaming_filter_topics.insert(_streaming_filter_topics.end(), notification_topics.begin(), notification_topics.end());
-
-        _storage->set_filter({ _streaming_filter_topics });
+    std::vector<std::string> ros2_reader::get_notification_topics() const
+    {
+        // /device_{device_index}/sensor_{sensor_index}/notification/{notification_type}
+        auto re = std::regex((rsutils::string::from() << "^/device_" << get_device_index() << "/sensor_\\d+/notification/[^/]+$").str());
+        return filter_topics_by_regex(re);
     }
 
     std::shared_ptr<info_container> ros2_reader::read_info_snapshot(const std::string& topic)
@@ -1174,43 +1170,4 @@ namespace librealsense
         return "";
     }
 
-    bool ros2_reader::has_next_cached() const
-    {
-        // If we have a valid cached message, we have next
-        if (_cache_valid)
-            return true;
-
-        return _storage->has_next();
-    }
-
-    std::shared_ptr<rosbag2_storage::SerializedBagMessage> ros2_reader::read_next_cached()
-    {
-        // If cache is valid, return cached message and mark as consumed
-        if (_cache_valid)
-        {
-            _cache_valid = false;
-            return _cached_message;
-        }
-
-        // Otherwise, read from storage and return immediately (no caching)
-        if (!_storage->has_next())
-            return nullptr;
-
-        return _storage->read_next();
-    }
-
-    std::shared_ptr<rosbag2_storage::SerializedBagMessage> ros2_reader::peek_next_cached()
-    {
-        // If cache is valid, return cached message without consuming
-        if (_cache_valid)
-            return _cached_message;
-
-        // Otherwise, read from storage and cache it
-        if (!_storage->has_next())
-            return nullptr;
-
-        _cached_message = _storage->read_next();
-        _cache_valid = true;
-        return _cached_message;
-    }
 }

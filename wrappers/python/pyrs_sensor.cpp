@@ -77,14 +77,18 @@ void init_sensor(py::module &m) {
                     return rs2::embedded_filter(self.get_embedded_filter<rs2::embedded_decimation_filter>());
                 case RS2_EMBEDDED_FILTER_TYPE_TEMPORAL:
                     return rs2::embedded_filter(self.get_embedded_filter<rs2::embedded_temporal_filter>());
+                case RS2_EMBEDDED_FILTER_TYPE_CLOSE_RANGE:
+                    return rs2::embedded_filter(self.get_embedded_filter<rs2::embedded_close_range_filter>());
                 default:
                     throw std::runtime_error("Unsupported embedded filter type");
             }
         }, "Return the embedded filter in the sensor by filter type.", "filter_type"_a)
-        .def("get_embedded_decimation_filter", &rs2::sensor::get_embedded_filter<rs2::embedded_decimation_filter>, 
+        .def("get_embedded_decimation_filter", &rs2::sensor::get_embedded_filter<rs2::embedded_decimation_filter>,
              "Return the embedded decimation filter in the sensor.")
-        .def("get_embedded_temporal_filter", &rs2::sensor::get_embedded_filter<rs2::embedded_temporal_filter>, 
+        .def("get_embedded_temporal_filter", &rs2::sensor::get_embedded_filter<rs2::embedded_temporal_filter>,
              "Return the embedded temporal filter in the sensor.")
+        .def("get_embedded_close_range_filter", &rs2::sensor::get_embedded_filter<rs2::embedded_close_range_filter>,
+             "Return the embedded Improved Close Range Depth filter in the sensor.")
         .def(py::init<>())
         .def("__nonzero__", &rs2::sensor::operator bool) // Called to implement truth value testing in Python 2
         .def("__bool__", &rs2::sensor::operator bool)    // Called to implement truth value testing in Python 3
@@ -98,6 +102,8 @@ void init_sensor(py::module &m) {
         .def(BIND_DOWNCAST(sensor, wheel_odometer))
         .def(BIND_DOWNCAST(sensor, max_usable_range_sensor))
         .def(BIND_DOWNCAST(sensor, debug_stream_sensor))
+        .def(BIND_DOWNCAST(sensor, inference_sensor))
+        .def(BIND_DOWNCAST(sensor, object_detection_sensor))
         .def_property_readonly( "name",
                                 []( const rs2::sensor & self ) {
                                     std::string name;
@@ -136,6 +142,12 @@ void init_sensor(py::module &m) {
 
     py::class_<rs2::fisheye_sensor, rs2::sensor, py_holder<rs2::fisheye_sensor>> fisheye_sensor(m, "fisheye_sensor"); // No docstring in C++
     fisheye_sensor.def(py::init<rs2::sensor>(), "sensor"_a);
+
+    py::class_<rs2::inference_sensor, rs2::sensor, py_holder<rs2::inference_sensor>> inference_sensor(m, "inference_sensor"); // No docstring in C++
+    inference_sensor.def(py::init<rs2::sensor>(), "sensor"_a);
+
+    py::class_<rs2::object_detection_sensor, rs2::inference_sensor, py_holder<rs2::object_detection_sensor>> object_detection_sensor(m, "object_detection_sensor"); // No docstring in C++
+    object_detection_sensor.def(py::init<rs2::sensor>(), "sensor"_a);
 
     py::class_<rs2::safety_sensor, rs2::sensor, py_holder<rs2::safety_sensor>> safety_sensor(m, "safety_sensor"); // No docstring in C++
     safety_sensor.def(py::init<rs2::sensor>(), "sensor"_a)

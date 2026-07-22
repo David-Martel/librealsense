@@ -133,6 +133,11 @@ namespace rs2
 
     bool stream_model::is_stream_visible() const
     {
+        // Inference streams carry binary data, not displayable video - no tile is shown for them
+        // (detections are overlaid on the color stream instead).
+        if (profile.stream_type() == RS2_STREAM_OBJECT_DETECTION)
+            return false;
+
         if (dev &&
             (dev->is_paused() ||
             (dev->streaming && dev->dev.is<playback>()) ||
@@ -170,6 +175,7 @@ namespace rs2
         texture->colorize = d->depth_colorizer;
         texture->yuy2rgb = d->yuy2rgb;
         texture->m420_to_rgb = d->m420_to_rgb;
+        texture->nv12_to_rgb = d->nv12_to_rgb;
         texture->y411 = d->y411;
 
         if (auto vd = p.as<video_stream_profile>())
@@ -204,7 +210,7 @@ namespace rs2
     void stream_model::show_metadata_by_default(const rs2::stream_profile& p)
     {
         // The purpose is to show metadata to a user by default because a user will not see frames in this stream.
-        if (p.stream_type() == RS2_STREAM_SAFETY)
+        if( p.stream_type() == RS2_STREAM_SAFETY || p.stream_type() == RS2_STREAM_OBJECT_DETECTION )
             show_metadata = true;
     }
 
@@ -453,8 +459,12 @@ namespace rs2
                 label = tooltip;
             else
             {
-                // Use only the SKU type for compact representation and use only the last three digits for S.N
-                auto short_name = split_string(dev_name, ' ').back();
+                // Use only the SKU type for compact representation and use only the last three digits for S.N.
+                // The SKU is the model token right after "RealSense" (e.g. D435, D585S), not the last word -
+                // e.g. "RealSense D585 Proto Dual RGB" should yield "D585", not "RGB".
+                const std::string prefix = "RealSense ";
+                std::string after_prefix = dev_name.substr( dev_name.find( prefix ) + prefix.size() );
+                auto short_name = split_string( after_prefix, ' ' ).front();
                 auto short_sn = dev_serial;
                 short_sn.erase(0, dev_serial.size() - 5).replace(0, 2, "..");
 
@@ -1000,13 +1010,20 @@ namespace rs2
 
 
         //add_descriptions_for_d500_metadata_fields(descriptions);
-        std::string pid = this->dev->dev.get_info(RS2_CAMERA_INFO_PRODUCT_ID);
-        if (pid == "0B6B")
-            add_d585S_metadata_descriptions(descriptions);
-        
-        std::string connection_type =  this->dev->dev.get_info(RS2_CAMERA_INFO_CONNECTION_TYPE);
-        if (connection_type == "DDS")
-            add_dds_metadata_descriptions(descriptions);
+        std::string pid;
+        if (dev)
+        {
+            pid = dev->dev.get_info(RS2_CAMERA_INFO_PRODUCT_ID);
+            if (pid == "0B6B")
+                add_d585S_metadata_descriptions(descriptions);
+
+            if (dev->dev.supports(RS2_CAMERA_INFO_CONNECTION_TYPE))
+            {
+                std::string connection_type = dev->dev.get_info(RS2_CAMERA_INFO_CONNECTION_TYPE);
+                if (connection_type == "DDS")
+                    add_dds_metadata_descriptions(descriptions);
+            }
+        }
 
         for (auto i = 0; i < RS2_FRAME_METADATA_COUNT; i++)
         {

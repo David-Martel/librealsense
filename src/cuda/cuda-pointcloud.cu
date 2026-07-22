@@ -1,58 +1,9 @@
 #ifdef RS2_USE_CUDA
 
 #include "cuda-pointcloud.cuh"
+#include "rscuda_utils.cuh"
 #include <iostream>
 #include <chrono>
-
-// --- GB10 shared-memory zero-copy experiment (opt-in; default OFF = byte-identical upstream) -------
-// Attribution ladder for "what does DGX Spark unified memory buy for the pointcloud CUDA path?".
-// Selected at runtime via RS2_PC_MODE (read once): 0=baseline (per-frame cudaMalloc+cudaMemcpy+free),
-// 1=cached device buffers (alloc once, reuse; still cudaMemcpy), 2=cached MANAGED buffers
-// (cudaMallocManaged once; host writes/reads the coherent buffer with plain memcpy, no cudaMemcpy).
-// Default when the define is compiled in but RS2_PC_MODE is unset = 0, so other tools on this build
-// are unaffected. Buffers are process-static, mutex-guarded, grow-only, sized to the current frame.
-#if defined(RS2_GB10_PC_ZEROCOPY)
-#include <mutex>
-#include <cstdlib>
-#include <cstring>
-#include <stdexcept>
-#include <string>
-namespace {
-    int rs2_pc_mode() {
-        static int m = -1;
-        if (m < 0) { const char* e = std::getenv("RS2_PC_MODE"); m = e ? std::atoi(e) : 1; }  // default 1 = cached-device (promoted)
-        return m;
-    }
-    // Checked CUDA error handling: asserts are stripped by -DNDEBUG in the Release/GB10 build, so a
-    // failed cudaMalloc/cudaMemcpy would go UNCHECKED on the now-default cached path (silent corruption).
-    // Throw instead so the failure is visible; happy path is unchanged.
-    inline void cuda_or_throw(cudaError_t r, const char* what) {
-        if (r != cudaSuccess)
-            throw std::runtime_error(std::string("GB10 pointcloud CUDA failure (") + what + "): " + cudaGetErrorString(r));
-    }
-    struct pc_zc_buffers {
-        std::mutex mtx;
-        int cap = 0; bool managed = false;
-        float* d_points = nullptr; uint16_t* d_depth = nullptr; rs2_intrinsics* d_intrin = nullptr;
-        void free_all() {
-            if (d_points) cudaFree(d_points); if (d_depth) cudaFree(d_depth); if (d_intrin) cudaFree(d_intrin);
-            d_points = nullptr; d_depth = nullptr; d_intrin = nullptr; cap = 0;
-        }
-        void ensure(int count, bool want_managed) {
-            if (d_points && cap >= count && managed == want_managed) return;
-            free_all(); managed = want_managed;
-            auto alloc = [&](void** p, size_t bytes) {
-                return want_managed ? cudaMallocManaged(p, bytes) : cudaMalloc(p, bytes); };
-            cuda_or_throw(alloc((void**)&d_points, (size_t)count * sizeof(float) * 3), "alloc d_points");
-            cuda_or_throw(alloc((void**)&d_depth, (size_t)count * sizeof(uint16_t)), "alloc d_depth");
-            cuda_or_throw(alloc((void**)&d_intrin, sizeof(rs2_intrinsics)), "alloc d_intrin");
-            cap = count;
-        }
-    };
-    pc_zc_buffers& pc_zc() { static pc_zc_buffers b; return b; }
-}
-#endif
-// ---------------------------------------------------------------------------------------------------
 
 
 __device__
@@ -66,14 +17,14 @@ void deproject_pixel_to_point_cuda(float points[3], const struct rs2_intrinsics 
     assert(intrin->model != RS2_DISTORTION_FTHETA); // Cannot deproject to an ftheta image
     //assert(intrin->model != RS2_DISTORTION_BROWN_CONRADY); // Cannot deproject to an brown conrady model
     float x = (pixel[0] - intrin->ppx) / intrin->fx;
-    float y = (pixel[1] - intrin->ppy) / intrin->fy;    
+    float y = (pixel[1] - intrin->ppy) / intrin->fy;
 
     float xo = x;
     float yo = y;
 
     if (intrin->model == RS2_DISTORTION_INVERSE_BROWN_CONRADY)
     {
-        // need to loop until convergence 
+        // need to loop until convergence
         // 10 iterations determined empirically
         for (int i = 0; i < 10; i++)
         {
@@ -89,7 +40,7 @@ void deproject_pixel_to_point_cuda(float points[3], const struct rs2_intrinsics 
     }
     else if (intrin->model == RS2_DISTORTION_BROWN_CONRADY)
     {
-        // need to loop until convergence 
+        // need to loop until convergence
         // 10 iterations determined empirically
         for (int i = 0; i < 10; i++)
         {
@@ -104,89 +55,66 @@ void deproject_pixel_to_point_cuda(float points[3], const struct rs2_intrinsics 
     points[0] = depth * x;
     points[1] = depth * y;
     points[2] = depth;
-    
+
 }
 
 
 __global__
-//void kernel_deproject_depth_cuda(float * points, const rs2_intrinsics & intrin, const uint16_t * depth, std::function<uint16_t(float)> map_depth)
 
-void kernel_deproject_depth_cuda(float * points, const rs2_intrinsics* intrin, const uint16_t * depth, float depth_scale)
+void kernel_deproject_depth_cuda( float * points, const rs2_intrinsics * intrin, const uint16_t * depth, float depth_scale )
 {
-    int i = blockDim.x * blockIdx.x + threadIdx.x;
-    
-    if (i >= (*intrin).height * (*intrin).width) {
+    const int width  = intrin->width;
+    const int height = intrin->height;
+
+    // One thread = one pixel; the grid is sized to the image so no stride loop is needed.
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if( x >= width || y >= height )
         return;
-    }
-    int stride = blockDim.x * gridDim.x;
-    int a, b;
-    
-    for (int j = i; j < (*intrin).height * (*intrin).width; j += stride) {
-        b = j / (*intrin).width;
-        a = j - b * (*intrin).width;
-        const float pixel[] = { (float)a, (float)b };
-        deproject_pixel_to_point_cuda(points + j * 3, intrin, pixel, depth_scale * depth[j]);               
-   }
+
+    const int j = y * width + x;
+    const float pixel[] = { (float)x, (float)y };
+    deproject_pixel_to_point_cuda( points + j * 3, intrin, pixel, depth_scale * depth[j] );
 }
 
 
-void rscuda::deproject_depth_cuda(float * points, const rs2_intrinsics & intrin, const uint16_t * depth, float depth_scale)
+void rscuda::pointcloud_cuda_helper::deproject_depth_cuda( float * points, const rs2_intrinsics & intrin,
+                                                           const uint16_t * depth, float depth_scale )
 {
-    int count = intrin.height * intrin.width;
+    const int count = intrin.width * intrin.height;
 
-#if defined(RS2_GB10_PC_ZEROCOPY)
-    const int _mode = rs2_pc_mode();
-    if (_mode == 1 || _mode == 2) {
-        const bool managed = (_mode == 2);
-        auto& b = pc_zc();
-        std::lock_guard<std::mutex> lk(b.mtx);
-        b.ensure(count, managed);
-        const int nb = count / RS2_CUDA_THREADS_PER_BLOCK;
-        if (managed) {                                  // host write into coherent managed memory
-            std::memcpy(b.d_depth, depth, (size_t)count * sizeof(uint16_t));
-            std::memcpy(b.d_intrin, &intrin, sizeof(rs2_intrinsics));
-        } else {                                        // cached device buffers, still cudaMemcpy
-            cuda_or_throw(cudaMemcpy(b.d_depth, depth, (size_t)count * sizeof(uint16_t), cudaMemcpyHostToDevice), "H2D depth");
-            cuda_or_throw(cudaMemcpy(b.d_intrin, &intrin, sizeof(rs2_intrinsics), cudaMemcpyHostToDevice), "H2D intrin");
-        }
-        kernel_deproject_depth_cuda<<<nb, RS2_CUDA_THREADS_PER_BLOCK>>>(b.d_points, b.d_intrin, b.d_depth, depth_scale);
-        cuda_or_throw(cudaGetLastError(), "kernel launch");
-        cuda_or_throw(cudaDeviceSynchronize(), "sync");  // explicit sync (D2H memcpy used to provide it)
-        if (managed) std::memcpy(points, b.d_points, (size_t)count * sizeof(float) * 3);
-        else cuda_or_throw(cudaMemcpy(points, b.d_points, (size_t)count * sizeof(float) * 3, cudaMemcpyDeviceToHost), "D2H points");
-        return;
+    // (Re)allocate persistent device buffers only when the frame size changes.
+    // On a steady stream this branch runs once, then every frame reuses the buffers.
+    if( count != _count )
+    {
+        _d_points.reset();
+        _d_depth.reset();
+        _d_intrin.reset();
+        _count = count;
     }
-    // _mode == 0 falls through to the unmodified baseline below
-#endif
-    int numBlocks = count / RS2_CUDA_THREADS_PER_BLOCK;
-    
-    float *dev_points = 0;	
-    uint16_t *dev_depth = 0;
-    rs2_intrinsics* dev_intrin = 0;
-    cudaError_t result;
+    if( !_d_points ) _d_points = rscuda::alloc_dev<float>( count * 3 );
+    if( !_d_depth )  _d_depth  = rscuda::alloc_dev<uint16_t>( count );
 
-    result = cudaMalloc(&dev_points, count * sizeof(float) * 3);
-    assert(result == cudaSuccess);
-    result = cudaMalloc(&dev_depth, count * sizeof(uint16_t));
-    assert(result == cudaSuccess);
-    result = cudaMalloc(&dev_intrin, sizeof(rs2_intrinsics));
-    assert(result == cudaSuccess);
-       
-    result = cudaMemcpy(dev_depth, depth, count * sizeof(uint16_t), cudaMemcpyHostToDevice);
-    assert(result == cudaSuccess); 
-    result = cudaMemcpy(dev_intrin, &intrin, sizeof(rs2_intrinsics), cudaMemcpyHostToDevice);
-    assert(result == cudaSuccess); 
-     
-    kernel_deproject_depth_cuda<<<numBlocks, RS2_CUDA_THREADS_PER_BLOCK>>>(dev_points, dev_intrin, dev_depth, depth_scale); 
+    // Upload intrinsics once; refresh only if they actually change (e.g. recalibration).
+    if( !_d_intrin || std::memcmp( &_intrin_cached, &intrin, sizeof( rs2_intrinsics ) ) != 0 )
+    {
+        _d_intrin = rscuda::make_device_copy( intrin );
+        _intrin_cached = intrin;
+    }
 
-     result = cudaMemcpy(points, dev_points, count * sizeof(float) * 3, cudaMemcpyDeviceToHost);
-     assert(result == cudaSuccess);
+    RS_CUDA_CHECK( cudaMemcpy( _d_depth.get(), depth, count * sizeof( uint16_t ), cudaMemcpyHostToDevice ) );
 
-     if (result); // suppress warning about "variable "result" was set but never used"
+    // 2D launch: warp-sized x dimension keeps a warp's lanes aligned with consecutive pixels,
+    // so depth reads stay coalesced. y dimension is sized to hit the threads-per-block target.
+    // Using 1D grid will require integer division (which is ~20-30 cycles on the GPU since there
+    // is no hardware integer divider).
+    const dim3 block( rscuda::THREADS_IN_WARP, THREADS_PER_BLOCK / rscuda::THREADS_IN_WARP );
+    const dim3 grid( ( intrin.width  + block.x - 1 ) / block.x,
+                     ( intrin.height + block.y - 1 ) / block.y );
+    kernel_deproject_depth_cuda<<< grid, block >>>( _d_points.get(), _d_intrin.get(), _d_depth.get(), depth_scale );
+    RS_CUDA_CHECK( cudaGetLastError() );
 
-    cudaFree(dev_points);
-    cudaFree(dev_depth);
-    cudaFree(dev_intrin);
+    RS_CUDA_CHECK( cudaMemcpy( points, _d_points.get(), count * sizeof( float ) * 3, cudaMemcpyDeviceToHost ) );
 }
 
 #endif
