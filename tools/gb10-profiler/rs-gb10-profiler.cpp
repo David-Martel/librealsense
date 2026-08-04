@@ -433,11 +433,19 @@ static rs2::device select_device(rs2::context& ctx, const std::string& requested
     if (devices.size() == 0)
         throw std::runtime_error("No RealSense devices were found");
 
-    for (auto&& dev : devices)
+    for (size_t index = 0; index < devices.size(); ++index)
     {
-        auto serial = get_info_or(dev, RS2_CAMERA_INFO_SERIAL_NUMBER, "");
-        if (requested_serial.empty() || serial == requested_serial)
-            return dev;
+        try
+        {
+            auto dev = devices[index];
+            auto serial = get_info_or(dev, RS2_CAMERA_INFO_SERIAL_NUMBER, "");
+            if (requested_serial.empty() || serial == requested_serial)
+                return dev;
+        }
+        catch (const rs2::error& error)
+        {
+            std::cerr << "device.warning index=" << index << " " << error.what() << "\n";
+        }
     }
 
     std::ostringstream ss;
