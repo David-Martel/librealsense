@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: E501, E702
 """GB10 non-headless display validation + interactive debug viewer for the RealSense.
 
 Renders the LIVE stream to a window on the MAIN display ($DISPLAY) and either validates it (default,
@@ -40,7 +41,6 @@ Controls (`--interactive`): 1-9 profile(size x fps)  c/d color/depth  e emitter 
   - = gain   l/L laser   p preset   f freeze   r re-acquire after a stream error   s snapshot   h help   q quit
 """
 import argparse
-import json
 import os
 import queue
 import subprocess
@@ -79,6 +79,8 @@ def build_parser():
     p.add_argument("--rgbd", action="store_true", help=argparse.SUPPRESS)  # accepted, mapped to color
     p.add_argument("--profile", type=int, default=DEFAULT_IDX, metavar="IDX",
                    help="initial profile index into the family's size/fps list")
+    p.add_argument("--serial", default=os.environ.get("LRS_DEVICE_SERIAL", ""), metavar="SERIAL",
+                   help="bind the SDK pipeline to one camera (or set LRS_DEVICE_SERIAL)")
     p.add_argument("--duration", type=float, default=None, metavar="S",
                    help="run for S seconds (default: validate runs --frames frames)")
     p.add_argument("--frames", type=int, default=150, help="validate-mode frame count")
@@ -219,9 +221,11 @@ def continuity_checks(frame_numbers, gaps_ms=None, domains=None, gap_max_ms=None
 # ----------------------------- camera I/O (fail-safe lifecycle) -----------------------------
 class Cam:
     """Single-stream RealSense wrapper: hot profile-switch, feature controls, fail-safe re-acquire."""
-    def __init__(self, rs, family="color", idx=DEFAULT_IDX):
+    def __init__(self, rs, family="color", idx=DEFAULT_IDX, serial=""):
         self.rs = rs; self.ctx = rs.context()
         self.family = family; self.idx = clamp_idx(idx, family)
+        self.serial = serial
+        self.device_serial = None
         self.pipe = None; self.whf = None
         self.depth_sensor = None; self.color_sensor = None
 
@@ -229,6 +233,8 @@ class Cam:
         rs = self.rs
         w, h, fps = profile_for(self.family, self.idx)
         cfg = rs.config()
+        if self.serial:
+            cfg.enable_device(self.serial)
         if self.family == "color":
             cfg.enable_stream(rs.stream.color, w, h, rs.format.bgr8, fps)
         else:
@@ -237,6 +243,10 @@ class Cam:
         prof = self.pipe.start(cfg)
         self.whf = (w, h, fps)
         dev = prof.get_device()
+        try:
+            self.device_serial = dev.get_info(rs.camera_info.serial_number)
+        except Exception:
+            self.device_serial = None
         try:
             self.depth_sensor = dev.first_depth_sensor()
         except Exception:
@@ -269,7 +279,6 @@ class Cam:
 
     def read(self, timeout_ms=5000):
         """Return the frame for the active family, or None on a (caught) stream error."""
-        rs = self.rs
         try:
             fs = self.pipe.wait_for_frames(timeout_ms)
         except Exception:
@@ -336,9 +345,10 @@ def run_self_test():
             fails.append(name)
 
     # argparse: good args parse; aliases + defaults resolve; bad args exit 2
-    a = resolve_args(["--interactive", "--depth", "--duration", "5"])
+    a = resolve_args(["--interactive", "--depth", "--duration", "5", "--serial", "1234"])
     check("argparse: --depth->stream=depth", a.stream == "depth")
     check("argparse: --interactive default record off", a.record is False)
+    check("argparse: --serial retained", a.serial == "1234")
     check("argparse: validate default record on", resolve_args([]).record is True)
     try:
         build_parser().parse_args(["--stream", "bogus"]); bad_ok = False
@@ -417,8 +427,10 @@ def run(args):
                        "stream": args.stream, "main_display": DISPLAY, "cv2": cv2.__version__})
     hil.preflight()
 
-    cam = Cam(rs, family=args.stream, idx=args.profile)
+    cam = Cam(rs, family=args.stream, idx=args.profile, serial=args.serial)
     cam.start()
+    hil.report.update({"requested_device_serial": args.serial or None,
+                       "device_serial": cam.device_serial})
     colorizer = rs.colorizer()
 
     shared = {"img": None, "stop": False, "controller_dead": False}
