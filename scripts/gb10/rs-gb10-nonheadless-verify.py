@@ -118,6 +118,19 @@ def device_provenance_checks(requested_serial, actual_serial, usb_type):
     }
 
 
+def seal_device_provenance(report, requested_serial, actual_serial, usb_type):
+    """Replace any preflight device metadata with the exact started device."""
+    checks = device_provenance_checks(requested_serial, actual_serial, usb_type)
+    report.pop("usb_warning", None)
+    report.update({"requested_device_serial": requested_serial or None,
+                   "device_serial": actual_serial,
+                   "usb_type": usb_type,
+                   "device_provenance_checks": checks})
+    if usb_type and not checks["usb3"]:
+        report["usb_warning"] = f"link is USB {usb_type} (<3.x) — degraded/death-prone"
+    return checks
+
+
 def compose_hud(img, fps_line, meta_lines, status="", help_lines=None):
     """Draw the debug HUD onto a frame copy. cv2 drawing is headless-safe (no display needed)."""
     import cv2
@@ -425,8 +438,11 @@ def run_self_test():
     fake_cam = Cam(FakeRs(), serial="camera-b")
     fake_cam.start()
     check("device provenance: exact second camera selected", fake_cam.device_serial == "camera-b")
-    checks = device_provenance_checks("camera-b", fake_cam.device_serial, fake_cam.usb_type)
+    fake_report = {"usb_type": "2.1", "usb_warning": "stale first-camera warning"}
+    checks = seal_device_provenance(fake_report, "camera-b", fake_cam.device_serial, fake_cam.usb_type)
     check("device provenance: exact USB3 device passes", all(checks.values()))
+    check("device provenance: exact device replaces preflight USB", fake_report["usb_type"] == "3.2")
+    check("device provenance: stale preflight warning removed", "usb_warning" not in fake_report)
     check("device provenance: mismatch fails",
           not device_provenance_checks("camera-a", "camera-b", "3.2")["requested_serial_matches"])
     check("device provenance: missing actual fails",
@@ -505,11 +521,8 @@ def run(args):
 
     cam = Cam(rs, family=args.stream, idx=args.profile, serial=args.serial)
     cam.start()
-    provenance_checks = device_provenance_checks(args.serial, cam.device_serial, cam.usb_type)
-    hil.report.update({"requested_device_serial": args.serial or None,
-                       "device_serial": cam.device_serial,
-                       "usb_type": cam.usb_type,
-                       "device_provenance_checks": provenance_checks})
+    provenance_checks = seal_device_provenance(
+        hil.report, args.serial, cam.device_serial, cam.usb_type)
     if not all(provenance_checks.values()):
         cam.stop()
         hil.report["result"] = "FAIL"
