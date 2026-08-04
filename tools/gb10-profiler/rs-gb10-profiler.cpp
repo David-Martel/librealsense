@@ -47,6 +47,8 @@ struct options
     int cooldown_ms = 1000;
     int stop_warn_ms = 5000;
     int hard_stop_ms = 30000;
+    double min_fps_ratio = 0.70;
+    double max_gap_ratio = 0.05;
     std::string output_dir = "/tmp/rs-gb10-profiler";
     bool render = true;
     bool require_usb3 = true;
@@ -56,6 +58,8 @@ struct options
     bool align_to_color = true;
     bool capture_evidence = true;
     bool list_profiles = false;
+    bool enforce_performance = true;
+    bool self_test = false;
 };
 
 struct stream_request
@@ -103,6 +107,7 @@ struct stream_counter
 {
     uint64_t frames = 0;
     uint64_t gaps = 0;
+    uint64_t expected_stride = 1;
     unsigned long long last_number = 0;
     bool has_last = false;
 };
@@ -127,7 +132,13 @@ struct cycle_result
     double start_ms = 0.0;
     double pre_stop_ms = 0.0;
     double stop_ms = 0.0;
+    double capture_sec = 0.0;
     double wall_sec = 0.0;
+    double expected_fps = 0.0;
+    bool rate_ok = false;
+    bool gaps_ok = false;
+    bool performance_ok = false;
+    bool performance_evaluated = false;
     running_stats wait_ms;
     running_stats process_ms;
     running_stats render_ms;
@@ -179,6 +190,10 @@ static void usage()
         << "  --cooldown-ms <n>      Sleep after stop before next start\n"
         << "  --stop-warn-ms <n>     Mark stop dirty if it takes longer than this\n"
         << "  --hard-stop-ms <n>     Terminate if pipeline.stop() wedges past this\n"
+        << "  --min-fps-ratio <n>    Minimum delivered/requested FPS ratio (default: 0.70)\n"
+        << "  --max-gap-ratio <n>    Maximum dropped/expected ratio per stream (default: 0.05)\n"
+        << "  --report-only          Report performance failures without failing the process\n"
+        << "  --self-test            Run deterministic metric checks without a camera\n"
         << "  --output-dir <path>    Write compact logs/evidence under this directory\n"
         << "  --no-evidence          Do not write framebuffer evidence images\n"
         << "  --no-render            Disable visible rendering for stress runs\n"
@@ -197,6 +212,20 @@ static bool read_arg(int argc, char** argv, int& i, std::string* value)
         return false;
     *value = argv[++i];
     return true;
+}
+
+static double parse_ratio(const std::string& value, const char* option)
+{
+    char* end = nullptr;
+    errno = 0;
+    const auto parsed = std::strtod(value.c_str(), &end);
+    if (errno == ERANGE || end == value.c_str() || *end != '\0' || !std::isfinite(parsed))
+    {
+        std::ostringstream ss;
+        ss << option << " requires a finite numeric value";
+        throw std::invalid_argument(ss.str());
+    }
+    return parsed;
 }
 
 static options parse_options(int argc, char** argv)
@@ -226,6 +255,10 @@ static options parse_options(int argc, char** argv)
             opt.stop_warn_ms = std::max(1, std::atoi(value.c_str()));
         else if (arg == "--hard-stop-ms" && read_arg(argc, argv, i, &value))
             opt.hard_stop_ms = std::max(1, std::atoi(value.c_str()));
+        else if (arg == "--min-fps-ratio" && read_arg(argc, argv, i, &value))
+            opt.min_fps_ratio = parse_ratio(value, "--min-fps-ratio");
+        else if (arg == "--max-gap-ratio" && read_arg(argc, argv, i, &value))
+            opt.max_gap_ratio = parse_ratio(value, "--max-gap-ratio");
         else if (arg == "--output-dir" && read_arg(argc, argv, i, &value))
             opt.output_dir = value;
         else if (arg == "--no-evidence")
@@ -244,6 +277,10 @@ static options parse_options(int argc, char** argv)
             opt.align_to_color = false;
         else if (arg == "--list-profiles")
             opt.list_profiles = true;
+        else if (arg == "--report-only")
+            opt.enforce_performance = false;
+        else if (arg == "--self-test")
+            opt.self_test = true;
         else if (arg == "-h" || arg == "--help")
         {
             usage();
@@ -256,6 +293,11 @@ static options parse_options(int argc, char** argv)
             throw std::invalid_argument(ss.str());
         }
     }
+
+    if (opt.min_fps_ratio <= 0.0 || opt.min_fps_ratio > 1.0)
+        throw std::invalid_argument("--min-fps-ratio must be greater than 0 and at most 1");
+    if (opt.max_gap_ratio < 0.0 || opt.max_gap_ratio > 1.0)
+        throw std::invalid_argument("--max-gap-ratio must be between 0 and 1");
 
     if (opt.stress)
     {
@@ -315,6 +357,110 @@ static double elapsed_ms(clock_type::time_point a, clock_type::time_point b)
 static double elapsed_sec(clock_type::time_point a, clock_type::time_point b)
 {
     return std::chrono::duration_cast<std::chrono::duration<double>>(b - a).count();
+}
+
+static double expected_frameset_fps(const test_profile& profile)
+{
+    if (profile.streams.empty())
+        return 0.0;
+
+    auto fps = profile.streams.front().fps;
+    for (auto&& request : profile.streams)
+        fps = std::min(fps, request.fps);
+    return static_cast<double>(fps);
+}
+
+static uint64_t total_gaps(const cycle_result& result)
+{
+    uint64_t gaps = 0;
+    for (auto&& stream : result.streams)
+        gaps += stream.second.gaps;
+    return gaps;
+}
+
+static double stream_gap_ratio(const stream_counter& stream)
+{
+    const auto expected = static_cast<double>(stream.frames) * static_cast<double>(stream.expected_stride)
+        + static_cast<double>(stream.gaps);
+    return expected > 0.0 ? static_cast<double>(stream.gaps) / expected : 0.0;
+}
+
+static void evaluate_performance(cycle_result& result, const options& opt)
+{
+    result.performance_evaluated = true;
+    const auto capture_fps = result.capture_sec > 0.0
+        ? static_cast<double>(result.framesets) / result.capture_sec
+        : 0.0;
+    result.rate_ok = result.expected_fps > 0.0
+        && capture_fps >= result.expected_fps * opt.min_fps_ratio;
+    result.gaps_ok = !result.streams.empty();
+    for (auto&& stream : result.streams)
+        result.gaps_ok = result.gaps_ok && stream_gap_ratio(stream.second) <= opt.max_gap_ratio;
+    result.performance_ok = result.rate_ok && result.gaps_ok;
+}
+
+static const char* performance_status(const cycle_result& result)
+{
+    if (!result.performance_evaluated)
+        return "not-evaluated";
+    return result.performance_ok ? "pass" : "fail";
+}
+
+static bool performance_failed(const cycle_result& result)
+{
+    return result.performance_evaluated && !result.performance_ok;
+}
+
+static int run_self_test()
+{
+    int checks = 0;
+    int failures = 0;
+    auto check = [&](bool condition, const char* name) {
+        ++checks;
+        if (!condition)
+        {
+            ++failures;
+            std::cerr << "self_test.fail=" << name << "\n";
+        }
+    };
+
+    stream_counter stride1;
+    stride1.frames = 95;
+    stride1.gaps = 5;
+    check(std::abs(stream_gap_ratio(stride1) - 0.05) < 1e-12, "stride1-boundary");
+
+    stream_counter stride2;
+    stride2.frames = 100;
+    stride2.gaps = 10;
+    stride2.expected_stride = 2;
+    check(std::abs(stream_gap_ratio(stride2) - (10.0 / 210.0)) < 1e-12, "stride2-source-units");
+
+    options opt;
+    cycle_result result;
+    result.capture_sec = 10.0;
+    result.framesets = 210;
+    result.expected_fps = 30.0;
+    result.streams["Depth#0"] = stride2;
+    evaluate_performance(result, opt);
+    check(result.rate_ok, "minimum-rate-boundary");
+    check(result.gaps_ok, "stride2-gap-pass");
+    check(result.performance_ok, "combined-performance-pass");
+
+    result.streams["Depth#0"].gaps = 11;
+    evaluate_performance(result, opt);
+    check(!result.gaps_ok && !result.performance_ok, "stride2-gap-fail");
+
+    cycle_result not_evaluated;
+    check(std::string(performance_status(not_evaluated)) == "not-evaluated", "not-evaluated-status");
+    not_evaluated.skipped = true;
+    check(!performance_failed(not_evaluated), "skipped-not-performance-failure");
+    not_evaluated.skipped = false;
+    not_evaluated.started = true;
+    not_evaluated.exceptions = 1;
+    check(!performance_failed(not_evaluated), "start-error-not-performance-failure");
+
+    std::cout << "SELF_TEST checks=" << checks << " failures=" << failures << "\n";
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
 static std::string timestamp_label()
@@ -412,10 +558,14 @@ static void update_stream_counter(cycle_result& result, const rs2::frame& frame)
 {
     auto key = stream_key(frame);
     auto& counter = result.streams[key];
+    const auto source_fps = frame.get_profile().fps();
+    counter.expected_stride = result.expected_fps > 0.0
+        ? std::max<uint64_t>(1, static_cast<uint64_t>(std::llround(source_fps / result.expected_fps)))
+        : 1;
     counter.frames++;
     auto number = frame.get_frame_number();
-    if (counter.has_last && number > counter.last_number + 1)
-        counter.gaps += number - counter.last_number - 1;
+    if (counter.has_last && number > counter.last_number + counter.expected_stride)
+        counter.gaps += number - counter.last_number - counter.expected_stride;
     counter.last_number = number;
     counter.has_last = true;
 }
@@ -684,6 +834,7 @@ static cycle_result run_cycle(rs2::context& ctx,
     cycle_result result;
     result.profile = profile.name;
     result.cycle = cycle;
+    result.expected_fps = expected_frameset_fps(profile);
 
     auto serial = opt.serial;
     if (serial.empty())
@@ -784,6 +935,8 @@ static cycle_result run_cycle(rs2::context& ctx,
             }
         }
 
+        result.capture_sec = elapsed_sec(run_begin, clock_type::now());
+        evaluate_performance(result, opt);
         drain_before_stop(session, opt, result);
     }
 
@@ -813,10 +966,7 @@ static cycle_result run_cycle(rs2::context& ctx,
 
 static void print_cycle_result(const cycle_result& r)
 {
-    const double fps = r.wall_sec > 0.0 ? static_cast<double>(r.framesets) / r.wall_sec : 0.0;
-    uint64_t total_gaps = 0;
-    for (auto&& kv : r.streams)
-        total_gaps += kv.second.gaps;
+    const double fps = r.capture_sec > 0.0 ? static_cast<double>(r.framesets) / r.capture_sec : 0.0;
 
     std::cout << std::fixed << std::setprecision(2)
               << "RESULT profile=" << r.profile
@@ -829,10 +979,16 @@ static void print_cycle_result(const cycle_result& r)
               << " usb3=" << (r.usb3 ? "yes" : "no")
               << " framesets=" << r.framesets
               << " fps=" << fps
+              << " target_hz=" << r.expected_fps
+              << " rate_ok=" << (r.rate_ok ? "yes" : "no")
+              << " gaps_ok=" << (r.gaps_ok ? "yes" : "no")
+              << " performance=" << performance_status(r)
+              << " capture_sec=" << r.capture_sec
+              << " wall_sec=" << r.wall_sec
               << " timeouts=" << r.timeouts
               << " drain_framesets=" << r.drain_framesets
               << " drain_timeouts=" << r.drain_timeouts
-              << " gaps=" << total_gaps
+              << " gaps=" << total_gaps(r)
               << " exceptions=" << r.exceptions
               << " evidence=" << (r.evidence_path.empty() ? "none" : r.evidence_path)
               << " start_ms=" << r.start_ms
@@ -853,6 +1009,8 @@ static void print_cycle_result(const cycle_result& r)
                   << " name=" << kv.first
                   << " frames=" << kv.second.frames
                   << " gaps=" << kv.second.gaps
+                  << " expected_stride=" << kv.second.expected_stride
+                  << " gap_ratio=" << std::fixed << std::setprecision(4) << stream_gap_ratio(kv.second)
                   << "\n";
     }
 }
@@ -879,10 +1037,7 @@ static std::vector<test_profile> selected_profiles(const options& opt)
 
 static std::string result_line(const cycle_result& r)
 {
-    const double fps = r.wall_sec > 0.0 ? static_cast<double>(r.framesets) / r.wall_sec : 0.0;
-    uint64_t total_gaps = 0;
-    for (auto&& kv : r.streams)
-        total_gaps += kv.second.gaps;
+    const double fps = r.capture_sec > 0.0 ? static_cast<double>(r.framesets) / r.capture_sec : 0.0;
 
     std::ostringstream ss;
     ss << std::fixed << std::setprecision(2)
@@ -896,10 +1051,16 @@ static std::string result_line(const cycle_result& r)
        << " usb3=" << (r.usb3 ? "yes" : "no")
        << " framesets=" << r.framesets
        << " fps=" << fps
+       << " target_hz=" << r.expected_fps
+       << " rate_ok=" << (r.rate_ok ? "yes" : "no")
+       << " gaps_ok=" << (r.gaps_ok ? "yes" : "no")
+       << " performance=" << performance_status(r)
+       << " capture_sec=" << r.capture_sec
+       << " wall_sec=" << r.wall_sec
        << " timeouts=" << r.timeouts
        << " drain_framesets=" << r.drain_framesets
        << " drain_timeouts=" << r.drain_timeouts
-       << " gaps=" << total_gaps
+       << " gaps=" << total_gaps(r)
        << " exceptions=" << r.exceptions
        << " evidence=" << (r.evidence_path.empty() ? "none" : r.evidence_path)
        << " start_ms=" << r.start_ms
@@ -917,6 +1078,8 @@ int main(int argc, char** argv) try
     rs2::log_to_console(RS2_LOG_SEVERITY_WARN);
 
     auto opt = parse_options(argc, argv);
+    if (opt.self_test)
+        return run_self_test();
     auto profiles = selected_profiles(opt);
 
     if (opt.list_profiles)
@@ -948,7 +1111,10 @@ int main(int argc, char** argv) try
     std::cout << "test.serial=" << opt.serial << "\n"
               << "test.render=" << (opt.render ? "visible" : "off") << "\n"
               << "test.cycles=" << opt.cycles << "\n"
-              << "test.duration_sec=" << opt.duration_sec << "\n";
+              << "test.duration_sec=" << opt.duration_sec << "\n"
+              << "test.performance_mode=" << (opt.enforce_performance ? "enforce" : "report-only") << "\n"
+              << "test.min_fps_ratio=" << opt.min_fps_ratio << "\n"
+              << "test.max_gap_ratio=" << opt.max_gap_ratio << "\n";
     append_log_line(opt, "device.name=" + get_info_or(device, RS2_CAMERA_INFO_NAME, "unknown"));
     append_log_line(opt, "device.serial=" + get_info_or(device, RS2_CAMERA_INFO_SERIAL_NUMBER, "unknown"));
     append_log_line(opt, "device.usb=" + get_info_or(device, RS2_CAMERA_INFO_USB_TYPE_DESCRIPTOR, "unknown"));
@@ -962,6 +1128,7 @@ int main(int argc, char** argv) try
     }
 
     int failures = 0;
+    int performance_failures = 0;
     uint64_t total_timeouts = 0;
     uint64_t total_framesets = 0;
 
@@ -979,13 +1146,22 @@ int main(int argc, char** argv) try
                    << " cycle=" << result.cycle
                    << " name=" << kv.first
                    << " frames=" << kv.second.frames
-                   << " gaps=" << kv.second.gaps;
+                   << " gaps=" << kv.second.gaps
+                   << " expected_stride=" << kv.second.expected_stride
+                   << " gap_ratio=" << std::fixed << std::setprecision(4) << stream_gap_ratio(kv.second);
                 append_log_line(opt, ss.str());
             }
 
             total_timeouts += result.timeouts;
             total_framesets += result.framesets;
-            if (!result.skipped && (!result.started || !result.stopped_cleanly || result.exceptions != 0 || result.framesets == 0))
+            if (performance_failed(result))
+                performance_failures++;
+            if (!result.skipped
+                && (!result.started
+                    || !result.stopped_cleanly
+                    || result.exceptions != 0
+                    || result.framesets == 0
+                    || (opt.enforce_performance && !result.performance_ok)))
                 failures++;
             if (result.window_closed)
                 break;
@@ -996,12 +1172,14 @@ int main(int argc, char** argv) try
 
     std::cout << "SUMMARY framesets=" << total_framesets
               << " timeouts=" << total_timeouts
+              << " performance_failures=" << performance_failures
               << " failures=" << failures
               << "\n";
     {
         std::ostringstream ss;
         ss << "SUMMARY framesets=" << total_framesets
            << " timeouts=" << total_timeouts
+           << " performance_failures=" << performance_failures
            << " failures=" << failures;
         append_log_line(opt, ss.str());
     }
