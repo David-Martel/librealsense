@@ -54,6 +54,7 @@ struct options
     bool require_usb3 = true;
     bool stress = false;
     bool pointcloud = false;
+    bool disable_pointcloud = false;
     bool filters = false;
     bool align_to_color = true;
     bool capture_evidence = true;
@@ -199,6 +200,7 @@ static void usage()
         << "  --no-render            Disable visible rendering for stress runs\n"
         << "  --allow-usb2           Do not fail when the device is on USB2\n"
         << "  --pointcloud           Force pointcloud processing when depth exists\n"
+        << "  --no-pointcloud        Disable pointcloud processing even when the profile enables it\n"
         << "  --filters              Force depth post-processing filters\n"
         << "  --no-align             Disable align-to-color processing\n"
         << "  --stress               all profiles, 3 cycles, 5 seconds each\n"
@@ -271,6 +273,8 @@ static options parse_options(int argc, char** argv)
             opt.stress = true;
         else if (arg == "--pointcloud")
             opt.pointcloud = true;
+        else if (arg == "--no-pointcloud")
+            opt.disable_pointcloud = true;
         else if (arg == "--filters")
             opt.filters = true;
         else if (arg == "--no-align")
@@ -298,6 +302,8 @@ static options parse_options(int argc, char** argv)
         throw std::invalid_argument("--min-fps-ratio must be greater than 0 and at most 1");
     if (opt.max_gap_ratio < 0.0 || opt.max_gap_ratio > 1.0)
         throw std::invalid_argument("--max-gap-ratio must be between 0 and 1");
+    if (opt.pointcloud && opt.disable_pointcloud)
+        throw std::invalid_argument("--pointcloud and --no-pointcloud are mutually exclusive");
 
     if (opt.stress)
     {
@@ -314,7 +320,7 @@ static options parse_options(int argc, char** argv)
 static std::vector<test_profile> built_in_profiles()
 {
     return {
-        { "vga30", "RGB + depth 640x480@30, align-to-color by default",
+        { "vga30", "RGB + depth 640x480@30, align-to-color and pointcloud by default",
             {
                 { RS2_STREAM_DEPTH, -1, 640, 480, RS2_FORMAT_Z16, 30 },
                 { RS2_STREAM_COLOR, -1, 640, 480, RS2_FORMAT_RGB8, 30 },
@@ -359,6 +365,17 @@ static double elapsed_sec(clock_type::time_point a, clock_type::time_point b)
     return std::chrono::duration_cast<std::chrono::duration<double>>(b - a).count();
 }
 
+static std::vector<std::pair<std::string, bool>> compiled_build_features()
+{
+    return {
+        { "BUILD_WITH_CUDA", RS2_GB10_PROFILER_CUDA != 0 },
+        { "FORCE_RSUSB_BACKEND", RS2_GB10_PROFILER_FORCE_RSUSB != 0 },
+        { "RS2_GB10_USB_TUNING", RS2_GB10_PROFILER_USB_TUNING != 0 },
+        { "RS2_GB10_CONV_CACHE", RS2_GB10_PROFILER_CONV_CACHE != 0 },
+        { "RS2_GB10_PC_ZEROCOPY", RS2_GB10_PROFILER_PC_ZEROCOPY != 0 },
+    };
+}
+
 static double expected_frameset_fps(const test_profile& profile)
 {
     if (profile.streams.empty())
@@ -383,6 +400,11 @@ static double stream_gap_ratio(const stream_counter& stream)
     const auto expected = static_cast<double>(stream.frames) * static_cast<double>(stream.expected_stride)
         + static_cast<double>(stream.gaps);
     return expected > 0.0 ? static_cast<double>(stream.gaps) / expected : 0.0;
+}
+
+static bool pointcloud_processing_enabled(const test_profile& profile, const options& opt)
+{
+    return !opt.disable_pointcloud && (opt.pointcloud || profile.pointcloud);
 }
 
 static void evaluate_performance(cycle_result& result, const options& opt)
@@ -458,6 +480,17 @@ static int run_self_test()
     not_evaluated.started = true;
     not_evaluated.exceptions = 1;
     check(!performance_failed(not_evaluated), "start-error-not-performance-failure");
+
+    test_profile pointcloud_profile;
+    pointcloud_profile.pointcloud = true;
+    options profile_default;
+    check(pointcloud_processing_enabled(pointcloud_profile, profile_default), "pointcloud-profile-default");
+    profile_default.disable_pointcloud = true;
+    check(!pointcloud_processing_enabled(pointcloud_profile, profile_default), "pointcloud-profile-disabled");
+    options forced_pointcloud;
+    forced_pointcloud.pointcloud = true;
+    pointcloud_profile.pointcloud = false;
+    check(pointcloud_processing_enabled(pointcloud_profile, forced_pointcloud), "pointcloud-force");
 
     std::cout << "SELF_TEST checks=" << checks << " failures=" << failures << "\n";
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
@@ -777,7 +810,7 @@ static void apply_processing(const test_profile& profile,
     if (!depth)
         return;
 
-    if (opt.pointcloud || profile.pointcloud)
+    if (pointcloud_processing_enabled(profile, opt))
     {
         if (auto color = frames.get_color_frame())
             pc.map_to(color);
@@ -1079,7 +1112,11 @@ int main(int argc, char** argv) try
 
     auto opt = parse_options(argc, argv);
     if (opt.self_test)
+    {
+        for (auto&& feature : compiled_build_features())
+            std::cout << "build." << feature.first << "=" << (feature.second ? "1" : "0") << "\n";
         return run_self_test();
+    }
     auto profiles = selected_profiles(opt);
 
     if (opt.list_profiles)
@@ -1088,6 +1125,9 @@ int main(int argc, char** argv) try
             std::cout << profile.name << " - " << profile.description << "\n";
         return EXIT_SUCCESS;
     }
+
+    for (auto&& feature : compiled_build_features())
+        std::cout << "build." << feature.first << "=" << (feature.second ? "1" : "0") << "\n";
 
     process_lock lock("/tmp/rs-gb10-profiler.lock");
     opt.output_dir = create_run_dir(opt.output_dir);
@@ -1112,12 +1152,16 @@ int main(int argc, char** argv) try
               << "test.render=" << (opt.render ? "visible" : "off") << "\n"
               << "test.cycles=" << opt.cycles << "\n"
               << "test.duration_sec=" << opt.duration_sec << "\n"
+              << "test.pointcloud_override="
+              << (opt.disable_pointcloud ? "disable" : (opt.pointcloud ? "force" : "profile")) << "\n"
               << "test.performance_mode=" << (opt.enforce_performance ? "enforce" : "report-only") << "\n"
               << "test.min_fps_ratio=" << opt.min_fps_ratio << "\n"
               << "test.max_gap_ratio=" << opt.max_gap_ratio << "\n";
     append_log_line(opt, "device.name=" + get_info_or(device, RS2_CAMERA_INFO_NAME, "unknown"));
     append_log_line(opt, "device.serial=" + get_info_or(device, RS2_CAMERA_INFO_SERIAL_NUMBER, "unknown"));
     append_log_line(opt, "device.usb=" + get_info_or(device, RS2_CAMERA_INFO_USB_TYPE_DESCRIPTOR, "unknown"));
+    for (auto&& feature : compiled_build_features())
+        append_log_line(opt, "build." + feature.first + "=" + (feature.second ? "1" : "0"));
 
     std::unique_ptr<window> app;
     if (opt.render)
