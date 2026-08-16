@@ -16,6 +16,7 @@ import logging
 log = logging.getLogger(__name__)
 import time
 import platform
+from rspy.snippets import is_dds_dev
 
 pytestmark = [
     pytest.mark.device_each("D400*"),
@@ -23,16 +24,17 @@ pytestmark = [
 ]
 
 
-_device_settled = False
-
-@pytest.fixture
+@pytest.fixture(scope="module")
 def pipeline_device(test_device):
-    """Return (dev, ctx), waiting once for device to reach idle state."""
-    global _device_settled
+    """Return (dev, ctx), waiting once for device to reach idle state.
+
+    Module-scoped so the settle-sleep fires once per module under normal runs
+    AND re-fires after a --retries-triggered re-instantiation (pytest-retry
+    tears down module fixtures between attempts, so the device may have been
+    recycled and needs to settle again).
+    """
     dev, ctx = test_device
-    if not _device_settled:
-        time.sleep(3)  # device starts at D0 (Operational), wait for idle
-        _device_settled = True
+    time.sleep(3)  # device starts at D0 (Operational), wait for idle
     return dev, ctx
 
 
@@ -56,6 +58,9 @@ def test_pipeline_first_depth_frame_delay(pipeline_device):
     log.info(f"Testing pipeline first depth frame delay on {product_name} device - {os_name} OS")
 
     depth_cfg = rs.config()
+    # On hubless multi-device rigs (e.g. Jetson with D457 + D436) the context sees every
+    # connected device; without enable_device(sn) the pipeline picks the first match.
+    depth_cfg.enable_device(dev.get_info(rs.camera_info.serial_number))
     depth_cfg.enable_stream(rs.stream.depth, rs.format.z16, 30)
 
     frame_delay = time_to_first_frame(ctx, depth_cfg)
@@ -65,6 +70,10 @@ def test_pipeline_first_depth_frame_delay(pipeline_device):
 
     assert frame_delay < max_delay, \
         f"Depth frame delay {frame_delay:.3f}s exceeds maximum {max_delay:.1f}s"
+
+    # Allow some time to close the depth pipe completely, stream stops when DDS reader closure is detected by device
+    if is_dds_dev(dev):
+        time.sleep(1)
 
 
 def test_pipeline_first_color_frame_delay(pipeline_device):
@@ -76,13 +85,12 @@ def test_pipeline_first_color_frame_delay(pipeline_device):
     if any(model in product_name for model in ['D421', 'D405', 'D430', 'D401']):
         pytest.skip(f"Device {product_name} has no color sensor")
 
-    # Allow HKR some time to close the depth pipe completely (runs after depth test)
-    if 'D555' in product_name:
-        time.sleep(1)
-
     log.info(f"Testing pipeline first color frame delay on {product_name} device - {os_name} OS")
 
     color_cfg = rs.config()
+    # On hubless multi-device rigs (e.g. Jetson with D457 + D436) the context sees every
+    # connected device; without enable_device(sn) the pipeline picks the first match.
+    color_cfg.enable_device(dev.get_info(rs.camera_info.serial_number))
     color_cfg.enable_stream(rs.stream.color, rs.format.rgb8, 30)
 
     frame_delay = time_to_first_frame(ctx, color_cfg)

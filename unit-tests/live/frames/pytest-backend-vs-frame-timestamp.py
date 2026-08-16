@@ -10,12 +10,13 @@ import pytest
 import pyrealsense2 as rs
 import time
 import logging
+from rspy.snippets import is_dds_dev
 log = logging.getLogger(__name__)
 
 pytestmark = [
     pytest.mark.device("D400*"),
     pytest.mark.device_each("D500*"),
-    pytest.mark.device_exclude("D401"),
+    pytest.mark.device_type_exclude("DDS"), # DDS devices no longer support Global Timestamp option. See Jira RSDEV-6299
 ]
 
 FPS = 30
@@ -73,7 +74,15 @@ def test_depth_backend_vs_frame_timestamp(test_device):
     log.info("Testing depth backend vs frame timestamp")
     _run_timestamp_check(ds, dp, "Depth")
 
+    # Allow some time to close the depth pipe completely, stream stops when DDS reader closure is detected by device
+    if is_dds_dev(dev):
+        time.sleep(1)
 
+
+# D421/D401/D405 do not have a color sensor support.
+@pytest.mark.device_exclude("D421")
+@pytest.mark.device_exclude("D401")
+@pytest.mark.device_exclude("D405")
 def test_color_backend_vs_frame_timestamp(test_device):
     dev, ctx = test_device
 

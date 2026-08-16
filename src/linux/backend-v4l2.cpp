@@ -899,7 +899,7 @@ namespace librealsense
             if (!is_usb_path_valid(video_path, dev_name, busnum, devnum, devpath))
             {
 #ifndef RS2_USE_CUDA
-                if (rsutils::rs2_is_gpu_available())
+                if (rsutils::rs2_is_cuda_available())
                 {
                     /* On the Jetson TX, the camera module is CSI & I2C and does not report as this code expects
                     Patch suggested by JetsonHacks: https://github.com/jetsonhacks/buildLibrealsense2TX */
@@ -2430,9 +2430,9 @@ namespace librealsense
                                     static_cast<float>(frame_interval.discrete.numerator);
 
                                 // On D585S, we need to distinguish the occupancy and the label point cloud streams.
-                                // The condition currently support 2 resolutions for LPC
+                                // The condition currently support 3 resolutions for LPC
                                 // This needs to be refactored!
-                                if (this->_info.pid == 0X0B6B && frame_size.discrete.width == 2880 && (frame_size.discrete.height == 1040 || frame_size.discrete.height == 260)) // 0x0B6B pid for D585S_PID
+                                if (this->_info.pid == 0X0B6B && frame_size.discrete.width == 2880 && (frame_size.discrete.height == 1040 || frame_size.discrete.height == 260 || frame_size.discrete.height == 32)) // 0x0B6B pid for D585S_PID
                                 {
                                     fourcc = 0x50414c38; // PAL8 used instead of GREY in order to distinguish between occupancy and point cloud streams
                                 }
@@ -3171,16 +3171,16 @@ namespace librealsense
                 case RS2_OPTION_EXPOSURE: return V4L2_CID_EXPOSURE_ABSOLUTE; // Is this actually valid? I'm getting a lot of VIDIOC error 22s...
                 case RS2_OPTION_GAIN: return V4L2_CTRL_CLASS_IMAGE_SOURCE | 0x903; // v4l2-ctl --list-ctrls -d /dev/video0
                 case RS2_OPTION_GAMMA: return V4L2_CID_GAMMA;
-                case RS2_OPTION_HUE: return V4L2_CID_HUE;
+                // case RS2_OPTION_HUE: return V4L2_CID_HUE;
                 case RS2_OPTION_LASER_POWER: return V4L2_CID_EXPOSURE_ABSOLUTE;
                 case RS2_OPTION_EMITTER_ENABLED: return V4L2_CID_EXPOSURE_AUTO;
-//            case RS2_OPTION_SATURATION: return V4L2_CID_SATURATION;
-//            case RS2_OPTION_SHARPNESS: return V4L2_CID_SHARPNESS;
-//            case RS2_OPTION_WHITE_BALANCE: return V4L2_CID_WHITE_BALANCE_TEMPERATURE;
+                case RS2_OPTION_SATURATION: return V4L2_CID_SATURATION;
+                case RS2_OPTION_SHARPNESS: return V4L2_CID_SHARPNESS;
+                case RS2_OPTION_WHITE_BALANCE: return V4L2_CID_WHITE_BALANCE_TEMPERATURE;
                 case RS2_OPTION_ENABLE_AUTO_EXPOSURE: return V4L2_CID_EXPOSURE_AUTO; // Automatic gain/exposure control
-//            case RS2_OPTION_ENABLE_AUTO_WHITE_BALANCE: return V4L2_CID_AUTO_WHITE_BALANCE;
-//            case RS2_OPTION_POWER_LINE_FREQUENCY : return V4L2_CID_POWER_LINE_FREQUENCY;
-//            case RS2_OPTION_AUTO_EXPOSURE_PRIORITY: return V4L2_CID_EXPOSURE_AUTO_PRIORITY;
+                case RS2_OPTION_ENABLE_AUTO_WHITE_BALANCE: return V4L2_CID_AUTO_WHITE_BALANCE;
+                case RS2_OPTION_POWER_LINE_FREQUENCY : return V4L2_CID_POWER_LINE_FREQUENCY;
+                case RS2_OPTION_AUTO_EXPOSURE_PRIORITY: return V4L2_CID_EXPOSURE_AUTO_PRIORITY;
                 default: throw linux_backend_exception(rsutils::string::from() << "no v4l2 mipi mapping cid for option " << option);
             }
         }

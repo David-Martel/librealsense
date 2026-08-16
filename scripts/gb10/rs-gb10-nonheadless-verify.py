@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: E501, E702
 """GB10 non-headless display validation + interactive debug viewer for the RealSense.
 
 Renders the LIVE stream to a window on the MAIN display ($DISPLAY) and either validates it (default,
@@ -40,7 +41,6 @@ Controls (`--interactive`): 1-9 profile(size x fps)  c/d color/depth  e emitter 
   - = gain   l/L laser   p preset   f freeze   r re-acquire after a stream error   s snapshot   h help   q quit
 """
 import argparse
-import json
 import os
 import queue
 import subprocess
@@ -79,6 +79,8 @@ def build_parser():
     p.add_argument("--rgbd", action="store_true", help=argparse.SUPPRESS)  # accepted, mapped to color
     p.add_argument("--profile", type=int, default=DEFAULT_IDX, metavar="IDX",
                    help="initial profile index into the family's size/fps list")
+    p.add_argument("--serial", default=os.environ.get("LRS_DEVICE_SERIAL", ""), metavar="SERIAL",
+                   help="bind the SDK pipeline to one camera (or set LRS_DEVICE_SERIAL)")
     p.add_argument("--duration", type=float, default=None, metavar="S",
                    help="run for S seconds (default: validate runs --frames frames)")
     p.add_argument("--frames", type=int, default=150, help="validate-mode frame count")
@@ -105,6 +107,28 @@ def clamp_idx(idx, family):
 
 def profile_for(family, idx):
     return (COLOR_PROFILES if family == "color" else DEPTH_PROFILES)[clamp_idx(idx, family)]
+
+
+def device_provenance_checks(requested_serial, actual_serial, usb_type):
+    """Return fail-closed identity/link checks for the device that actually started."""
+    return {
+        "actual_serial_present": bool(actual_serial),
+        "requested_serial_matches": not requested_serial or actual_serial == requested_serial,
+        "usb3": bool(usb_type) and str(usb_type).startswith("3"),
+    }
+
+
+def seal_device_provenance(report, requested_serial, actual_serial, usb_type):
+    """Replace any preflight device metadata with the exact started device."""
+    checks = device_provenance_checks(requested_serial, actual_serial, usb_type)
+    report.pop("usb_warning", None)
+    report.update({"requested_device_serial": requested_serial or None,
+                   "device_serial": actual_serial,
+                   "usb_type": usb_type,
+                   "device_provenance_checks": checks})
+    if usb_type and not checks["usb3"]:
+        report["usb_warning"] = f"link is USB {usb_type} (<3.x) — degraded/death-prone"
+    return checks
 
 
 def compose_hud(img, fps_line, meta_lines, status="", help_lines=None):
@@ -219,9 +243,12 @@ def continuity_checks(frame_numbers, gaps_ms=None, domains=None, gap_max_ms=None
 # ----------------------------- camera I/O (fail-safe lifecycle) -----------------------------
 class Cam:
     """Single-stream RealSense wrapper: hot profile-switch, feature controls, fail-safe re-acquire."""
-    def __init__(self, rs, family="color", idx=DEFAULT_IDX):
+    def __init__(self, rs, family="color", idx=DEFAULT_IDX, serial=""):
         self.rs = rs; self.ctx = rs.context()
         self.family = family; self.idx = clamp_idx(idx, family)
+        self.serial = serial
+        self.device_serial = None
+        self.usb_type = None
         self.pipe = None; self.whf = None
         self.depth_sensor = None; self.color_sensor = None
 
@@ -229,6 +256,8 @@ class Cam:
         rs = self.rs
         w, h, fps = profile_for(self.family, self.idx)
         cfg = rs.config()
+        if self.serial:
+            cfg.enable_device(self.serial)
         if self.family == "color":
             cfg.enable_stream(rs.stream.color, w, h, rs.format.bgr8, fps)
         else:
@@ -237,6 +266,14 @@ class Cam:
         prof = self.pipe.start(cfg)
         self.whf = (w, h, fps)
         dev = prof.get_device()
+        try:
+            self.device_serial = dev.get_info(rs.camera_info.serial_number)
+        except Exception:
+            self.device_serial = None
+        try:
+            self.usb_type = dev.get_info(rs.camera_info.usb_type_descriptor)
+        except Exception:
+            self.usb_type = None
         try:
             self.depth_sensor = dev.first_depth_sensor()
         except Exception:
@@ -269,7 +306,6 @@ class Cam:
 
     def read(self, timeout_ms=5000):
         """Return the frame for the active family, or None on a (caught) stream error."""
-        rs = self.rs
         try:
             fs = self.pipe.wait_for_frames(timeout_ms)
         except Exception:
@@ -336,15 +372,81 @@ def run_self_test():
             fails.append(name)
 
     # argparse: good args parse; aliases + defaults resolve; bad args exit 2
-    a = resolve_args(["--interactive", "--depth", "--duration", "5"])
+    a = resolve_args(["--interactive", "--depth", "--duration", "5", "--serial", "1234"])
     check("argparse: --depth->stream=depth", a.stream == "depth")
     check("argparse: --interactive default record off", a.record is False)
+    check("argparse: --serial retained", a.serial == "1234")
     check("argparse: validate default record on", resolve_args([]).record is True)
     try:
         build_parser().parse_args(["--stream", "bogus"]); bad_ok = False
     except SystemExit as e:
         bad_ok = (e.code == 2)
     check("argparse: invalid choice exits 2", bad_ok)
+
+    # Exact device binding must derive provenance from the started device, not devices[0].
+    class FakeDevice:
+        def __init__(self, serial, usb):
+            self.serial = serial
+            self.usb = usb
+
+        def get_info(self, info):
+            return self.serial if info == "serial" else self.usb
+
+        def first_depth_sensor(self):
+            raise RuntimeError("no depth sensor in fake")
+
+        def query_sensors(self):
+            return []
+
+    class FakeContext:
+        def __init__(self):
+            self.devices = [FakeDevice("camera-a", "2.1"), FakeDevice("camera-b", "3.2")]
+
+    class FakeConfig:
+        def enable_device(self, serial):
+            self.serial = serial
+
+        def enable_stream(self, *_args):
+            pass
+
+    class FakePipeline:
+        def __init__(self, context):
+            self.context = context
+
+        def start(self, config):
+            device = next(device for device in self.context.devices if device.serial == config.serial)
+            return type("FakeProfile", (), {"get_device": lambda _self: device})()
+
+    class FakeRs:
+        stream = type("Stream", (), {"color": "color", "depth": "depth"})
+        format = type("Format", (), {"bgr8": "bgr8", "z16": "z16"})
+        camera_info = type("CameraInfo", (), {
+            "serial_number": "serial", "usb_type_descriptor": "usb", "name": "name"})
+
+        def __init__(self):
+            self.fake_context = FakeContext()
+
+        def context(self):
+            return self.fake_context
+
+        def config(self):
+            return FakeConfig()
+
+        def pipeline(self, context):
+            return FakePipeline(context)
+
+    fake_cam = Cam(FakeRs(), serial="camera-b")
+    fake_cam.start()
+    check("device provenance: exact second camera selected", fake_cam.device_serial == "camera-b")
+    fake_report = {"usb_type": "2.1", "usb_warning": "stale first-camera warning"}
+    checks = seal_device_provenance(fake_report, "camera-b", fake_cam.device_serial, fake_cam.usb_type)
+    check("device provenance: exact USB3 device passes", all(checks.values()))
+    check("device provenance: exact device replaces preflight USB", fake_report["usb_type"] == "3.2")
+    check("device provenance: stale preflight warning removed", "usb_warning" not in fake_report)
+    check("device provenance: mismatch fails",
+          not device_provenance_checks("camera-a", "camera-b", "3.2")["requested_serial_matches"])
+    check("device provenance: missing actual fails",
+          not device_provenance_checks("camera-b", None, "3.2")["actual_serial_present"])
 
     # profile clamping at both bounds + family sizes
     check("clamp low", clamp_idx(-5, "color") == 0)
@@ -417,8 +519,16 @@ def run(args):
                        "stream": args.stream, "main_display": DISPLAY, "cv2": cv2.__version__})
     hil.preflight()
 
-    cam = Cam(rs, family=args.stream, idx=args.profile)
+    cam = Cam(rs, family=args.stream, idx=args.profile, serial=args.serial)
     cam.start()
+    provenance_checks = seal_device_provenance(
+        hil.report, args.serial, cam.device_serial, cam.usb_type)
+    if not all(provenance_checks.values()):
+        cam.stop()
+        hil.report["result"] = "FAIL"
+        hil.report["device_provenance_error"] = "exact serial or USB3 provenance check failed"
+        hil.finish(ok=False)
+        return 1
     colorizer = rs.colorizer()
 
     shared = {"img": None, "stop": False, "controller_dead": False}

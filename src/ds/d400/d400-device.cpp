@@ -133,19 +133,23 @@ namespace librealsense
 
         std::string fw_version = ds::extract_firmware_version_string( image );
 
-        auto it = ds::d400_device_to_fw_min_version.find( _pid );
-        if( it == ds::d400_device_to_fw_min_version.end() )
-        {
-            throw librealsense::invalid_value_exception(
-                rsutils::string::from()
-                << "Min and Max firmware versions have not been defined for this device: "
-                << std::hex << _pid );
-        }
-        bool result = ( firmware_version( fw_version ) >= firmware_version( it->second ) );
+        std::string const min_fw = get_firmware_min_version();
+        bool result = ( firmware_version( fw_version ) >= firmware_version( min_fw ) );
         if( ! result )
             LOG_ERROR( "Firmware version isn't compatible " << fw_version );
 
         return result;
+    }
+
+    std::string d400_device::get_firmware_min_version() const
+    {
+        auto it = ds::d400_device_to_fw_min_version.find( _pid );
+        if( it == ds::d400_device_to_fw_min_version.end() )
+            throw librealsense::invalid_value_exception(
+                rsutils::string::from()
+                << "Minimum firmware version has not been defined for this device: "
+                << std::hex << _pid );
+        return it->second;
     }
 
     std::string d400_device::get_opcode_string(int opcode) const
@@ -543,15 +547,30 @@ namespace librealsense
         init( dev_info->get_context(), dev_info->get_group() );
     }
 
+    d400_device::~d400_device()
+    {
+        // Signal background loops (polling_error_handler) so they exit cleanly on the
+        // next tick instead of firing one more failing FW query before being joined.
+        _device_alive->store( false );
+    }
+
     void d400_device::init(std::shared_ptr<context> ctx,
         const platform::backend_device_group& group)
     {
         using namespace ds;
+        using namespace platform;
 
         auto raw_sensor = get_raw_depth_sensor();
         _pid = group.uvc_devices.front().pid;
 
         _is_mipi_device = (ds::d400_mipi_device_pid.count(_pid) > 0);
+        
+        // Register MIPI driver version for GMSL devices
+        rsutils::version mipi_driver_version;
+        if (_is_mipi_device)
+        {
+            mipi_driver_version = platform::get_jetson_driver_version();
+        }
 
         _color_calib_table_raw = [this]()
         {
@@ -607,19 +626,6 @@ namespace librealsense
         auto& depth_sensor = get_depth_sensor();
         auto raw_depth_sensor = get_raw_depth_sensor();
 
-        using namespace platform;
-
-        rsutils::version mipi_driver_version;
-        // Register MIPI driver version for Jetson platform (GMSL devices only)
-        if (_is_mipi_device)
-        {
-            auto uvc_dev = raw_depth_sensor->get_uvc_device();
-            if (uvc_dev && uvc_dev->is_platform_jetson())
-            {
-                mipi_driver_version = platform::get_jetson_driver_version();
-            }
-        }
-
         // minimal firmware version in which hdr feature is supported
         firmware_version hdr_firmware_version("5.12.8.100");
 
@@ -653,19 +659,13 @@ namespace librealsense
                     usb_modality = false;
             }
 
-            if (!_is_mipi_device)
+            if ( !_is_mipi_device || mipi_driver_version >= rsutils::version("1.0.4.9") )
             {
                 depth_sensor.register_processing_block(
                     { {RS2_FORMAT_Y8I} },
                     { {RS2_FORMAT_Y8, RS2_STREAM_INFRARED, 1} , {RS2_FORMAT_Y8, RS2_STREAM_INFRARED, 2} },
                     []() { return std::make_shared<y8i_to_y8y8>(); }
                 ); // L+R
-
-                depth_sensor.register_processing_block(
-                    { RS2_FORMAT_Y12I },
-                    { {RS2_FORMAT_Y16, RS2_STREAM_INFRARED, 1}, {RS2_FORMAT_Y16, RS2_STREAM_INFRARED, 2} },
-                    []() {return std::make_shared<y12i_to_y16y16>(); }
-                );
             }
             else
             {
@@ -674,15 +674,26 @@ namespace librealsense
                     { {RS2_FORMAT_Y8, RS2_STREAM_INFRARED, 1} , {RS2_FORMAT_Y8, RS2_STREAM_INFRARED, 2} },
                     []() { return std::make_shared<y8i_to_y8y8_mipi>(); }
                 ); // L+R
+            }
 
+            if ( !_is_mipi_device )
+            {
+                depth_sensor.register_processing_block(
+                    { RS2_FORMAT_Y12I },
+                    { {RS2_FORMAT_Y16, RS2_STREAM_INFRARED, 1}, {RS2_FORMAT_Y16, RS2_STREAM_INFRARED, 2} },
+                    []() {return std::make_shared<y12i_to_y16y16>(); }
+                );
+            }
+            else
+            {
                  depth_sensor.register_processing_block(
                     { RS2_FORMAT_Y12I },
                     { {RS2_FORMAT_Y16, RS2_STREAM_INFRARED, 1}, {RS2_FORMAT_Y16, RS2_STREAM_INFRARED, 2} },
                     []() {return std::make_shared<y12i_to_y16y16_mipi>(); }
                 );
             }
-            
 
+            
             pid_hex_str = rsutils::string::from() << std::uppercase << rsutils::string::hexdump( _pid );
 
             if ((_pid == RS416_PID || _pid == RS416_RGB_PID) && _fw_version >= firmware_version("5.12.0.1"))
@@ -726,6 +737,7 @@ namespace librealsense
 
                     _polling_error_handler = std::make_shared<polling_error_handler>(1000,
                         error_control,
+                        std::weak_ptr<std::atomic<bool>>( _device_alive ),
                         raw_depth_sensor->get_notifications_processor(),
                         std::make_shared< ds_notification_decoder >( d400_fw_error_report ) );
 
@@ -937,13 +949,10 @@ namespace librealsense
                 }
             }
 
-            if (!_is_mipi_device)
-            {
-                depth_sensor.register_option( RS2_OPTION_STEREO_BASELINE,
-                                              std::make_shared< const_value_option >(
-                                                  "Distance in mm between the stereo imagers",
-                                                  rsutils::lazy< float >( [this]() { return get_stereo_baseline_mm(); } ) ) );
-            }
+            depth_sensor.register_option( RS2_OPTION_STEREO_BASELINE,
+                                          std::make_shared< const_value_option >(
+                                              "Distance in mm between the stereo imagers",
+                                              rsutils::lazy< float >( [this]() { return get_stereo_baseline_mm(); } ) ) );
 
             _depth_units_register_action = [this]()
             {
@@ -1037,7 +1046,6 @@ namespace librealsense
     void d400_device::register_features()
     {
         firmware_version fw_ver = firmware_version( get_info( RS2_CAMERA_INFO_FIRMWARE_VERSION ) );
-        auto pid = get_pid();
 
         if( val_in_range( _pid, { ds::RS455_PID, ds::RS457_PID } )
             && fw_ver >= firmware_version( 5, 14, 0, 0 ) )
@@ -1051,7 +1059,9 @@ namespace librealsense
 
         register_feature( std::make_shared< auto_exposure_roi_feature >( get_depth_sensor(), _hw_monitor ) );
 
-        if( !_is_mipi_device && fw_ver >= firmware_version( 5, 12, 10, 11 ) )
+        // ae / gain limit feature is not supported on rolling-shutter
+        if( fw_ver >= firmware_version( 5, 12, 10, 11 )
+            && ( _device_capabilities & ds::ds_caps::CAP_GLOBAL_SHUTTER ) == ds::ds_caps::CAP_GLOBAL_SHUTTER )
         {
             register_feature(
                 std::make_shared< auto_exposure_limit_feature >( get_depth_sensor(), d400_device::_hw_monitor ) );

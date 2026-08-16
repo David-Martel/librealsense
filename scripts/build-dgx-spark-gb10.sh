@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="${LRS_GB10_BUILD_DIR:-/opt/vigil/build/librealsense-v2.58.1-dgx-spark-gb10}"
-PREFIX="${LRS_GB10_PREFIX:-/opt/vigil/opt/librealsense-v2.58.1-dgx-spark-gb10}"
+BUILD_DIR="${LRS_GB10_BUILD_DIR:-/opt/vigil/build/librealsense-v2.58.3-dgx-spark-gb10}"
+PREFIX="${LRS_GB10_PREFIX:-/opt/vigil/opt/librealsense-v2.58.3-dgx-spark-gb10}"
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 CUDA_ARCH="${LRS_GB10_CUDA_ARCH:-121}"
 JOBS="${LRS_GB10_JOBS:-$(nproc)}"
@@ -26,11 +26,18 @@ fi
 GENERATOR="${LRS_GB10_GENERATOR:-Ninja}"
 # Toolchain arch: default -mcpu=native (best perf on THIS host, but binaries are host-CPU-specific and
 # GCC 13.3 silently degrades 'native' to an armv8-a baseline on Cortex-X925). Set LRS_GB10_REPRODUCIBLE=1
-# for an explicit, portable, reproducible GB10 arch (-mcpu=cortex-x925) instead of 'native'.
+# for an explicit GB10 ISA and a GCC-13-supported tuning target. GCC 13.3 rejects both
+# -mcpu=cortex-x925 and -mcpu=cortex-a725; both Spark core classes expose Armv9.2-A, SVE2, BF16, and I8MM.
 if [[ "${LRS_GB10_REPRODUCIBLE:-0}" == "1" ]]; then
-  ARCH_FLAG="${LRS_GB10_ARCH:--mcpu=cortex-x925}"
+  ARCH_FLAG="${LRS_GB10_ARCH:--march=armv9.2-a+sve2+bf16+i8mm -mtune=neoverse-v2}"
 else
   ARCH_FLAG="${LRS_GB10_ARCH:--mcpu=native}"
+fi
+read -r -a ARCH_ARGS <<< "$ARCH_FLAG"
+CXX_COMPILER="${CXX:-c++}"
+if ! printf 'int main() { return 0; }\n' | "$CXX_COMPILER" "${ARCH_ARGS[@]}" -x c++ -c -o /dev/null -; then
+  echo "ERROR: C++ compiler '$CXX_COMPILER' rejects LRS_GB10_ARCH='$ARCH_FLAG'" >&2
+  exit 1
 fi
 NATIVE_FLAGS="${LRS_GB10_NATIVE_FLAGS:--O3 -DNDEBUG $ARCH_FLAG -ffunction-sections -fdata-sections}"
 LINK_FLAGS="${LRS_GB10_LINK_FLAGS:--Wl,--gc-sections}"
@@ -43,12 +50,9 @@ FORCE_RSUSB="${LRS_GB10_FORCE_RSUSB:-ON}"
 # Enable GB10-specific USB mitigations (P2 URB pool depth + P4 watchdog rate-limit + stop settle).
 # Set LRS_GB10_USB_TUNING=0 to produce a vanilla build without the GB10 defaults baked in.
 GB10_USB_TUNING="${LRS_GB10_USB_TUNING:-1}"
-# CUDA cached-buffer ladders, PROMOTED TO DEFAULT (measured: pointcloud 3.3x faster, conversion
-# ~NEON-parity; both byte-identical to baseline, max-abs-diff 0). Default ON here: the ladder is
-# compiled in AND the runtime default is mode 1 (cached) -- see rs2_pc_mode()/rs2_conv_mode().
-# These defines are #if-guarded, so an UPSTREAM cmake build without them is byte-identical; only this
-# GB10 build profile bakes the cached path in. Set =0 to opt back out to the per-frame-malloc baseline.
-GB10_PC_ZEROCOPY="${LRS_GB10_PC_ZEROCOPY:-1}"
+# v2.58.3 owns persistent pointcloud buffers per helper instance.  Keep the retired process-static
+# GB10 ladder explicitly disabled so stale build environments cannot reintroduce it.
+GB10_PC_ZEROCOPY="${LRS_GB10_PC_ZEROCOPY:-0}"
 GB10_CONV_CACHE="${LRS_GB10_CONV_CACHE:-1}"
 # Opt-in to building the unit-test target alongside the SDK (off by default in GB10 builds to
 # avoid requiring Catch2 unless the user explicitly wants tests).
@@ -92,9 +96,8 @@ Useful environment:
                            Python install dir, default under the GB10 prefix
   LRS_GB10_USB_TUNING      Bake in GB10 USB mitigations (RS2_GB10_USB_TUNING=1),
                            default 1 (ON). Set to 0 for a vanilla build.
-  LRS_GB10_PC_ZEROCOPY     Pointcloud cached-buffer ladder, default 1 (ON +
-                           runtime mode 1 = cached, 3.3x faster). Set 0 to opt out
-                           (or RS2_PC_MODE=0 at runtime for the malloc baseline).
+  LRS_GB10_PC_ZEROCOPY     Retired process-static pointcloud ladder; must remain 0.
+                           v2.58.3 reuses per-instance CUDA buffers by default.
   LRS_GB10_CONV_CACHE      YUYV->color cached-buffer ladder, default 1 (ON +
                            runtime mode 1 = cached, ~NEON-parity). Set 0 to opt out
                            (or RS2_CONV_MODE=0 at runtime for the malloc baseline).

@@ -124,11 +124,9 @@ namespace rs2
     {
         std::stringstream ss;
 
-        rs2_error* e = nullptr;
-
         ss << "| | |\n";
         ss << "|---|---|\n";
-        ss << "|**librealsense**|" << api_version_to_string(rs2_get_api_version(&e)) << (is_debug() ? " DEBUG" : " RELEASE") << "|\n";
+        ss << "|**librealsense**|" << RS2_API_FULL_VERSION_STR << (is_debug() ? " DEBUG" : " RELEASE") << "|\n";
         ss << "|**OS**|" << rsutils::os::get_os_name() << "|\n";
 
         for (auto& dm : devices)
@@ -318,7 +316,7 @@ namespace rs2
         {
             std::string name = dev.get_info(RS2_CAMERA_INFO_NAME);
             std::smatch match;
-            if( ! std::regex_search( name, match, std::regex( "^Intel RealSense (\\S+)" ) ) )
+            if( ! std::regex_search( name, match, std::regex( "^RealSense (\\S+)" ) ) )
                 throw std::runtime_error( "cannot parse device name from '" + name + "'" );
 
             glob(
@@ -334,6 +332,47 @@ namespace rs2
             LOG_WARNING( "Exception caught trying to detect presets: " << e.what() );
         }
     }
+
+    bool device_model::subdevice_has_inference_stream_enabled( const subdevice_model & sub )
+    {
+        for( auto const & kv : sub.stream_enabled )
+        {
+            if( ! kv.second ) continue;
+            for( auto const & p : sub.profiles )
+                if( p.unique_id() == kv.first && p.stream_type() == RS2_STREAM_OBJECT_DETECTION )
+                    return true;
+        }
+        return false;
+    }
+
+    bool device_model::are_color_and_depth_streaming() const
+    {
+        bool has_color = false, has_depth = false;
+        for( auto const & sub : subdevices )
+        {
+            if( ! sub->streaming ) continue;
+            for( auto const & p : sub->profiles )
+            {
+                if( p.stream_type() == RS2_STREAM_COLOR ) has_color = true;
+                if( p.stream_type() == RS2_STREAM_DEPTH ) has_depth = true;
+            }
+            if( has_color && has_depth ) return true;
+        }
+        return false;
+    }
+
+    void device_model::stop_inference_if_video_stopped( viewer_model & viewer )
+    {
+        // If color or depth are no longer both streaming, stop any inference subdevice that is still running.
+        if( are_color_and_depth_streaming() )
+            return;
+        for( auto & sub : subdevices )
+        {
+            if( sub->streaming && subdevice_has_inference_stream_enabled( *sub ) )
+                sub->stop( viewer.not_model );
+        }
+    }
+
     void device_model::play_defaults(viewer_model& viewer)
     {
         if (!dev_syncer)
@@ -1267,6 +1306,65 @@ namespace rs2
                     }
                 }
 
+                // PID toggle between Dual-RGB (2C) and Dedicated-RGB (3C) variants:
+                //   D535:       0x0C01 <-> 0x0C02
+                //   D585:       0x0C04 <-> 0x0C05
+                //   D585 Proto: 0x0C07 <-> 0x0C08
+                if (dev.supports(RS2_CAMERA_INFO_PRODUCT_ID) && dev.is<debug_protocol>())
+                {
+                    static constexpr uint32_t MWD_OPCODE          = 0x02U;
+                    static constexpr uint32_t MODE_REG_START_ADDR = 0x80000064U;
+                    static constexpr uint32_t MODE_REG_END_ADDR   = 0x80000068U;
+                    static constexpr uint32_t MODE_DEDICATED_RGB  = 0U;
+                    static constexpr uint32_t MODE_DUAL_RGB       = 1U;
+
+                    std::string current_pid = dev.get_info(RS2_CAMERA_INFO_PRODUCT_ID);
+                    const bool is_dual_rgb      = (current_pid == "0C01") || (current_pid == "0C04") || (current_pid == "0C07");
+                    const bool is_dedicated_rgb = (current_pid == "0C02") || (current_pid == "0C05") || (current_pid == "0C08");
+                    if (is_dual_rgb || is_dedicated_rgb)
+                    {
+                        const std::string toggle_label = is_dual_rgb
+                            ? "Switch to Dedicated-RGB Mode"
+                            : "Switch to Dual-RGB Mode";
+                        const ImGuiSelectableFlags toggle_flags = is_streaming
+                            ? ImGuiSelectableFlags_Disabled : ImGuiSelectableFlags_None;
+                        if (ImGui::Selectable(toggle_label.c_str(), false, toggle_flags))
+                        {
+                            try
+                            {
+                                const uint32_t value = is_dual_rgb ? MODE_DEDICATED_RGB : MODE_DUAL_RGB;
+                                const std::vector<uint8_t> data = {
+                                    static_cast<uint8_t>( value         & 0xFF),
+                                    static_cast<uint8_t>((value >>  8 ) & 0xFF),
+                                    static_cast<uint8_t>((value >> 16 ) & 0xFF),
+                                    static_cast<uint8_t>((value >> 24 ) & 0xFF) };
+
+                                auto dp = dev.as<debug_protocol>();
+                                auto cmd = dp.build_command(MWD_OPCODE, MODE_REG_START_ADDR, MODE_REG_END_ADDR, 0, 0, data);
+
+                                dp.send_and_receive_raw_data(cmd);
+                                restarting_device_info = get_device_info(dev, false);
+                                dev.hardware_reset();
+                            }
+                            catch (const error& e)
+                            {
+                                error_message = error_to_string(e);
+                            }
+                            catch (const std::exception& e)
+                            {
+                                error_message = e.what();
+                            }
+                        }
+                        if (ImGui::IsItemHovered())
+                        {
+                            std::string tooltip = rsutils::string::from()
+                                << "Switch Dual-RGB / Dedicated Color Sensor Mode"
+                                << (is_streaming ? " (Disabled while streaming)" : "");
+                            RsImGui::CustomTooltip("%s", tooltip.c_str());
+                        }
+                    }
+                }
+
                 // fw update disabled when any sensor is streaming
                 ImGuiSelectableFlags updateFwFlags = (is_streaming) ? ImGuiSelectableFlags_Disabled : 0;
 
@@ -1932,7 +2030,8 @@ namespace rs2
                                             << "Setting " << opt_model.opt << " to " << new_val << " ("
                                             << labels[selected] << ")");
 
-                                        opt_model.set_option(opt_model.opt, static_cast<float>(new_val), error_message);
+                                        // Sync: get_curr_advanced_controls below reads back the FW state set by the preset.
+                                        opt_model.set_option_sync(static_cast<float>(new_val));
 
                                         // Only apply preset to GUI if set_option was succesful
                                         selected_file_preset = "";
@@ -2414,6 +2513,11 @@ namespace rs2
                         }
                         if (can_stream)
                         {
+                            // Disable the start button for inference streams unless color and depth are already streaming.
+                            bool disable_inference = subdevice_has_inference_stream_enabled( *sub ) && ! are_color_and_depth_streaming();
+                            if( disable_inference )
+                                ImGui::BeginDisabled();
+
                             if( ImGui::Button( label.c_str(), button_size ) )
                             {
                                 if (profiles.empty()) // profiles might be already filled
@@ -2447,7 +2551,13 @@ namespace rs2
                                     viewer.begin_stream(sub, profile);
                                 }
                             }
-                            if (ImGui::IsItemHovered())
+                            if( disable_inference )
+                            {
+                                ImGui::EndDisabled();
+                                if( ImGui::IsItemHovered( ImGuiHoveredFlags_AllowWhenDisabled ) )
+                                    RsImGui::CustomTooltip( "Color and Depth streams must be streaming before starting inference" );
+                            }
+                            else if (ImGui::IsItemHovered())
                             {
                                 window.link_hovered();
                                 RsImGui::CustomTooltip("Start streaming data from this sensor");
@@ -2465,6 +2575,7 @@ namespace rs2
                         if( ImGui::Button( label.c_str(), button_size ) )
                         {
                             sub->stop(viewer.not_model);
+                            stop_inference_if_video_stopped( viewer );
                             std::string friendly_name = sub->s->get_info(RS2_CAMERA_INFO_NAME);
                             if ((friendly_name.find("Tracking") != std::string::npos) ||
                                 (friendly_name.find("Motion") != std::string::npos))
@@ -2769,6 +2880,16 @@ namespace rs2
                     draw_later.push_back([windows_width, &window, sub, pos, &viewer, this, pb]() {
                         ImGui::SetCursorPos({ windows_width - 42, pos.y - 3 });
 
+                        const bool pb_available = pb->is_available();
+                        // RAII guard pairing BeginDisabled/EndDisabled: keeps them balanced
+                        // even if an exception is thrown between begin and the explicit end()
+                        // call below (which runs before the tooltip hover check).
+                        struct disable_guard {
+                            bool active, ended;
+                            disable_guard( bool a ) : active( a ), ended( false ) { if( active ) ImGui::BeginDisabled( true ); }
+                            void end() { if( active && !ended ) { ended = true; ImGui::EndDisabled(); } }
+                            ~disable_guard() { end(); }
+                        } dg( !pb_available );
                         try
                         {
                             ImGui::PushFont(window.get_font());
@@ -2850,6 +2971,11 @@ namespace rs2
                                     }
                                 }
                             }
+
+                            dg.end();
+                            if( !pb_available && !pb->unavailable_tooltip.empty()
+                                && ImGui::IsItemHovered( ImGuiHoveredFlags_AllowWhenDisabled ) )
+                                RsImGui::CustomTooltip( "%s", pb->unavailable_tooltip.c_str() );
 
                             ImGui::PopStyleColor(5);
                             ImGui::PopFont();

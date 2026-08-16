@@ -37,20 +37,36 @@ sys.path.insert( 1, pyrs_dir )
 
 MAX_ENUMERATION_TIME = 20  # [sec]
 
+# Worst-case device removal delay after port disable / hw_reset.
+# DDS devices (e.g. D555 over PoE) are only declared gone after the participant
+# lease (3s) expires past the last announcement (1.5s cycle), plus propagation
+# latency in the device-changed callback. Observed on D555/PoE: ~8s after PoE cut.
+PORTS_DISABLED_TIMEOUT = 10  # [sec]
+
 # We need both pyrealsense2 and hub. We can work without hub, but
 # without pyrealsense2 no devices at all will be returned.
 from rspy import device_hub
 try:
     import pyrealsense2 as rs
     log.d( rs )
-    hub = device_hub.create() # if there's no hub, this will hold None
-    sys.path = sys.path[:-1]  # remove what we added
 except ModuleNotFoundError:
     log.w( 'No pyrealsense2 library is available! Running as if no cameras available...' )
     import sys
     log.d( 'sys.path=', sys.path )
     rs = None
-    hub = None
+
+hub = None
+_hub_attempted = False
+
+def init_hub():
+    """Create the hub instance. Call after logging is configured so discovery prints are visible."""
+    global hub, _hub_attempted
+    if _hub_attempted:
+        return
+    _hub_attempted = True
+    hub = device_hub.create()
+    if pyrs_dir in sys.path:
+        sys.path.remove( pyrs_dir )
 
 import time
 
@@ -67,11 +83,14 @@ class Device:
             self._name = dev.get_info( rs.camera_info.name )
             if self._name.startswith( 'Intel RealSense ' ):
                 self._name = self._name[16:]
+            elif self._name.startswith( 'RealSense ' ):
+                self._name = self._name[10:]
         self._product_line = None
         if dev.supports( rs.camera_info.product_line ):
             self._product_line = dev.get_info( rs.camera_info.product_line )
         self._physical_port = dev.supports( rs.camera_info.physical_port ) and dev.get_info( rs.camera_info.physical_port ) or None
 
+        self._connection_type = None  # remains None if camera_info.connection_type is unsupported
         if dev.supports(rs.camera_info.connection_type):
             self._connection_type = dev.get_info(rs.camera_info.connection_type)
             self._is_dds = self._connection_type == "DDS"
@@ -145,14 +164,16 @@ class Device:
         return self._is_dds
 
 
-def wait_until_all_ports_disabled( timeout = 5 ):
+def wait_until_all_ports_disabled( timeout = PORTS_DISABLED_TIMEOUT ):
     """
-    Waits for all ports to be disabled
+    Waits for all ports to be disabled.
     """
     for retry in range( timeout ):
         if len( enabled() ) == 0:
             return True
         time.sleep( 1 )
+    if len( enabled() ) == 0:
+        return True
     log.w( 'Timed out waiting for 0 devices' )
     return False
 
@@ -246,6 +267,7 @@ def query( monitor_changes=True, hub_reset=False, recycle_ports=True, disable_dd
     global rs
     if not rs:
         return
+    init_hub()
     #
     # Before we can start a context and query devices, we need to enable all the ports
     # on the hub, if any:
@@ -585,6 +607,10 @@ def enable_only( serial_numbers, recycle = False, timeout = MAX_ENUMERATION_TIME
                     re-enabling
     :param timeout: The maximum seconds to wait to make sure the devices are indeed online
     """
+    if recycle:
+        # let the driver/device settle before we disrupt it; helps the MIPI driver in particular
+        # recover cleanly when a preceding test left it in a bad state
+        time.sleep(1)
     if hub:
         #
         ports = [ get( sn ).port for sn in serial_numbers ]
@@ -613,16 +639,19 @@ def enable_only( serial_numbers, recycle = False, timeout = MAX_ENUMERATION_TIME
             else:
                 log.d( 'no hub ports to enable; leaving hub as-is' )
         #
-        _wait_for( serial_numbers, timeout = timeout )
+        if not _wait_for( serial_numbers, timeout = timeout ):
+            raise TimeoutError( f'devices did not enumerate within {timeout}s after hub enable: {serial_numbers}' )
         #
     elif recycle:
         #
-        hw_reset( serial_numbers )
+        if not hw_reset( serial_numbers, timeout = timeout ):
+            raise RuntimeError( f'hw_reset failed for: {serial_numbers}' )
         #
     else:
         log.d( 'no hub; ports left as-is' )
         # even without reset, enable_only should wait for the devices to be available again
-        _wait_for(serial_numbers, timeout=timeout)
+        if not _wait_for( serial_numbers, timeout = timeout ):
+            raise TimeoutError( f'devices did not enumerate within {timeout}s: {serial_numbers}' )
 
 
 def enable_all():
@@ -632,7 +661,7 @@ def enable_all():
     hub.enable_ports()
 
 
-def _wait_until_removed( serial_numbers, timeout = 5 ):
+def _wait_until_removed( serial_numbers, timeout = PORTS_DISABLED_TIMEOUT ):
     """
     Wait until the given serial numbers are all offline
 
@@ -710,7 +739,12 @@ def hw_reset( serial_numbers, timeout = MAX_ENUMERATION_TIME ):
     _wait_for(serial_numbers, timeout=timeout) # make sure devices are added before doing hw reset
     for sn in serial_numbers:
         dev = get( sn ).handle
-        dev.hardware_reset()
+        try:
+            dev.hardware_reset()
+        except Exception as e:
+            # swallow so one failing SN doesn't skip reset on the others and, more importantly,
+            # doesn't skip the post-reset settle that lets the driver re-enumerate
+            log.w( f'hardware_reset() failed for {sn}: {e}' )
     #
 
     if removable_devs_sns:
@@ -807,6 +841,7 @@ if __name__ == '__main__':
     if args:
         usage()
     try:
+        init_hub()
         if hub:
             if not hub.is_connected():
                 hub.connect()
@@ -866,6 +901,7 @@ if __name__ == '__main__':
             hub.recycle_ports()
     finally:
         # Disconnect from the hub -- if we don't it might crash on Linux...
-        hub.disconnect()
+        if hub:
+            hub.disconnect()
 
 

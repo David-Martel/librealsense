@@ -30,7 +30,7 @@ namespace librealsense
     {
         #if defined(RS2_USE_CUDA)
         auto disable_cuda_align = std::getenv("RS2_DISABLE_CUDA_ALIGN");
-        if (!disable_cuda_align && rsutils::rs2_is_gpu_available())
+        if (!disable_cuda_align && rsutils::rs2_is_cuda_available())
         {
             LOG_INFO("Using CUDA-optimized align implementation");
             return std::make_shared<librealsense::align_cuda>(align_to);

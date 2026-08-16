@@ -26,7 +26,7 @@ The `just` recipes set all of this; run tools by hand only with the same env.
 ## Build
 | tool | what |
 |------|------|
-| `../build-dgx-spark-gb10.sh [configure\|build\|install\|validate\|clean\|all]` | Production GB10 build (RSUSB + CUDA + tuning + pyrealsense2). **Reproducibility knobs:** ABI guard refuses a pre-release Python (the 3.15-vs-3.12 trap) and pins `FindPython` to the interpreter's venv; `LRS_GB10_REPRODUCIBLE=1` swaps `-mcpu=native`→`-mcpu=cortex-x925` for portable binaries; `LRS_GB10_FRESH=1` (or `clean` mode) does a from-scratch build. Key env: `PYTHON_EXECUTABLE` (point at the venv), `LRS_GB10_USB_TUNING` (1=GB10 mitigations on, 0=vanilla), `LRS_GB10_OPENCV_DIR`. |
+| `../build-dgx-spark-gb10.sh [configure\|build\|install\|validate\|clean\|all]` | Production GB10 build (RSUSB + CUDA + tuning + pyrealsense2). **Reproducibility knobs:** ABI guard refuses a pre-release Python (the 3.15-vs-3.12 trap) and pins `FindPython` to the interpreter's venv; `LRS_GB10_REPRODUCIBLE=1` uses the shared X925/A725 Armv9.2-A + SVE2/BF16/I8MM ISA with GCC-13-supported Neoverse-V2 tuning instead of the silently degraded `-mcpu=native`; `LRS_GB10_FRESH=1` (or `clean` mode) does a from-scratch build. Key env: `PYTHON_EXECUTABLE` (point at the venv), `LRS_GB10_USB_TUNING` (1=GB10 mitigations on, 0=vanilla), `LRS_GB10_OPENCV_DIR`. |
 | `just build` / `just build-hil` | production install build / non-installing CUDA+pyrealsense2 HIL build into `build-gb10-full`. |
 | `just test-fast` | g++-only standalone gate for the `usb-tuning.h` P2/P3/P4/P7 policy — no SDK, no hardware. |
 | `just test-unit` | builds + runs the Catch2 `usb-tuning` unit tests. |
