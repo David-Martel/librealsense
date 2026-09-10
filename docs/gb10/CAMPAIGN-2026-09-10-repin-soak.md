@@ -200,3 +200,64 @@ converter) without touching a line of source.
 measurable change, A/B'd against the baseline prefix with `scripts/gb10/bench-filters.sh` and the
 profiler, and byte-identity gated before it is pinned. Doing both at once would make a regression
 unattributable.
+
+---
+
+## Mode recommendations for vigil-spark
+
+vigil-spark's ROS node hardcodes **640×480@30 depth + colour**
+(`src/sensors/sensors/realsensenode.py:797-798`) and already negotiates `bgr8` with a `yuyv`
+fallback. Everything below is measured on this hardware unless marked otherwise.
+
+### Wire arithmetic (corrected)
+
+The D435 colour sensor transmits **YUY2 at 2 bytes/pixel** and the SDK converts host-side to
+RGB8/BGR8/RGBA8/BGRA8 (`d400-color.cpp:342` → `device.cpp:255`). Depth is Z16 at 2 B/px, IR is Y8 at
+1 B/px. So:
+
+| Config | Wire bytes/s | % of a 5 Gbps SuperSpeed link (≈500 MB/s practical) |
+|---|---:|---:|
+| 640×480@30 D+C **(deployed today)** | 36.9 MB/s | ~7% |
+| 848×480@30 D+C | 48.9 MB/s | ~10% |
+| **1280×720@30 D+C** | 110.6 MB/s | ~22% |
+| 1280×720@30 D+C+IR1+IR2 **(soaked)** | 165.9 MB/s | ~33% |
+| 960×540@60 D(848@60)+C | 118.1 MB/s | ~24% |
+
+The deployed configuration uses about **7%** of the link. The heaviest thing measured here uses
+about a third and dropped no frames on either host.
+
+### Recommendations, in the order they are worth doing
+
+| # | Change | Why | Cost |
+|---|---|---|---|
+| **M1** | **640×480 → 1280×720 @30, depth + colour** | 3× the pixels for identification/segmentation/clustering. Measured 29.98/30 fps, 0 drops, 0 USB faults on **both** hosts. Still only ~22% of the link. | Two literals in `realsensenode.py`. Downstream models must accept the larger frame. |
+| **M2** | **Request `yuyv` rather than `bgr8`** *when the consumer can take it* | Skips the `yuy2_converter` pass per frame. The node already has the fallback wired, so this is a preference flip. **Not a bandwidth saving** — the wire is YUY2 either way. | Frees CPU only; unmeasured at 30 Hz (see caveat). |
+| **M3** | **Add IR1 (+IR2) only if a consumer uses them** | Proven safe at 720p30 alongside D+C. Stereo IR is the honest input for depth-quality work. | +55 MB/s. No benefit unless consumed. |
+| **M4** | **960×540@60 for >30 fps colour** | The **only** 16:9 colour mode above 30 Hz on this SKU. Use this, not 720p, if motion is the constraint. | Lower resolution than 720p. |
+| **M5** | **848×100@300 or 256×144@300 depth for a latency-first path** | 300 Hz depth exists. If a controller needs fast depth rather than detailed depth, this is a different operating point entirely. | Tiny frames; a separate pipeline. |
+| **M6** | **Rebuild with Armv9.2 flags** (F6) | Both the incumbent and replacement SDK are baseline armv8-a. Affects every hot path. | Rebuild + A/B + byte-identity gate. |
+
+**Caveat on M2**, stated because it has not been measured: at 720p30 the conversion does not show up
+in delivered frame rate (bgr8 29.98 vs yuyv 29.95 on 3066; 29.98 vs 29.98 on 0060), so the argument
+for it is CPU headroom, which was *not* instrumented here. Do not adopt M2 on a throughput claim.
+
+### ROS 2 / CycloneDDS — what is already right, and what is missing
+
+Checked on the fleet rather than assumed:
+
+- **`net.core.rmem_max` = 16 MB on the Sparks** (`rmem_default` and `wmem_max` likewise). The ROS 2
+  DDS-tuning guide asks for ≥8–10 MB against a Linux default of 208 KB. **This is already done** —
+  do not "fix" it.
+- The fleet's Cyclone config (`ops/gb10-validation/qsfp_cyclone.xml`) pins the QSFP p2p interface,
+  disables multicast and lists the two peers explicitly. That is the right shape for a two-host
+  200 GbE fabric.
+- **Missing, and the documented levers for large image topics**: `<Internal><SocketReceiveBufferSize>`,
+  `<MaxMessageSize>` and `<FragmentSize>`. Also absent is any `<SharedMemory>`/iceoryx section, which
+  is the on-host zero-copy path for `sensor_msgs/Image`.
+- **These only matter if image topics actually cross the DDS boundary.** The RealSense node publishes
+  on the host that owns the camera; whether frames traverse the fabric depends on where the
+  subscribers run, which was not established here. **Measure that before tuning it** — otherwise this
+  is optimisation of a path that may carry nothing.
+
+Sources for the DDS levers: [ROS 2 Jazzy DDS tuning](https://docs.ros.org/en/jazzy/How-To-Guides/DDS-tuning.html),
+[rmw_cyclonedds shared-memory support](https://github.com/ros2/rmw_cyclonedds/blob/rolling/shared_memory_support.md).
