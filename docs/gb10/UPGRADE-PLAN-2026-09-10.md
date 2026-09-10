@@ -105,6 +105,7 @@ Both Sparks, non-destructive probes only.
 | D435 serial | `404543020690` | `344223022564` | `346522072418` |
 | Link speed | **5000 Mbps**, but **behind a hub** (`2-1.1`) | **5000 Mbps, native root port `6-1`** | USB 2.1 (PR #12) |
 | Camera state | **HELD** by PID 1139440 in live `vigil_c2` | **idle** (`Driver=[none]`) | — |
+| D435 firmware | — | **5.17.3.10** | 5.13.0.55 |
 | Controller deaths since boot | **0** (7d14h) | **0** (7d13h) | 3 reproductions in June |
 | USB disconnects since boot | 0 | 1 | — |
 
@@ -121,6 +122,11 @@ kernel `-1021 → -1029` and driver `580 → 595`. What is **not**: platform fir
 **no before/after comparison is possible.** The defect lives in `xhci_plat_hcd`, which ships with the
 *kernel*, so the kernel bump is the plausible carrier. `6.17.0-1032.32` is available and not yet
 installed.
+
+**Camera firmware, by contrast, demonstrably did move:** the live D435 on spark-3066 enumerates at
+**5.17.3.10**, versus 5.13.0.55 in June. 5.17.3.10 is the D400 matrix floor this fork's PR #7
+corrected the target to, so the cameras are now at the intended level. That is a real part of the
+"firmware was updated" premise — it is the *camera* firmware that advanced, not the platform BIOS.
 
 **Zero controller deaths over 7+ days is not yet evidence the defect is fixed** — both hosts have run
 only inside the single-stream safe envelope, which is equally consistent with "fixed" and
