@@ -405,3 +405,141 @@ The case for GPU compression is therefore **not** link capacity. It is:
 - removing per-frame single-threaded `cv2.imencode` from a Grace core (F7.3),
 - keeping depth in device memory from capture through encode (F7.4.2),
 - and headroom to scale streams/resolution/cameras without the CPU becoming the limit.
+
+---
+
+## F8 — firmware, definitively: 5.17.3.10 is current for D435. There is no 5.19 for D400.
+
+Re-researched properly rather than from a single doc page, because the earlier answer was challenged.
+
+The authoritative source is not a documentation page — it is the **update-server database the SDK
+itself queries**, named in this tree at `common/device-model.h:69`:
+
+```
+constexpr const char* server_versions_db_url =
+    "https://librealsense.realsenseai.com/Releases/rs_versions_db.json";
+```
+
+Fetched live (2026-09-10). Every D400 entry:
+
+| device_name | component | version |
+|---|---|---|
+| Intel RealSense **D435** | FIRMWARE | **5.17.3.10** |
+| Intel RealSense D435I / D435IF | FIRMWARE | 5.17.3.10 |
+| Intel RealSense D455 / D455F / D456 / D457 | FIRMWARE | 5.17.3.10 |
+| Intel RealSense D4* (catch-all) | FIRMWARE | 5.17.0.10 |
+| Intel RealSense D4* | LIBREALSENSE | 2.58.2 |
+
+Corroborating evidence, all pointing the same way:
+
+- **SDK 2.58.4's own source knows nothing above 5.17.4.13** — a grep for `5.18.*`/`5.19.*` across
+  `src/`, `common/`, `include/`, `tools/` returns **nothing**. An SDK released 2026-08-30 would gate
+  on a 5.19 firmware if one existed for the D400 line.
+- The highest versions anywhere in the tree are `5.17.3.13`, `.15`, `.20`, `.151`, `5.17.4.13`, and
+  every one of them is a **MIPI/GMSL/D401/D455/D435i** gate (per-constant table in F2), not a
+  D435-USB release.
+- Release notes for **2.58.2** say "Bundled D400 firmware removed from the SDK package", which is why
+  `common/fw/` does not exist in this tree and why the version DB above is now the single source.
+
+**5.19.x is not a D400 firmware.** The RealSense line now spans D400, **D500** (D555 etc.), F400 and
+L500, each with its own firmware series and its own release page, and this SDK does carry D500
+support (`src/ds/d500/`, `rs2_d500_intercam_sync_mode`). A 5.19 in the wild will belong to one of
+those other families. It does not apply to a D435 and cannot be flashed to one.
+
+**Conclusion unchanged: nothing to flash.** Both fleet cameras are on 5.17.3.10, which is what the
+vendor's live database prescribes for a D435.
+
+---
+
+## F9 — NVENC bit depth: **10 bits, not 16.** Z16 cannot ride a single NVENC plane losslessly.
+
+**This corrects a claim made earlier today in this same document.** F7.4 reported "encoded OK" and
+"lossless OK" for `hevc_nvenc -pix_fmt p016le`, and treated that as evidence NVENC could carry Z16.
+`ffmpeg` returning success was the wrong thing to check. Probing the *output* instead of trusting the
+input flag:
+
+| requested `-pix_fmt` | what NVENC actually produced |
+|---|---|
+| `p016le` (16-bit) | **Main 10 / `yuv420p10le`** |
+| `yuv444p16le` (16-bit) | **Rext / `yuv444p10le`** |
+| `p010le` (10-bit) | Main 10 / `yuv420p10le` |
+| `yuv444p` (8-bit) | Rext / `yuv444p` |
+
+Profiles this encoder offers: `main`, `main10`, `rext`. **There is no `main12`.** Every 16-bit request
+is silently accepted and truncated to 10 bits.
+
+And **`h264_nvenc` is 8-bit only** on this hardware — despite advertising `p016le` and `yuv444p16le`
+in its "supported pixel formats" list, both fail outright:
+
+```
+h264_nvenc -pix_fmt p016le      -> Error while opening encoder ... (0 bytes)
+h264_nvenc -pix_fmt yuv444p16le -> Error while opening encoder ... (0 bytes)
+```
+
+That format list is what the **ffmpeg wrapper** accepts, not what the **silicon** does. Reading it is
+how the earlier error was made.
+
+**Consequence for depth.** Z16 at the D435's default 0.001 m scale needs all 16 bits: 10 bits is a
+1.024 m range and 12 would be 4.096 m. Truncation is not a quality trade-off here, it is a broken
+depth map. So:
+
+- **Do not put Z16 through a single NVENC plane.** Not at any preset, not "lossless".
+- If depth must be compressed, the options are **plane-split** (high byte + low byte as two 8-bit
+  planes, encoded losslessly — preserves all 16 bits; the high plane compresses very well, the low
+  plane is near-noise) or **RVL** (`compressed_depth_image_transport`'s lossless 16-bit codec, CPU
+  but cheap, and portable to CUDA).
+
+---
+
+## F10 — the architecture that follows, and it is simpler than compressing depth
+
+The stated design is that RealSense feeds are attached to the Sparks *deliberately* so processing
+happens on the Spark, with only small results going to the workstation. Taking that seriously:
+
+**Depth never needs a codec.** If Z16 is consumed on the same Spark it was captured on, it should
+stay in device memory as raw Z16 from capture through align through whatever consumes it. That
+sidesteps F9 entirely — no truncation risk, no encode/decode latency, no CPU. The zero-copy align
+path (§9) already puts depth in a CUDA-mapped buffer; the work is to keep it there.
+
+**Colour is the thing worth encoding, and H.264 is the right codec** — which is also where the rest
+of the fleet is converging (GoPro, and potentially IntuBlade). Colour is 8-bit, so the 10-bit ceiling
+is irrelevant. Measured on spark-3066: a full `format=nv12 → hwupload_cuda → h264_nvenc` chain
+encodes 720p from **device memory** and produces a valid Main/`yuv420p` stream. NVENC accepts `cuda`
+as an input pixel format, so there is no host round-trip.
+
+The ideal colour path therefore never touches the CPU:
+
+```
+D435 YUYV on the wire
+  → rscuda::unpack_yuy2_cuda            (already GPU: color-formats-converter.cpp:63-69)
+  → NV12 in device memory
+  → h264_nvenc                          (accepts cuda pix_fmt)
+  → CompressedImage / vigil_msgs FrameMessage(format="h264")
+```
+
+versus what runs today: `cv2.imencode(".jpg", …, JPEG_QUALITY 80)` on a single Grace core, per frame,
+per camera (`realsensenode.py:2193`, `:2542`).
+
+**Decoders are present** for the return path and for the other cameras: `h264_cuvid`, `hevc_cuvid`,
+`av1_cuvid`, `mjpeg_cuvid`, `mpeg4_cuvid`, plus `cuda` in `-hwaccels`. So a GoPro H.264 feed can be
+decoded on the GPU into device memory and stay there.
+
+---
+
+## F11 — OpenCV: the CUDA build exists, but a bare `python3` does not get it
+
+| Interpreter | cv2 | CUDA devices |
+|---|---|---|
+| system `python3` on spark-3066 | **4.6.0** (`/usr/lib/python3/dist-packages`) | **0** |
+| vigil-spark release venv + `.vigil-opencv-cuda` on `PYTHONPATH` | **4.14.0** | **1** (CUDA 13.2, CUFFT CUBLAS FAST_MATH) |
+
+So vigil-spark's runtime **does** resolve a CUDA OpenCV — that part is already right, and this
+corrects any impression that the Sparks lack one. Two caveats worth writing down:
+
+- **Anything run outside that venv gets the non-CUDA 4.6.0**, silently. Every ad-hoc script, every
+  `ssh spark-3066 python3 -c ...`, every tool not launched through the release environment.
+- **A CUDA OpenCV does not make `cv2.imencode` a GPU call.** OpenCV has no CUDA JPEG encoder;
+  GPU JPEG needs nvJPEG. So the per-frame JPEG in `realsensenode.py` is CPU work **regardless** of
+  which OpenCV is loaded — moving it to NVENC H.264 (F10) is the fix, not swapping OpenCV builds.
+- Note also the CUDA split already documented in §14: the venv OpenCV is built against **13.2**
+  while `/opt/gb10-cuda/install/opencv`, which the SDK builds against, is **13.0**.
