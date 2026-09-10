@@ -221,6 +221,14 @@ Ordered by measured value. "Gate" = what must be true before the item is called 
 > **Only A1 needs the reboot-risk window.** A2/A3/A6 are single-stream or offline measurements —
 > the same envelope the fleet runs in daily — and are *not* blocked on it. Do not bundle them.
 
+### P-1 — hard blocker found while executing A6. **2.58.4 must not ship until this is fixed.**
+
+- [ ] **A0 · Fix the exit-time double free in the GB10 2.58.4 build.** Full evidence in §11.
+      Every tool built from 2.58.4 with the GB10 script aborts at exit — including
+      `rs-enumerate-devices --version`, which opens no camera. 2.58.1 and 2.58.3 on the same host and
+      script are clean. *Gate:* `rs-enumerate-devices --version` exits 0 with no `free()` diagnostic,
+      and `rs-gb10-profiler --self-test` passes, before **any** re-pin (A7) is even considered.
+
 ### P0 — verification and the measurements the plan turns on
 - [ ] **A6 · Build `d976b8a08` on spark-3066** into a **new** isolated prefix
       (`LRS_GB10_PREFIX=...-v2.58.4-...-canary`; the script's default still says `v2.58.3` and would
@@ -327,3 +335,88 @@ already records provenance; the schema should be lifted out of the GB10-specific
 Precedence was taken on the librealsense repo itself, as instructed. It was **not** extended to
 wedging a Spark that another agent is streaming on — that is the specific risk the coordination
 clause exists to prevent.
+
+---
+
+## 11. BLOCKER — 2.58.4 double-frees at exit on the GB10 build
+
+Found while executing A6 (the Spark build). This is the reason A6 is verification and not deployment:
+the x86_64 build was clean, and the defect only appears in the GB10 configuration.
+
+### Symptom
+
+Every tool built from 2.58.4 by `scripts/build-dgx-spark-gb10.sh` aborts at exit — including
+`rs-enumerate-devices --version`, which never touches a camera:
+
+```
+/opt/vigil/opt/librealsense-v2.58.4-dgx-spark-gb10-canary/bin/rs-enumerate-devices  version: 2.58.4.0
+free(): double free detected in tcache 2      <- SIGABRT, core dumped
+```
+
+Same host (spark-3066), same script, same fork:
+
+| Prefix | Result |
+|---|---|
+| `librealsense-v2.58.1-dgx-spark-gb10` | clean |
+| `librealsense-v2.58.3-dgx-spark-gb10-py312` | clean |
+| `librealsense-v2.58.4-dgx-spark-gb10-canary` | **aborts** |
+
+### Root cause (gdb, not inference)
+
+```
+#8  ~basic_json<..., rsutils::json_base>()        at 0x0000aaaaaad65590   <- EXECUTABLE range
+#9  __cxa_finalize
+#10 __do_global_dtors_aux   from .../lib/librealsense2.so.2.58            <- LIBRARY range 0x0000ffff...
+#11 _dl_call_fini -> _dl_fini -> __run_exit_handlers -> exit
+#15 TCLAP::CmdLine::parse   (--version prints, then exit())
+```
+
+The library's finalizer runs a destructor for a global `nlohmann::json` object that lives in the
+**executable**. Two copies of one global object exist; each is destroyed once; the second `free()`
+is a double free.
+
+### Why 2.58.4 and not 2.58.3 — measured symbol counts
+
+`nm -DC --defined-only` on the `.so`, `nm -C` on the executable:
+
+| Build | `.so` exported `json_abi` | exe local `json_abi` | Result |
+|---|---:|---:|---|
+| 2.58.1 GB10 (aarch64) | 504 | 62 | clean |
+| 2.58.3 GB10 (aarch64) | 511 | 62 | clean |
+| **2.58.4 GB10 (aarch64)** | **158** | **157** | **double free** |
+| 2.58.4 plain (x86_64, asuspro13) | 158 | 62 | clean |
+
+Upstream `4bbc18032` added `-Wl,--exclude-libs` (`hide_bundled_archive_symbols` in
+`CMake/lrs_macros.cmake`) to keep bundled static-archive symbols out of the dynamic symbol table —
+its stated purpose is to stop ROS 2 FastDDS/FastCDR ABI interposition crashes. That drops exported
+json symbols 511 → 158. Previously the executable's json references bound to the library's exported
+copy; now they cannot, and the tools carry their own.
+
+### It is not purely upstream
+
+The x86_64 row is the control: **identical `.so` hiding (158), but the executable stays at 62 and
+does not crash.** The executable only balloons to 157 under the GB10 configuration. The most likely
+differentiator is `CMAKE_CXX_STANDARD=20`, which the GB10 script sets
+(`scripts/build-dgx-spark-gb10.sh:44`) while upstream core builds C++14 and tools C++11 — a different
+standard changes which template instantiations get emitted locally versus bound externally.
+
+`realsense.TODO.md` already anticipated this: *"Keep `LRS_GB10_CXX_STANDARD=20` … unless a downstream
+wrapper shows an ABI or source-compatibility issue."* **This is that issue.** It is also plausibly the
+same family as the fork's long-open *"RealDDS duplicate static/shared symbol"* item — upstream's
+change appears to have converted a latent duplicate-symbol condition into a hard crash.
+
+### Status
+
+A C++14 probe build (`librealsense-v2.58.4-gb10-cxx14-probe`) was run to test the hypothesis; its
+result is recorded in §11.1. Until A0 closes, **do not re-pin any fleet consumer to 2.58.4.** Both
+Sparks' `/usr/local/lib/librealsense2.so*` still resolve to the 2.58.1 prefix and were not touched.
+
+### Fix options, in order of preference
+
+1. **`LRS_GB10_CXX_STANDARD=14`** — if §11.1 confirms it, this is a one-variable change the fork
+   already documented as the fallback. Costs the C++20 experiment, which has no measured win.
+2. **Link the tools against the library's json rather than their own copy** — the principled fix, and
+   the one to take upstream, since any downstream consumer building tools at a different `-std` hits
+   this.
+3. Do **not** simply revert `4bbc18032`: it fixes a real ROS 2 ABI crash, which matters more to this
+   fleet than the C++20 experiment does.
