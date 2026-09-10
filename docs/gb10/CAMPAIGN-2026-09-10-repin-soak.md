@@ -156,3 +156,47 @@ rollback to plan. The 0060 fleet unit's full `ExecStart` is recorded in the bus 
 - Host reboots. If an xHCI controller wedges and a driver-level rebind does not recover it, that is
   a stop-and-ask, not a reboot.
 - Any vigil-spark file other than the two `ops/` pin scripts.
+
+---
+
+### F6 — the shipped SDK is compiled for **baseline armv8-a**, not Armv9.2
+
+Probed on spark-3066 (read-only) while the soaks ran:
+
+```
+$ gcc --version              → gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+$ lscpu | grep 'Model name'  → Cortex-X925
+$ gcc -mcpu=native -Q --help=target | grep -E 'march=|mcpu=|mtune='
+  -march=            (empty)
+  -mcpu=             (empty)
+  -mtune=            (empty)
+$ gcc -mcpu=cortex-x925 -c t.c
+  cc1: error: unknown value 'cortex-x925' for '-mcpu'
+```
+
+**GCC 13.3 does not know Cortex-X925**, and `-mcpu=native` on an unrecognised part resolves to
+nothing at all rather than erroring — so it silently compiles to the aarch64 default baseline.
+`scripts/build-dgx-spark-gb10.sh:27-30` already warns about exactly this; what had not been checked
+is which flag the *shipped* artifacts actually carry:
+
+| Prefix | `CMAKE_CXX_FLAGS_RELEASE` | Effective ISA |
+|---|---|---|
+| `…-v2.58.1-…` (**currently pinned on both Sparks**) | `-O3 -DNDEBUG -mcpu=native …` | **baseline** |
+| `…-v2.58.4-…` (**the prefix this campaign pins to**) | `-O3 -DNDEBUG -mcpu=native …` | **baseline** |
+| `…-v2.58.1-…-py313-rpath-v4l2` | `-mcpu=neoverse-v2` | Armv9 |
+| `…-v2.58.3-…-py312` | `-mcpu=cortex-x925` | (flag this GCC rejects) |
+
+So both the incumbent and the replacement are baseline builds: no SVE2, no BF16, no I8MM, no Armv9.2
+baseline. The script's own `LRS_GB10_REPRODUCIBLE=1` path sets
+`-march=armv9.2-a+sve2+bf16+i8mm -mtune=neoverse-v2`, and this GCC **accepts** that combination
+(verified by compiling with it). GCC 13.3 also accepts `-mcpu=grace` and `-mcpu=neoverse-v2`.
+
+This is the largest untaken acceleration opportunity found in this campaign, and it is orthogonal to
+everything else here — it changes codegen for every hot path (align, pointcloud, colorize, the YUY2
+converter) without touching a line of source.
+
+**Sequenced after the re-pin, deliberately**: the re-pin swaps a baseline 2.58.1 for a baseline
+2.58.4, so it changes one variable. Rebuilding with Armv9.2 flags is then a second, separately
+measurable change, A/B'd against the baseline prefix with `scripts/gb10/bench-filters.sh` and the
+profiler, and byte-identity gated before it is pinned. Doing both at once would make a regression
+unattributable.
