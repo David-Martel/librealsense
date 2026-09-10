@@ -315,3 +315,93 @@ Two further points, both from the ROS side:
   1500-byte MTU.** On the jumbo-frame 200 GbE leg they should be raised. The fleet's
   `qsfp_cyclone.xml` already pins the interface explicitly and disables multicast, which is correct —
   a dual-homed Spark left on autodetermine can otherwise pick the 1 GbE NIC for Spark↔Spark traffic.
+
+---
+
+## F7 — compressed depth: not from the camera, but NVENC on GB10 can do it
+
+Investigated on direction, after the observation that the RealSense feeds are streamed to the Sparks
+*deliberately* so that RealSense processing happens on the Spark before anything reaches ROS DDS.
+
+### F7.1 The D435 cannot source compressed depth. Nothing can make it.
+
+`RS2_FORMAT_Z16H` — "Variable-length Huffman-compressed 16-bit depth values" — does exist in this SDK
+(`include/librealsense2/h/rs_sensor.h:99`), and the UVC streamer treats it as a compressed transport
+alongside MJPEG (`src/uvc/uvc-streamer.cpp:163`). But:
+
+- It is marked **`DEPRECATED!`** in the header, and it was an **L5xx** feature.
+- The **D400 fourcc maps carry no Z16H**. `d400-color.cpp:24-32` and `d400-device.cpp:66-85` map only
+  YUY2/YUYV, UYVY, **MJPG**, RW16/BYR2, BA81 — and MJPG only onto `RS2_STREAM_COLOR`.
+- Measured on the actual unit (fw 5.17.3.10): the D435 advertises **Z16, Y8, Y16, RGB8/BGR8/RGBA8/BGRA8,
+  RAW16, YUYV** — and not even MJPEG. No compressed depth at any resolution or rate.
+
+So depth compression **must** be host-side. That is not a limitation of this fork or of the firmware
+version; there is no newer D400 firmware that adds it (see F2).
+
+### F7.2 The ROS 2 wrapper's "compressed depth" is also host-side
+
+`compressed_depth_image_transport` (PNG, and RVL for `16UC1`) runs in the subscriber/publisher
+process, not in the camera. So "the ROS 2 RealSense node does compressed depth" is true, and it is
+**CPU work on the host** — which is the thing worth moving to the GPU, not evidence that the camera
+can do it.
+
+### F7.3 What vigil-spark does today — and it is CPU JPEG
+
+`src/sensors/sensors/realsensenode.py` publishes `/…/color/compressed` and
+`/…/depth/preview/compressed`, and produces both with **`cv2.imencode(".jpg", …)`** — line 2193
+(`IMWRITE_JPEG_QUALITY, 80`) and line 2542. That is single-threaded OpenCV JPEG on a Grace core, per
+frame, for every camera. Those are exactly the topics asuspro13 consumes: it runs live
+`scripts/ros2_to_v4l2.py --topic /realsense/spark_3066/color/compressed --device /dev/video22` and
+the matching `spark_0060` → `/dev/video21` bridge.
+
+### F7.4 GB10's NVENC **can** carry 16-bit depth — measured, not inferred
+
+On spark-3066 (GB10, driver 595.84):
+
+```
+hevc_nvenc supported pixel formats:
+  yuv420p nv12 p010le yuv444p p016le yuv444p16le bgr0 bgra rgb0 rgba
+  x2rgb10le x2bgr10le gbrp gbrp16le cuda
+presets include:  lossless (10), losslesshp (11);  tune: lossless (4)
+```
+
+Two real encodes, 1280×720, 30 frames:
+
+| Test | Result |
+|---|---|
+| `-c:v hevc_nvenc -pix_fmt p016le` | **encoded OK** |
+| `-c:v hevc_nvenc -pix_fmt p016le -tune lossless` | **encoded OK** |
+
+(The byte counts from those runs are meaningless — the input was a flat synthetic gray field. They
+prove the *pipe accepts 16-bit and lossless*, not a compression ratio. A ratio must be measured on
+real Z16.)
+
+Three things make this fit the existing architecture rather than fight it:
+
+1. **`p016le` / `yuv444p16le` / `gbrp16le` are 16-bit**, so Z16 needs no destructive squeeze into
+   8-bit luma — which is the hazard flagged earlier in this repo's codec notes.
+2. **`cuda` is an accepted input pixel format**, i.e. NVENC takes **device memory** directly. That
+   composes with the zero-copy align work in §9: depth already lands in a CUDA-mapped buffer.
+3. **A lossless tune exists**, so depth can be compressed without changing a single measured value —
+   which is the only acceptable option for anything feeding metrology or segmentation.
+
+### F7.5 vigil-spark already has the message type for this
+
+- `vigil_msgs/msg/DepthMessage.msg` carries **`uint16[] raw_frame_bytes`** — uncompressed.
+- `vigil_msgs/msg/FrameMessage.msg` carries **`string format`** plus **`uint8[] frame_bytes`**,
+  documented as "The frame as bytes (compressed)".
+
+So the carrier for an NVENC-encoded depth stream already exists and is already format-tagged. No new
+message type is needed; `format` becomes e.g. `hevc/p016le-lossless`.
+
+### F7.6 Corrected: the link is not the constraint
+
+An earlier section of this document said 720p colour + Z16 depth (~1.1 Gbit/s) "does not fit on the
+1 GbE LAN". The fleet's actual link speeds are **asuspro13 → Spark 5 Gbps, Spark → asuspro13
+10 Gbps**, plus the QSFP Spark↔Spark fabric. At 10 Gbps upstream, 1.1 Gbit/s of raw 720p D+C fits
+with large margin, and that earlier caveat is withdrawn.
+
+The case for GPU compression is therefore **not** link capacity. It is:
+- removing per-frame single-threaded `cv2.imencode` from a Grace core (F7.3),
+- keeping depth in device memory from capture through encode (F7.4.2),
+- and headroom to scale streams/resolution/cameras without the CPU becoming the limit.
