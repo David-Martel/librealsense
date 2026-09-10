@@ -58,6 +58,19 @@ void close_range_xu_option::set( float value )
     if( ! ep )
         throw invalid_value_exception( "Close Range: depth sensor not alive for set" );
 
+    // Close-range operates on depth only. On dual-color devices the depth sensor also streams color,
+    // so block enabling while any color stream is active. get_active_streams() is scoped to this
+    // endpoint, so on dedicated-color variants (separate endpoints) this loop is a safe no-op.
+    if( value != 0.f )
+    {
+        for( auto & sp : ep->get_active_streams() )
+        {
+            if( sp && sp->get_stream_type() == RS2_STREAM_COLOR )
+                throw wrong_api_call_sequence_exception(
+                    "Improved Close Range Depth cannot be activated while color streams are active" );
+        }
+    }
+
     ep->invoke_powered(
         [this, value]( platform::uvc_device & dev )
         {

@@ -5,6 +5,7 @@ import pytest
 import pyrealsense2 as rs
 from rspy import devices
 from rspy.timer import Timer
+import platform
 import time
 import logging
 log = logging.getLogger(__name__)
@@ -44,9 +45,11 @@ def test_hw_reset_sanity( test_device ):
     t = Timer( 10 )
     dev, ctx = test_device
     target_sn = dev.get_info( rs.camera_info.serial_number )
+    connection_type = dev.get_info( rs.camera_info.connection_type ) if dev.supports( rs.camera_info.connection_type ) else None
     ctx.set_devices_changed_callback( device_changed )
     time.sleep(1)
     log.info( "Sending HW-reset command" )
+    reset_time = time.perf_counter()
     dev.hardware_reset()
 
     log.info( "Pending for device removal" )
@@ -57,6 +60,14 @@ def test_hw_reset_sanity( test_device ):
         time.sleep( 0.1 )
 
     assert device_removed, "device was not removed after hardware_reset"
+
+    # Regression guard for the Windows UVC+HID watcher gate that used to defer removal up to 15s.
+    # DDS devices don't go through this gate and have their own reset-to-enumeration timing — skip them.
+    removal_latency = device_removed_time - reset_time
+    log.info( "Removal latency: %.2f [sec]", removal_latency )
+    if platform.system() == "Windows" and connection_type != "DDS":
+        assert removal_latency < 2.5, \
+            f"removal took {removal_latency:.2f}s — expected under 2.5s on Windows USB"
 
     log.info( "Pending for device addition" )
     t = Timer( devices.MAX_ENUMERATION_TIME )

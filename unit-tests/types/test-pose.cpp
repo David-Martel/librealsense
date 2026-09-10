@@ -234,7 +234,9 @@ TEST_CASE( "inverse of inverse (rot mat)", "[types]" )
     INFO( "\ninv(p)=\n" << std::setprecision( 15 ) << inv( p ) );
     INFO( "\ninv(inv(p))=\n" << inv( inv( p ) ) );
     INFO( "\ninverse(inverse(p))=\n" << inverse( inverse( p ) ) );
-    CHECK( inverse( inverse( p ) ) == p );
+    // inverse(inverse(p)) computes R * (R^T * t); R * R^T is not exactly the identity in float,
+    // so the round-trip is only approximate -- compare like the (extr) case below
+    CHECK( eq( inverse( inverse( p ) ), p ) );
 }
 
 TEST_CASE( "inverse of inverse (extr)", "[types]" )

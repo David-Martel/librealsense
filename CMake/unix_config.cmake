@@ -18,6 +18,11 @@ macro(os_set_flags)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pedantic -Wno-missing-field-initializers")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-switch -Wno-multichar -Wsequence-point -Wformat -Wformat-security")
 
+    # Default -ffp-contract=fast fuses a*b+c*d into an FMA wherever the ISA has one (x86-64-v3
+    # on Ubuntu 26.04, always on aarch64), dropping a rounding and shifting filter output 1 LSB.
+    set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -ffp-contract=off")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ffp-contract=off")
+
     execute_process(COMMAND ${CMAKE_C_COMPILER} -dumpmachine OUTPUT_VARIABLE MACHINE)
     if(${MACHINE} MATCHES "arm64-*" OR ${MACHINE} MATCHES "aarch64-*")
         if(BUILD_WITH_NEON)

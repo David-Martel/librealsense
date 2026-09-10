@@ -16,7 +16,7 @@
 #include "ds/ds-timestamp.h"
 #include "d500-active.h"
 #include "d500-color.h"
-#include "d500-dual-rgb.h"
+#include "d500-dual-color.h"
 #include "d500-motion.h"
 #include "d500-safety.h"
 #include "d500-depth-mapping.h"
@@ -103,11 +103,21 @@ namespace librealsense
     };
 
 
-    // D585 or D535, dual RGB variant. No dedicated color sensor.
+    void add_motion_streams( const std::shared_ptr< ds_motion_common > & motion_common,
+                             std::vector< std::shared_ptr< librealsense::stream_interface > > & streams )
+    {
+        if( motion_common )
+        {
+            streams.push_back( motion_common->get_accel_stream() );
+            streams.push_back( motion_common->get_gyro_stream() );
+        }
+    }
+
+    // D585 or D535, dual color variant. No dedicated color sensor.
     class rs5x5_device
         : public d500_active
         , public d500_motion
-        , public d500_dual_rgb
+        , public d500_dual_color
         , public ds_advanced_mode_base
         , public extended_firmware_logger_device
     {
@@ -118,20 +128,23 @@ namespace librealsense
             , d500_device( dev_info )
             , d500_active( dev_info )
             , d500_motion( dev_info )
-            , d500_dual_rgb( dev_info )
+            , d500_dual_color( dev_info )
             , ds_advanced_mode_base()
             , extended_firmware_logger_device( dev_info, d500_device::_hw_monitor, get_firmware_logs_command() )
         {
             ds_advanced_mode_base::initialize_advanced_mode( this );
+
+            // Improved Close Range Depth - USB toggle
+            register_feature( std::make_shared< close_range_filter_feature >(
+                    dynamic_cast< d500_depth_sensor & >( get_depth_sensor() ) ) );
         }
 
         std::shared_ptr<matcher> create_matcher(const frame_holder& frame) const override
         {
 
             std::vector< std::shared_ptr< stream_interface > > streams = { _depth_stream, _left_ir_stream, _right_ir_stream,
-                                                                           _color_stream_1, _color_stream_2,
-                                                                           _ds_motion_common->get_accel_stream(),
-                                                                           _ds_motion_common->get_gyro_stream() };
+                                                                           _color_stream_1, _color_stream_2 };
+            add_motion_streams( _ds_motion_common, streams );
             return create_default_matcher( streams );
         }
 
@@ -166,7 +179,7 @@ namespace librealsense
             , backend_device( dev_info )
             , d500_device( dev_info )
             , d500_active( dev_info )
-            , d500_color( dev_info, RS2_FORMAT_M420 )
+            , d500_color( dev_info, RS2_FORMAT_NV12 )
             , d500_motion( dev_info )
             , d500_object_detection( dev_info )
             , ds_advanced_mode_base()
@@ -174,18 +187,17 @@ namespace librealsense
         {
             ds_advanced_mode_base::initialize_advanced_mode( this );
 
-            // Improved Close Range Depth - USB toggle
-            register_feature( std::make_shared< close_range_filter_feature >(
-                    dynamic_cast< d500_depth_sensor & >( get_depth_sensor() ) ) );
+            // Skipped on MIPI: the V4L2 backend has no CID for the close-range depth-XU selector (0x14).
+            if( ! _is_mipi_device )
+                register_feature( std::make_shared< close_range_filter_feature >( dynamic_cast< d500_depth_sensor & >( get_depth_sensor() ) ) );
         }
 
         std::shared_ptr<matcher> create_matcher(const frame_holder& frame) const override
         {
 
             std::vector< std::shared_ptr< stream_interface > > streams = { _depth_stream, _left_ir_stream, _right_ir_stream, _color_stream,
-                                                                           _ds_motion_common->get_accel_stream(),
-                                                                           _ds_motion_common->get_gyro_stream(),
                                                                            _object_detection_stream };
+            add_motion_streams( _ds_motion_common, streams );
             return create_default_matcher( streams );
         }
 
@@ -193,13 +205,17 @@ namespace librealsense
         {
             std::vector<tagged_profile> tags;
 
+            // MIPI requires accel and gyro at equal fps, USB uses 100 for accel.
+            int gyro_fps = static_cast< int >( odr::IMU_FPS_200 );
+            int accel_fps = _is_mipi_device ? static_cast< int >( odr::IMU_FPS_200 ) : static_cast< int >( odr::IMU_FPS_100 );
+
             tags.push_back({ RS2_STREAM_COLOR, -1, 1280, 720, RS2_FORMAT_RGB8, 30, profile_tag::PROFILE_TAG_SUPERSET | profile_tag::PROFILE_TAG_DEFAULT });
             tags.push_back({ RS2_STREAM_DEPTH, -1, 1280, 720, RS2_FORMAT_Z16, 30, profile_tag::PROFILE_TAG_SUPERSET | profile_tag::PROFILE_TAG_DEFAULT });
             tags.push_back({ RS2_STREAM_INFRARED, -1, 1280, 720, RS2_FORMAT_Y8, 30, profile_tag::PROFILE_TAG_SUPERSET });
-            tags.push_back({ RS2_STREAM_GYRO, -1, 0, 0, RS2_FORMAT_MOTION_XYZ32F, (int)odr::IMU_FPS_200, profile_tag::PROFILE_TAG_SUPERSET | profile_tag::PROFILE_TAG_DEFAULT });
-            tags.push_back({ RS2_STREAM_ACCEL, -1, 0, 0, RS2_FORMAT_MOTION_XYZ32F, (int)odr::IMU_FPS_100, profile_tag::PROFILE_TAG_SUPERSET | profile_tag::PROFILE_TAG_DEFAULT });
+            tags.push_back({ RS2_STREAM_GYRO, -1, 0, 0, RS2_FORMAT_MOTION_XYZ32F, gyro_fps, profile_tag::PROFILE_TAG_SUPERSET | profile_tag::PROFILE_TAG_DEFAULT });
+            tags.push_back({ RS2_STREAM_ACCEL, -1, 0, 0, RS2_FORMAT_MOTION_XYZ32F, accel_fps, profile_tag::PROFILE_TAG_SUPERSET | profile_tag::PROFILE_TAG_DEFAULT });
             tags.push_back({ RS2_STREAM_OBJECT_DETECTION, -1, -1, -1, RS2_FORMAT_Y8, -1, profile_tag::PROFILE_TAG_SUPERSET });
-            
+
             return tags;
         };
     };
@@ -232,9 +248,8 @@ namespace librealsense
         {
 
             std::vector< std::shared_ptr< stream_interface > > streams = { _depth_stream, _left_ir_stream, _right_ir_stream, _color_stream,
-                                                                           _ds_motion_common->get_accel_stream(),
-                                                                           _ds_motion_common->get_gyro_stream(),
                                                                            _object_detection_stream };
+            add_motion_streams( _ds_motion_common, streams );
             return create_default_matcher( streams );
         }
 
@@ -254,6 +269,8 @@ namespace librealsense
     };
     
 
+    // Local to this translation unit; method bodies kept inline to match sibling classes
+    // in this file (rs555_device, rs585_legacy_device, etc.).
     class rs585s_device
         : public d500_active
         , public d500_color
@@ -284,9 +301,6 @@ namespace librealsense
             versions[1] = get_info( RS2_CAMERA_INFO_SMCU_FW_VERSION );
             set_expected_source_versions( std::move( versions ) );
 
-            auto emitter_always_on_opt = std::make_shared<emitter_always_on_option>( d500_device::_hw_monitor, ds::APM_STROBE_GET, ds::APM_STROBE_SET );
-            get_depth_sensor().register_option( RS2_OPTION_EMITTER_ALWAYS_ON, emitter_always_on_opt );
-
             // Note - requirement to gate depth options was removed to allow validation checks. Gated by FW only.
             // This should be last as we wish to protect the depth options setting when not in service safety mode
             // d500_safety::gate_depth_options();
@@ -295,9 +309,8 @@ namespace librealsense
         std::shared_ptr<matcher> create_matcher(const frame_holder& frame) const override
         {
             std::vector< std::shared_ptr< stream_interface > > streams = { _depth_stream, _left_ir_stream, _right_ir_stream, _color_stream,
-                                                                           _safety_stream, _occupancy_stream, _point_cloud_stream,
-                                                                           _ds_motion_common->get_accel_stream(),
-                                                                           _ds_motion_common->get_gyro_stream() };
+                                                                           _safety_stream, _occupancy_stream, _point_cloud_stream };
+            add_motion_streams( _ds_motion_common, streams );
             return create_default_matcher( streams );
         }
 
@@ -314,6 +327,21 @@ namespace librealsense
 
             return tags;
         };
+
+        // FW-side decimation lets pipeline auto-complete depth and IR at different
+        // resolutions from the same sensor; only fps must agree.
+        bool contradicts( const stream_profile_interface * a, const std::vector< stream_profile > & others ) const override
+        {
+            if( dynamic_cast< const video_stream_profile_interface * >( a ) )
+            {
+                for( auto request : others )
+                {
+                    if( a->get_framerate() != 0 && request.fps != 0 && ( a->get_framerate() != request.fps ) )
+                        return true;
+                }
+            }
+            return false;
+        }
     };
     
 
@@ -344,10 +372,6 @@ namespace librealsense
             auto & depth_sensor = get_depth_sensor();
             group_multiple_fw_calls(depth_sensor, [&]()
             {
-                auto emitter_always_on_opt = std::make_shared<emitter_always_on_option>( d500_device::_hw_monitor,
-                                                                                         ds::LASERONCONST, ds::LASERONCONST);
-                depth_sensor.register_option( RS2_OPTION_EMITTER_ALWAYS_ON, emitter_always_on_opt );
-
                 auto thermal_compensation_toggle = std::make_shared< d500_thermal_compensation_option >( d500_device::_hw_monitor );
 
                 // Monitoring SOC PVT (not OHM) because it correlates to D400 ASIC temperature and we keep the model the same.
@@ -371,9 +395,8 @@ namespace librealsense
         {
 
             std::vector< std::shared_ptr< stream_interface > > streams = { _depth_stream, _left_ir_stream, _right_ir_stream, _color_stream,
-                                                                           _ds_motion_common->get_accel_stream(),
-                                                                           _ds_motion_common->get_gyro_stream(),
                                                                            _object_detection_stream };
+            add_motion_streams( _ds_motion_common, streams );
             return create_default_matcher( streams );
         }
 

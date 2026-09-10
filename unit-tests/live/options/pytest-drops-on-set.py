@@ -1,8 +1,6 @@
 # License: Apache 2.0. See LICENSE file in root directory.
 # Copyright(c) 2020 RealSense, Inc. All Rights Reserved.
 
-# Currently, we exclude D457 and D401 as it's failing
-
 import platform
 import pytest
 import pyrealsense2 as rs
@@ -11,9 +9,7 @@ import logging
 log = logging.getLogger(__name__)
 
 pytestmark = [
-    pytest.mark.device("D400*"),
-    pytest.mark.device_exclude("D457"),
-    pytest.mark.device_exclude("D401"),
+    pytest.mark.device_each("D400*"),
     pytest.mark.context("nightly"),
 ]
 
@@ -84,6 +80,10 @@ def run_option_changes(sensor, checker, product_line):
             if orig_opt_value.type in (rs.option_type.integer, rs.option_type.float):
                 old_value = orig_opt_value.value
                 opt_range = sensor.get_option_range(option)
+                # e.g. Exposure while AE is on reads as 0 but range starts at 1 — restoring old_value would throw
+                if not (opt_range.min <= old_value <= opt_range.max):
+                    log.info(f"{option}: skipping, current {old_value} outside range [{opt_range.min}, {opt_range.max}]")
+                    continue
                 new_value = opt_range.min if old_value != opt_range.min else opt_range.max
                 log.debug(f"{option}: {old_value} -> {new_value}")
                 set_new_value(checker, sensor, option, new_value)
@@ -96,6 +96,9 @@ def test_laser_power_frame_drops(test_device_wrapped):
     """No frame drops when sweeping laser power through its full range."""
     dev, ctx = test_device_wrapped
     product_line = dev.get_info(rs.camera_info.product_line)
+    product_name = dev.get_info(rs.camera_info.name)
+    if 'D401' in product_name or 'D405' in product_name:
+        pytest.skip(f"{product_name} does not support laser power")
     depth_sensor = dev.first_depth_sensor()
     depth_profile = next(p for p in depth_sensor.profiles if p.is_default())
     checker = FrameDropChecker(product_line, is_depth=True)
@@ -143,14 +146,23 @@ def test_color_options_frame_drops(test_device_wrapped):
     product_line = dev.get_info(rs.camera_info.product_line)
     product_name = dev.get_info(rs.camera_info.name)
 
+    # D405 and D401 have no separate color sensor; their color options are registered on the depth sensor.
     try:
         color_sensor = dev.first_color_sensor()
     except RuntimeError:
-        if 'D421' in product_name or 'D405' in product_name:
+        if 'D405' in product_name or 'D401' in product_name:
+            color_sensor = dev.first_depth_sensor()
+        elif 'D421' in product_name:
             pytest.skip("No color sensor")
-        raise
+        else:
+            raise
 
-    color_profile = next(p for p in color_sensor.profiles if p.is_default())
+    color_profile = next(
+        (p for p in color_sensor.profiles
+         if p.is_default() and p.stream_type() == rs.stream.color),
+        None)
+    if color_profile is None:
+        pytest.fail(f"{product_name}: no default color-stream profile found on sensor")
     checker = FrameDropChecker(product_line, is_depth=False)
 
     color_sensor.open(color_profile)

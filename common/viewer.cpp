@@ -932,6 +932,10 @@ namespace rs2
         _hidden_options.emplace(RS2_OPTION_FRAMES_QUEUE_SIZE);
         _hidden_options.emplace(RS2_OPTION_NOISE_ESTIMATION);
         _hidden_options.emplace(RS2_OPTION_REGION_OF_INTEREST);
+        _hidden_options.emplace(RS2_OPTION_READOUT_SHAPING);
+        // Rendered as a "more" popup Selectable in device-model.cpp instead of a sensor
+        // control, so it doesn't need to appear in the sensor's Controls tree.
+        _hidden_options.emplace(RS2_OPTION_SENSORS_CONFIG_MODE);
     }
 
     void viewer_model::update_configuration(config_file* new_cfg)
@@ -3286,6 +3290,15 @@ namespace rs2
                     {
                         reload_required = true;
                         temp_cfg = config_file();
+                        {
+                            namespace cfg = configurations::viewer::viewport_grid_overlay;
+                            temp_cfg.set_nested_default( cfg::horizontal_lines, 1   );
+                            temp_cfg.set_nested_default( cfg::vertical_lines,   1   );
+                            temp_cfg.set_nested_default( cfg::line_width,       1   );
+                            temp_cfg.set_nested_default( cfg::line_color_r,     255 );
+                            temp_cfg.set_nested_default( cfg::line_color_g,     255 );
+                            temp_cfg.set_nested_default( cfg::line_color_b,     255 );
+                        }
                     }
                     ImGui::SameLine();
                     if (ImGui::Button(" Export Settings "))

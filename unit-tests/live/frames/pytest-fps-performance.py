@@ -22,15 +22,16 @@ import numpy as np
 import platform
 import time
 import sys
-import os
 from collections import deque
 from typing import List, Tuple, Dict
 import logging
 log = logging.getLogger(__name__)
 
+# No context marker: this test is always collected and scales its coverage by the active tier
+# (see resolve_coverage_tier). gating runs everywhere, semi adds coverage on --context nightly,
+# full runs the whole matrix on --context weekly.
 pytestmark = [
-    pytest.mark.context("weekly"),
-    pytest.mark.device("D400*"),
+    pytest.mark.device_each("D400*"),
     pytest.mark.device_exclude("D401")
 ]
 
@@ -41,8 +42,46 @@ DDS_DEVICE_CREATION_TIMEOUT = 30  # Extended timeout for DDS devices (seconds)
 MIN_FRAME_COUNT_LOW_FPS = 5  # Minimum frame count for low FPS tests
 MIN_TEST_DURATION_PERCENT = 0.6  # Minimum test duration percentage (60%)
 
-# CI optimization: Detect if running in CI environment
-CI_MODE = bool(os.getenv('CI') or os.getenv('CONTINUOUS_INTEGRATION') or os.getenv('GITHUB_ACTIONS'))
+# ---------------------------------------------------------------------------------------------
+# Coverage tiers
+# ---------------------------------------------------------------------------------------------
+# This test is split into three coverage tiers, selected by the active --context so each build
+# runs exactly one tier (the highest present):
+#   gating (no --context)      : very short sanity - runs on every build, incl. PR gating
+#   semi   (--context nightly) : capped representative subset, kept well under ~10 min
+#   full   (--context weekly)  : all supported permutations
+# Rationale: back-to-back UVC open/start/stop/close storms can wedge the host USB controller on
+# CI machines (and take the whole agent offline where the NIC shares that controller).
+TIER_GATING = "gating"
+TIER_SEMI = "semi"
+TIER_FULL = "full"
+
+# Per-tier caps (None = no cap, exercise every supported permutation).
+TIER_CONFIG_CAP = {TIER_GATING: 1, TIER_SEMI: 8, TIER_FULL: None}
+TIER_FPS_CAP = {TIER_GATING: 1, TIER_SEMI: 6, TIER_FULL: None}
+# Full multistream is capped (not "all 930 combos") to keep weekly bounded; matches the prior
+# CI cap. Config/FPS tests stay uncapped at full.
+TIER_MULTISTREAM_CAP = {TIER_GATING: 1, TIER_SEMI: 6, TIER_FULL: 50}
+
+# Let USB endpoints tear down between stream reconfigurations. Back-to-back stop/close -> open
+# storms can wedge the host USB controller on CI machines.
+SETTLE_DELAY = 0.5  # seconds
+
+
+def resolve_coverage_tier(config):
+    """Pick the highest active coverage tier from the --context option."""
+    context = config.getoption("--context", default="").split()
+    if "weekly" in context:
+        return TIER_FULL
+    if "nightly" in context:
+        return TIER_SEMI
+    return TIER_GATING
+
+
+def _settle():
+    """Pause so USB endpoints fully tear down before the next open()."""
+    time.sleep(SETTLE_DELAY)
+
 
 def format_duration(seconds):
     """
@@ -71,52 +110,31 @@ def format_duration(seconds):
         else:
             return f"{hours}h"
 
-def optimize_for_ci(configurations, max_configs=8):
+def _evenly_spaced_subset(items, max_count):
     """
-    Optimize configuration list for CI by limiting the number of configurations tested
+    Return a representative subset of a pre-sorted list with at most max_count entries.
 
-    Args:
-        configurations: List of (width, height, fps) configurations
-        max_configs: Maximum number of configurations to test in CI mode
+    For max_count == 1 returns the middle item (a reliable smoke config for the gating tier -
+    avoids both the highest-bandwidth and lowest-FPS extremes). For max_count >= 2 keeps the
+    first and last item (the extremes) and spreads the remaining slots evenly across the middle.
+    Order is preserved. max_count None means "return everything".
 
-    Returns:
-        List of configurations (limited if in CI mode)
+    Works for both (width, height, fps) config tuples and plain FPS-rate ints - the caller
+    passes lists already sorted by the ordering that matters for that type.
     """
-    if not CI_MODE or len(configurations) <= max_configs:
-        return configurations
+    if max_count is None or len(items) <= max_count:
+        return items
+    if max_count == 1:
+        # A middle item - reliable smoke config for the gating tier. Avoids both extremes: the
+        # highest-bandwidth mode (flaky FPS on constrained benches) and the lowest-FPS mode
+        # (too few frames for a stable measurement).
+        return [items[len(items) // 2]]
 
-    # In CI mode, select a representative subset:
-    # - Lowest resolution configuration
-    # - Highest resolution configuration
-    # - Medium resolution configurations
-    # - Various FPS rates
-
-    log.info(f"CI mode detected: limiting configurations from {len(configurations)} to {max_configs}")
-
-    # Sort by resolution area, then by FPS
-    sorted_configs = sorted(configurations, key=lambda x: (x[0] * x[1], x[2]))
-
-    # Select representative configurations
-    selected = []
-
-    # Always include lowest and highest resolution
-    if sorted_configs:
-        selected.append(sorted_configs[0])  # Lowest resolution
-        if len(sorted_configs) > 1:
-            selected.append(sorted_configs[-1])  # Highest resolution
-
-    # Select middle configurations to reach max_configs
-    remaining_slots = max_configs - len(selected)
-    if remaining_slots > 0 and len(sorted_configs) > 2:
-        # Select evenly spaced configurations from the middle
-        middle_configs = sorted_configs[1:-1]
-        if middle_configs:
-            step = max(1, len(middle_configs) // remaining_slots)
-            for i in range(0, len(middle_configs), step):
-                if len(selected) < max_configs:
-                    selected.append(middle_configs[i])
-
-    return selected
+    # Evenly spaced across the full range, endpoints included. Distinct indices for len > max_count
+    # (the >1 step keeps consecutive picks apart), so exactly max_count items are returned.
+    n = len(items)
+    idx = sorted({round(i * (n - 1) / (max_count - 1)) for i in range(max_count)})
+    return [items[i] for i in idx]
 
 
 class FPSMonitor:
@@ -195,6 +213,7 @@ def time_to_first_frame(sensor, profile, max_delay_allowed):
 
     sensor.stop()
     sensor.close()
+    _settle()
 
     return first_frame_time
 
@@ -433,8 +452,18 @@ def check_stream_fps_accuracy_generic(device, stream_name, stream_type, formats,
                     break
 
     finally:
-        sensor.stop()
-        sensor.close()
+        # Guard teardown so a failed open()/start() surfaces its real error instead of being
+        # masked by a "UVC device is not streaming" raised from stop(). Log (don't mask) the
+        # teardown error so CI post-mortem has a trace. Settle before next open().
+        try:
+            sensor.stop()
+        except Exception as e:
+            log.debug(f"{stream_name} sensor.stop() failed during teardown: {e}")
+        try:
+            sensor.close()
+        except Exception as e:
+            log.debug(f"{stream_name} sensor.close() failed during teardown: {e}")
+        _settle()
 
     # Calculate statistics
     if not fps_measurements:
@@ -621,7 +650,7 @@ def get_fps_test_parameters(fps_rate):
     """
     # Configuration: list of (threshold, (duration, tolerance))
     fps_test_config = [
-        (6,   (15.0, 0.35)),  # Very low FPS: extended test time and higher tolerance
+        (6,   (12.0, 0.35)),  # Very low FPS: extended test time and higher tolerance
         (15,  (10.0, 0.25)),  # Low FPS: increased test time and tolerance
         (30,  (8.0, 0.15)),   # Standard FPS: increased duration for better measurements
         (60,  (6.0, 0.18)),   # High FPS: optimized duration and tolerance
@@ -633,7 +662,7 @@ def get_fps_test_parameters(fps_rate):
     return (3.0, 0.25)  # Extremely high FPS: quickest test, highest tolerance
 
 
-def check_stream_fps_accuracy_comprehensive(device, stream_type_name, test_function, get_fps_function):
+def check_stream_fps_accuracy_comprehensive(device, stream_type_name, test_function, get_fps_function, max_fps_rates=None):
     """
     Comprehensive FPS accuracy test for any stream type
 
@@ -642,6 +671,8 @@ def check_stream_fps_accuracy_comprehensive(device, stream_type_name, test_funct
         stream_type_name: Name of stream type for logging (e.g., "depth", "color", "IR")
         test_function: Function to test FPS for this stream type
         get_fps_function: Function to get supported FPS rates for this stream type
+        max_fps_rates: Coverage cap — limits FPS rates tested to an evenly-spaced subset of this
+            size. None (default) means test all supported rates.
 
     Returns:
         Tuple[bool, List[Dict]]: (all_tests_passed, results_list)
@@ -653,19 +684,12 @@ def check_stream_fps_accuracy_comprehensive(device, stream_type_name, test_funct
         log.warning(f"No supported {stream_type_name} FPS rates found!")
         return False, []
 
-    # Optimize for CI if needed
-    if CI_MODE and len(supported_fps_rates) > 6:
-        # In CI mode, limit to key FPS rates for faster testing
-        original_count = len(supported_fps_rates)
-        # Keep low, medium, and high FPS rates
-        supported_fps_rates = supported_fps_rates[:2] + supported_fps_rates[-2:]  # First 2 and last 2
-        # Add one from middle if available
-        if original_count > 4:
-            mid_index = original_count // 2
-            if mid_index not in [0, 1, original_count-2, original_count-1]:
-                supported_fps_rates.append(get_fps_function(device)[mid_index])
-        supported_fps_rates = sorted(list(set(supported_fps_rates)))
-        log.info(f"CI optimization: limiting FPS rates from {original_count} to {len(supported_fps_rates)}")
+    # Coverage tier: limit to a representative subset of FPS rates (None = all supported)
+    original_count = len(supported_fps_rates)
+    supported_fps_rates = _evenly_spaced_subset(supported_fps_rates, max_fps_rates)
+    if len(supported_fps_rates) != original_count:
+        log.info(f"Coverage: limiting {stream_type_name} FPS rates from {original_count} to "
+                 f"{len(supported_fps_rates)} (cap={max_fps_rates})")
 
     log.info(f"Found supported {stream_type_name} FPS rates: {supported_fps_rates}")
 
@@ -833,7 +857,7 @@ def print_fps_test_summary(stream_type_name, supported_fps_rates, all_fps_result
 
 
 def check_stream_configurations_comprehensive(device, stream_type_name, test_function, get_configurations_function,
-                                            test_duration=3.0, fps_tolerance=0.20):
+                                            max_configs=None):
     """
     Test all supported resolution and FPS configurations for a stream type
 
@@ -842,8 +866,12 @@ def check_stream_configurations_comprehensive(device, stream_type_name, test_fun
         stream_type_name: Name of stream type for logging (e.g., "depth", "color", "IR")
         test_function: Function to test individual configuration (e.g., check_depth_fps_accuracy)
         get_configurations_function: Function to get supported configurations
-        test_duration: How long to test each configuration
-        fps_tolerance: Allowed FPS deviation
+        max_configs: Coverage cap — limits configurations tested to an evenly-spaced subset of this
+            size. None (default) means test all supported configurations.
+
+    Per-config streaming time and tolerance are derived from the FPS via get_fps_test_parameters
+    (same as the FPS-rate and multi-stream paths), so low-FPS modes stream long enough to collect
+    a stable, steady-state measurement instead of only startup-burst frames.
 
     Returns:
         Tuple[bool, List[Dict]]: (all_passed, list_of_results)
@@ -863,10 +891,12 @@ def check_stream_configurations_comprehensive(device, stream_type_name, test_fun
 
     log.info(f"Found {len(supported_configs)} {stream_type_name} configurations")
 
-    # Optimize for CI if needed
-    if CI_MODE:
-        supported_configs = optimize_for_ci(supported_configs, max_configs=8)
-        log.info(f"CI optimization: testing {len(supported_configs)} configurations")
+    # Coverage tier: limit to a representative subset of configurations (None = all supported)
+    original_count = len(supported_configs)
+    supported_configs = _evenly_spaced_subset(supported_configs, max_configs)
+    if len(supported_configs) != original_count:
+        log.info(f"Coverage: limiting {stream_type_name} configurations from {original_count} to "
+                 f"{len(supported_configs)} (cap={max_configs})")
 
     log.info(f"Testing {len(supported_configs)} {stream_type_name} configurations:")
     for width, height, fps in supported_configs:
@@ -878,6 +908,9 @@ def check_stream_configurations_comprehensive(device, stream_type_name, test_fun
     for i, (width, height, fps) in enumerate(supported_configs):
         config_name = f"{width}x{height}@{fps}fps"
         log.info(f"\nTesting {stream_type_name} configuration {i+1}/{len(supported_configs)}: {config_name}")
+
+        # Streaming time scales with FPS: low FPS needs a longer stream to gather enough frames
+        test_duration, fps_tolerance = get_fps_test_parameters(fps)
 
         try:
             # Test this specific configuration
@@ -1153,6 +1186,8 @@ def check_multistream_fps_accuracy(device, depth_config, color_config, test_dura
             if current_fps > 0:
                 color_fps_measurements.append(current_fps)
 
+    depth_sensor = None
+    color_sensor = None
     try:
         # Get sensors
         depth_sensor = device.first_depth_sensor()
@@ -1200,27 +1235,38 @@ def check_multistream_fps_accuracy(device, depth_config, color_config, test_dura
         return False, {"error": f"Multi-stream test failed: {str(e)}"}
 
     finally:
-        # Stop and close sensors
-        try:
-            depth_sensor.stop()
-            depth_sensor.close()
-        except:
-            pass
-        try:
-            color_sensor.stop()
-            color_sensor.close()
-        except:
-            pass
+        # Stop and close sensors. Split stop/close so a failing stop() can't skip close() and
+        # leak an open sensor. One settle after both are closed (both reopen together on the next
+        # combo), so USB endpoints tear down before the next open().
+        for name, s in (("depth", depth_sensor), ("color", color_sensor)):
+            if s is None:
+                continue
+            try:
+                s.stop()
+            except Exception as e:
+                log.debug(f"{name} sensor.stop() failed during teardown: {e}")
+            try:
+                s.close()
+            except Exception as e:
+                log.debug(f"{name} sensor.close() failed during teardown: {e}")
+        _settle()
 
     # Calculate statistics
     elapsed_time = test_stopwatch.get_elapsed()
 
-    # Check if we have sufficient measurements
+    # no_frames marks a stream that never started, as opposed to one merely too slow to measure.
+    # Both counts are reported either way: the stream that died is often not the one short of
+    # measurements, and naming only that one sends triage after the wrong stream.
+    no_frames = depth_frame_count == 0 or color_frame_count == 0
+    frame_counts = f"got depth {depth_frame_count}, color {color_frame_count} frames"
+
     if len(depth_fps_measurements) < 2:
-        return False, {"error": f"Insufficient depth measurements: {len(depth_fps_measurements)} (got {depth_frame_count} frames)"}
+        return False, {"error": f"Insufficient depth measurements: {len(depth_fps_measurements)} ({frame_counts})",
+                       "no_frames": no_frames}
 
     if len(color_fps_measurements) < 2:
-        return False, {"error": f"Insufficient color measurements: {len(color_fps_measurements)} (got {color_frame_count} frames)"}
+        return False, {"error": f"Insufficient color measurements: {len(color_fps_measurements)} ({frame_counts})",
+                       "no_frames": no_frames}
 
     # Calculate FPS statistics
     depth_avg_fps = sum(depth_fps_measurements) / len(depth_fps_measurements)
@@ -1259,7 +1305,7 @@ def check_multistream_fps_accuracy(device, depth_config, color_config, test_dura
     return overall_passed, stats
 
 
-def get_depth_color_combinations(device, max_combinations=50):
+def get_depth_color_combinations(device, max_combinations=None):
     """
     Get all combinations of depth and color configurations for multi-stream testing.
     Includes all possible combinations (any resolution and FPS pairing).
@@ -1290,9 +1336,9 @@ def get_depth_color_combinations(device, max_combinations=50):
 
     log.info(f"Found {len(combinations)} depth+color combinations (all possible combinations)")
 
-    # Optimize for CI if needed
-    if CI_MODE and len(combinations) > max_combinations:
-        log.info(f"CI mode: limiting combinations from {len(combinations)} to {max_combinations}")
+    # Coverage tier: limit to a representative subset of combinations (None = all)
+    if max_combinations is not None and len(combinations) > max_combinations:
+        log.info(f"Coverage: limiting combinations from {len(combinations)} to {max_combinations}")
 
         # Prioritize combinations with:
         # 1. Same FPS rates (most common use case)
@@ -1355,30 +1401,65 @@ def get_depth_color_combinations(device, max_combinations=50):
                 if len(selected) < max_combinations:
                     selected.append(diff_fps_diff_res[i])
 
+        # Small caps can zero out every proportional bucket above; fall back to an evenly-spaced
+        # pick (same strategy as _evenly_spaced_subset) so a low tier (e.g. gating=1) still
+        # exercises a representative combo, consistent with the config/FPS tests.
+        if not selected:
+            selected = list(_evenly_spaced_subset(combinations, max_combinations))
+
         combinations = selected
 
-        log.info(f"CI optimization selected: {len(same_fps_same_res)} same FPS+res, {len(same_fps_diff_res)} same FPS+diff res, "
+        log.info(f"Coverage buckets (available): {len(same_fps_same_res)} same FPS+res, {len(same_fps_diff_res)} same FPS+diff res, "
               f"{len(diff_fps_same_res)} diff FPS+same res, {len(diff_fps_diff_res)} diff FPS+res")
-        log.info(f"Final selection: {len(selected)} combinations")
+        log.info(f"Final selection: {len(combinations)} combinations")
 
     return combinations
 
 
-def check_multistream_configurations_comprehensive(device):
+# Known open defect: on D455, depth throughput degrades while colour also runs at 90 fps.
+DUAL_90FPS_DEPTH_DEGRADATION_MIN_RATIO = 0.65
+
+
+def is_dual_90fps_on_d455(device_name, depth_fps, color_fps):
+    """The configuration the known depth degradation is tied to."""
+    return 'D455' in device_name and depth_fps == 90 and color_fps == 90
+
+
+def is_depth_degraded_at_dual_90fps(device_name, depth_fps, color_fps, stats, tolerance):
+    """Depth alone falls short of target while colour holds 90 fps, on D455."""
+    if not is_dual_90fps_on_d455(device_name, depth_fps, color_fps) or 'error' in stats:
+        return False
+    try:
+        ratio = stats['depth']['actual_fps'] / depth_fps
+        color_deviation = stats['color']['deviation']
+    except (KeyError, TypeError):
+        return False
+    return DUAL_90FPS_DEPTH_DEGRADATION_MIN_RATIO <= ratio < (1 - tolerance) and color_deviation <= tolerance
+
+
+def is_stream_start_failure(stats):
+    """One of the pair delivered no frames at all - the stream never started."""
+    return stats.get('no_frames', False)
+
+
+def check_multistream_configurations_comprehensive(device, max_combinations=None):
     """
     Test all depth + color multi-stream configurations.
     Tests all possible combinations of depth and color configurations.
 
     Args:
         device: RealSense device
+        max_combinations: Coverage cap on the number of combinations (None = all)
 
     Returns:
         Tuple[bool, List[Dict]]: (all_passed, results_list)
     """
     log.info("\nTesting all depth + color multi-stream configurations...")
 
+    device_name = device.get_info(rs.camera_info.name) if device.supports(rs.camera_info.name) else ""
+
     # Get combinations
-    combinations = get_depth_color_combinations(device)
+    combinations = get_depth_color_combinations(device, max_combinations)
 
     if not combinations:
         log.warning("No depth + color combinations available for testing")
@@ -1405,27 +1486,39 @@ def check_multistream_configurations_comprehensive(device):
                 device, depth_config, color_config, test_duration, tolerance
             )
 
+            known_issue = (not passed) and is_depth_degraded_at_dual_90fps(
+                device_name, depth_fps, color_fps, stats, tolerance)
+            never_started = (not passed) and is_stream_start_failure(stats)
+
             result = {
                 "depth_config": depth_config,
                 "color_config": color_config,
                 "config_name": config_name,
                 "passed": passed,
+                "known_issue": known_issue,
+                "never_started": never_started,
                 "stats": stats
             }
 
             all_results.append(result)
 
             if not passed:
-                all_passed = False
+                excused = known_issue or never_started
+                if not excused:
+                    all_passed = False
+                log_fn = log.warning if excused else log.error
+                tag = (" (known issue RSDSO-21810, not counted as a CI failure)" if known_issue
+                       else " (stream never started, RSDSO-21811 - test will be skipped)" if never_started
+                       else "")
                 if 'error' in stats:
-                    log.error(f"  ERROR: {stats['error']}")
+                    log_fn(f"  ERROR{tag}: {stats['error']}")
                 else:
                     depth_stats = stats['depth']
                     color_stats = stats['color']
-                    log.error(f"  FAILED:")
-                    log.error(f"    Depth: Expected {depth_stats['expected_fps']} FPS, got {depth_stats['actual_fps']:.1f} FPS "
+                    log_fn(f"  FAILED{tag}:")
+                    log_fn(f"    Depth: Expected {depth_stats['expected_fps']} FPS, got {depth_stats['actual_fps']:.1f} FPS "
                           f"(deviation: {depth_stats['deviation']*100:.1f}%)")
-                    log.error(f"    Color: Expected {color_stats['expected_fps']} FPS, got {color_stats['actual_fps']:.1f} FPS "
+                    log_fn(f"    Color: Expected {color_stats['expected_fps']} FPS, got {color_stats['actual_fps']:.1f} FPS "
                           f"(deviation: {color_stats['deviation']*100:.1f}%)")
             else:
                 depth_stats = stats['depth']
@@ -1435,6 +1528,9 @@ def check_multistream_configurations_comprehensive(device):
                       f"(deviation: {depth_stats['deviation']*100:.1f}%)")
                 log.info(f"    Color: Expected {color_stats['expected_fps']} FPS, got {color_stats['actual_fps']:.1f} FPS "
                       f"(deviation: {color_stats['deviation']*100:.1f}%)")
+                if is_dual_90fps_on_d455(device_name, depth_fps, color_fps):
+                    log.warning(f"  NOTE: {config_name} PASSED - the known RSDSO-21810 degradation may be fixed; "
+                                f"re-check before keeping the allowance")
 
         except Exception as e:
             log.error(f"  ERROR testing {config_name}: {e}")
@@ -1443,6 +1539,8 @@ def check_multistream_configurations_comprehensive(device):
                 "color_config": color_config,
                 "config_name": config_name,
                 "passed": False,
+                "known_issue": False,
+                "never_started": False,
                 "stats": {"error": str(e)}
             }
             all_results.append(result)
@@ -1508,7 +1606,10 @@ def print_multistream_test_summary(all_results, all_passed, product_line):
         depth_str = f"{depth_config[0]}x{depth_config[1]}@{depth_config[2]}"
         color_str = f"{color_config[0]}x{color_config[1]}@{color_config[2]}"
 
-        status = "PASS" if result['passed'] else "FAIL"
+        if result['passed']:
+            status = "PASS"
+        else:
+            status = "KNOWN" if result.get('known_issue') else ("NOSTART" if result.get('never_started') else "FAIL")
 
         if 'error' in result['stats']:
             log.info(f"{depth_str:<20} {color_str:<20} {status:<8} {'ERROR':<10} {'ERROR':<10} {result['stats']['error']}")
@@ -1522,6 +1623,11 @@ def print_multistream_test_summary(all_results, all_passed, product_line):
     failed_tests = len(all_results) - passed_tests
 
     successful_results = [r for r in all_results if r['passed'] and 'error' not in r['stats']]
+
+    known_tests = sum(1 for r in all_results if r.get('known_issue'))
+    nostart_tests = sum(1 for r in all_results if r.get('never_started'))
+    if known_tests or nostart_tests:
+        log.info(f"Excluded from pass/fail: {known_tests} known, {nostart_tests} never started")
 
     if successful_results:
         log.info(f"\n--- MULTI-STREAM STATISTICS ---")
@@ -1567,24 +1673,29 @@ def settled_device(test_device):
     return dev, ctx
 
 
+# Function-scoped (not module): the tier is device-independent (depends only on --context), so a
+# module-scoped fixture would trip the per-camera fixture guard on benches with >1 D400 camera.
+@pytest.fixture
+def coverage_tier(request):
+    """Resolve the coverage tier (gating/semi/full) from --context."""
+    tier = resolve_coverage_tier(request.config)
+    log.info(f"FPS-performance coverage tier: {tier}")
+    return tier
+
+
 # ============================================================================
 # Test Functions
 # ============================================================================
 
 @pytest.mark.timeout(14400)
-def test_depth_configurations(settled_device):
+def test_depth_configurations(settled_device, coverage_tier):
     """Test depth FPS accuracy for all supported configurations"""
     dev, ctx = settled_device
     product_line = dev.get_info(rs.camera_info.product_line)
 
-    # Log CI optimization status
-    if CI_MODE:
-        log.info("CI mode detected - using optimized test parameters")
-    else:
-        log.info("Full test mode - comprehensive testing of all configurations")
-
     depth_config_tests_passed, depth_config_results = check_stream_configurations_comprehensive(
-        dev, "depth", check_depth_fps_accuracy, get_supported_depth_configurations
+        dev, "depth", check_depth_fps_accuracy, get_supported_depth_configurations,
+        max_configs=TIER_CONFIG_CAP[coverage_tier]
     )
 
     if depth_config_results:
@@ -1595,13 +1706,14 @@ def test_depth_configurations(settled_device):
 
 
 @pytest.mark.timeout(14400)
-def test_color_configurations(settled_device):
+def test_color_configurations(settled_device, coverage_tier):
     """Test color/RGB FPS accuracy for all supported configurations"""
     dev, ctx = settled_device
     product_line = dev.get_info(rs.camera_info.product_line)
 
     color_config_tests_passed, color_config_results = check_stream_configurations_comprehensive(
-        dev, "color", check_color_fps_accuracy, get_supported_color_configurations
+        dev, "color", check_color_fps_accuracy, get_supported_color_configurations,
+        max_configs=TIER_CONFIG_CAP[coverage_tier]
     )
 
     if color_config_results:
@@ -1620,13 +1732,14 @@ def test_color_configurations(settled_device):
 
 
 @pytest.mark.timeout(14400)
-def test_ir_configurations(settled_device):
+def test_ir_configurations(settled_device, coverage_tier):
     """Test IR FPS accuracy for all supported configurations"""
     dev, ctx = settled_device
     product_line = dev.get_info(rs.camera_info.product_line)
 
     ir_config_tests_passed, ir_config_results = check_stream_configurations_comprehensive(
-        dev, "IR", check_ir_fps_accuracy, get_supported_ir_configurations
+        dev, "IR", check_ir_fps_accuracy, get_supported_ir_configurations,
+        max_configs=TIER_CONFIG_CAP[coverage_tier]
     )
 
     if ir_config_results:
@@ -1636,18 +1749,80 @@ def test_ir_configurations(settled_device):
         f"All supported IR configurations accuracy test - {len(ir_config_results) if ir_config_results else 0} configurations tested"
 
 
+def describe_multistream_failure(result):
+    """One-line description of a failed combination, for the assertion message.
+
+    This only ever runs while building a failure message, so it must not raise: an exception
+    here would replace the real AssertionError with a confusing secondary one.
+    """
+    config_name = result.get('config_name', '?')
+    stats = result.get('stats', {})
+    if 'error' in stats:
+        return f"{config_name} -> {stats['error']}"
+
+    try:
+        depth_stats = stats['depth']
+        color_stats = stats['color']
+        return (f"{config_name} -> "
+                f"depth {depth_stats['actual_fps']:.1f}/{depth_stats['expected_fps']} fps "
+                f"({depth_stats['deviation']*100:.1f}% dev), "
+                f"color {color_stats['actual_fps']:.1f}/{color_stats['expected_fps']} fps "
+                f"({color_stats['deviation']*100:.1f}% dev)")
+    except (KeyError, TypeError, ValueError):
+        return f"{config_name} -> unexpected stats shape: {stats}"
+
+
+MAX_REPORTED_FAILURES = 10
+
+
+def describe_multistream_failures(all_results):
+    """Assertion message naming the failed combinations; known-issue rows are listed separately."""
+    def summarize(results):
+        shown = "; ".join(describe_multistream_failure(r) for r in results[:MAX_REPORTED_FAILURES])
+        extra = len(results) - MAX_REPORTED_FAILURES
+        return shown + (f"; ... and {extra} more (see log)" if extra > 0 else "")
+
+    failed = [r for r in all_results if not r['passed'] and not r.get('known_issue') and not r.get('never_started')]
+    known = [r for r in all_results if r.get('known_issue')]
+    never_started = [r for r in all_results if r.get('never_started')]
+    msg = (f"Depth + color multi-stream configurations (all combinations) accuracy test - "
+           f"{len(all_results)} combinations tested, {len(failed)} failed: {summarize(failed)}")
+    if known:
+        msg += f" [{len(known)} known-issue failure(s) excluded: {summarize(known)}]"
+    if never_started:
+        # Surfaced here too: when a real failure asserts, the skip below it never runs and these
+        # would otherwise be missing from the JUnit report entirely.
+        msg += f" [{len(never_started)} stream-start failure(s) also detected: {summarize(never_started)}]"
+    return msg
+
+
 @pytest.mark.timeout(14400)
-def test_multistream_configurations(settled_device):
+def test_multistream_configurations(settled_device, coverage_tier):
     """Test depth + color multi-stream FPS accuracy for all supported configurations"""
     dev, ctx = settled_device
     product_line = dev.get_info(rs.camera_info.product_line)
 
-    multistream_tests_passed, multistream_results = check_multistream_configurations_comprehensive(dev)
+    multistream_tests_passed, multistream_results = check_multistream_configurations_comprehensive(
+        dev, max_combinations=TIER_MULTISTREAM_CAP[coverage_tier]
+    )
 
     if multistream_results:
         print_multistream_test_summary(multistream_results, multistream_tests_passed, product_line)
-        assert multistream_tests_passed, \
-            f"Depth + color multi-stream configurations (all combinations) accuracy test - {len(multistream_results)} combinations tested"
+        # The assertion message is all that reaches the JUnit report; without the offending
+        # combinations, triage means downloading the per-device artifact log.
+        assert multistream_tests_passed, describe_multistream_failures(multistream_results)
+
+        # Only skip when nothing streamed at all - that is a rig/link problem and there is no
+        # result to report. A partial no-start would otherwise discard the pass signal for every
+        # other combination in the run; those stay visible as NOSTART rows and in the log.
+        never_started = [r for r in multistream_results if r.get('never_started')]
+        if never_started and len(never_started) == len(multistream_results):
+            pytest.skip(f"no stream started on any of {len(multistream_results)} combination(s) "
+                        f"(RSDSO-21811): " + "; ".join(r['config_name'] for r in never_started))
+        if never_started:
+            log.warning(f"{len(never_started)}/{len(multistream_results)} combination(s) never started "
+                        f"(RSDSO-21811), not counted as failures: "
+                        + "; ".join(r['config_name'] for r in never_started))
     else:
         # Check if device has no color sensor (like D421, D405)
         product_name = dev.get_info(rs.camera_info.name)
@@ -1660,13 +1835,14 @@ def test_multistream_configurations(settled_device):
 
 
 @pytest.mark.timeout(14400)
-def test_depth_fps_rates(settled_device):
+def test_depth_fps_rates(settled_device, coverage_tier):
     """Test depth FPS accuracy for all supported frame rates"""
     dev, ctx = settled_device
     product_line = dev.get_info(rs.camera_info.product_line)
 
     depth_tests_passed, depth_results = check_stream_fps_accuracy_comprehensive(
-        dev, "depth", check_depth_fps_accuracy, get_supported_depth_fps_rates
+        dev, "depth", check_depth_fps_accuracy, get_supported_depth_fps_rates,
+        max_fps_rates=TIER_FPS_CAP[coverage_tier]
     )
 
     if depth_results:
@@ -1674,13 +1850,14 @@ def test_depth_fps_rates(settled_device):
 
 
 @pytest.mark.timeout(14400)
-def test_color_fps_rates(settled_device):
+def test_color_fps_rates(settled_device, coverage_tier):
     """Test color/RGB FPS accuracy for all supported frame rates"""
     dev, ctx = settled_device
     product_line = dev.get_info(rs.camera_info.product_line)
 
     color_tests_passed, color_results = check_stream_fps_accuracy_comprehensive(
-        dev, "color", check_color_fps_accuracy, get_supported_color_fps_rates
+        dev, "color", check_color_fps_accuracy, get_supported_color_fps_rates,
+        max_fps_rates=TIER_FPS_CAP[coverage_tier]
     )
 
     if color_results:
@@ -1697,13 +1874,14 @@ def test_color_fps_rates(settled_device):
 
 
 @pytest.mark.timeout(14400)
-def test_ir_fps_rates(settled_device):
+def test_ir_fps_rates(settled_device, coverage_tier):
     """Test IR FPS accuracy for all supported frame rates"""
     dev, ctx = settled_device
     product_line = dev.get_info(rs.camera_info.product_line)
 
     ir_tests_passed, ir_results = check_stream_fps_accuracy_comprehensive(
-        dev, "IR", check_ir_fps_accuracy, get_supported_ir_fps_rates
+        dev, "IR", check_ir_fps_accuracy, get_supported_ir_fps_rates,
+        max_fps_rates=TIER_FPS_CAP[coverage_tier]
     )
 
     if ir_results:

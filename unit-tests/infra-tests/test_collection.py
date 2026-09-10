@@ -154,6 +154,51 @@ class TestPrioritySorting:
         assert names[0] == "test_below"
         assert names.index("test_no_prio") < names.index("test_above")
 
+    def test_priority_orders_modules(self):
+        """A module's priority must beat alphabetical module order in both directions:
+        mod_zzz_fw_update (priority 1) runs first, mod_0bbb (priority 900) runs last,
+        even though the alphabet would put them the other way around."""
+        items = [
+            make_mock_item("test_default", module_name="mod_aaa"),
+            make_mock_item("test_urgent", module_name="mod_zzz_fw_update",
+                           markers=[pytest.mark.priority(1)]),
+            make_mock_item("test_late", module_name="mod_0bbb",
+                           markers=[pytest.mark.priority(900)]),
+        ]
+        filter_and_sort_items(make_mock_config(), items)
+
+        names = [i.name for i in items]
+        assert names == ["test_urgent", "test_default", "test_late"]
+
+    def test_module_priority_uses_own_default(self):
+        """A module whose tests are all above the 500 default must sort after a default
+        module, not be clamped to 500 and fall back to alphabetical order."""
+        items = [
+            make_mock_item("test_late", module_name="mod_aaa",
+                           markers=[pytest.mark.priority(900)]),
+            make_mock_item("test_default", module_name="mod_zzz"),
+        ]
+        filter_and_sort_items(make_mock_config(), items)
+
+        names = [i.name for i in items]
+        assert names == ["test_default", "test_late"]
+
+    def test_module_priority_keeps_module_grouping(self):
+        """A single high-priority test pulls its whole module forward, but items never
+        interleave across modules — grouping by module is preserved."""
+        items = [
+            make_mock_item("test_a1", module_name="mod_aaa"),
+            make_mock_item("test_z1", module_name="mod_zzz"),
+            make_mock_item("test_z2_first", module_name="mod_zzz",
+                           markers=[pytest.mark.priority(1)]),
+            make_mock_item("test_a2", module_name="mod_aaa"),
+        ]
+        filter_and_sort_items(make_mock_config(), items)
+
+        names = [i.name for i in items]
+        # mod_zzz (min priority 1) runs first as a contiguous block, priority order inside
+        assert names == ["test_z2_first", "test_z1", "test_a1", "test_a2"]
+
 
 class TestDeviceGrouping:
     """Tests should be grouped by (module, device_serial) so hub recycling is minimized."""

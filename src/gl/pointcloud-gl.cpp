@@ -423,9 +423,18 @@ const librealsense::float3* pointcloud_gl::depth_to_points(
         _depth_data = depth_frame;
         _depth_scale = depth_frame.get_units();
         _depth_intr = depth_intrinsics;
+
+        // With no texture mapped the base class skips get_texture_map, leaving the output empty.
+        // Render here instead against the depth stream itself, so the shader passes UVs through.
+        if (!_extrinsics || !_other_intrinsics)
+        {
+            get_texture_map(output, nullptr, depth_frame.get_width(), depth_frame.get_height(),
+                            depth_intrinsics, identity_matrix(), nullptr);
+        }
     }, [&]{
         _enabled = false;
     });
+
     return nullptr;
 }
 

@@ -29,6 +29,16 @@ using namespace rs2::sw_update;
 
 namespace rs2
 {
+    // RAII guard pairing BeginDisabled/EndDisabled: keeps them balanced even if an exception is
+    // thrown between begin and the explicit end() call (which runs before the tooltip hover check).
+    struct disable_guard
+    {
+        bool active, ended;
+        disable_guard( bool a ) : active( a ), ended( false ) { if( active ) ImGui::BeginDisabled( true ); }
+        void end() { if( active && !ended ) { ended = true; ImGui::EndDisabled(); } }
+        ~disable_guard() { end(); }
+    };
+
     void imgui_easy_theming(ImFont*& font_dynamic, ImFont*& font_18, ImFont*& monofont, int& font_size)
     {
         ImGuiStyle& style = ImGui::GetStyle();
@@ -333,7 +343,7 @@ namespace rs2
         }
     }
 
-    bool device_model::subdevice_has_inference_stream_enabled( const subdevice_model & sub )
+    bool device_model::subdevice_has_perception_stream_enabled( const subdevice_model & sub ) const
     {
         for( auto const & kv : sub.stream_enabled )
         {
@@ -361,16 +371,37 @@ namespace rs2
         return false;
     }
 
-    void device_model::stop_inference_if_video_stopped( viewer_model & viewer )
+    void device_model::stop_perception_if_video_stopped( viewer_model & viewer )
     {
-        // If color or depth are no longer both streaming, stop any inference subdevice that is still running.
+        // If color or depth are no longer both streaming, stop any perception subdevice that is still running.
         if( are_color_and_depth_streaming() )
             return;
         for( auto & sub : subdevices )
         {
-            if( sub->streaming && subdevice_has_inference_stream_enabled( *sub ) )
+            if( sub->streaming && subdevice_has_perception_stream_enabled( *sub ) )
                 sub->stop( viewer.not_model );
         }
+    }
+
+    bool device_model::is_perception_streaming() const
+    {
+        for( auto const & sub : subdevices )
+            if( sub->streaming && subdevice_has_perception_stream_enabled( *sub ) )
+                return true;
+        return false;
+    }
+
+    bool device_model::is_perception_blocking_filter_enabled() const
+    {
+        for( auto const & sub : subdevices )
+            for( auto const & ef : sub->embedded_filters )
+            {
+                auto type = ef->get_filter()->get_type();
+                if( ( type == RS2_EMBEDDED_FILTER_TYPE_DECIMATION || type == RS2_EMBEDDED_FILTER_TYPE_TEMPORAL )
+                    && ef->is_enabled() )
+                    return true;
+            }
+        return false;
     }
 
     void device_model::play_defaults(viewer_model& viewer)
@@ -820,9 +851,9 @@ namespace rs2
                 if (advanced.is_enabled())
                 {
                     std::string dev_name = dev.supports(RS2_CAMERA_INFO_NAME) ? dev.get_info(RS2_CAMERA_INFO_NAME) : "";
-                    bool d457_device = (dev_name.find("D457") != std::string::npos);
+                    bool ae_setpoint_unsupported = (dev_name.find("D457") != std::string::npos) || _is_d500_device;
 
-                    draw_advanced_mode_controls(advanced, amc, get_curr_advanced_controls, was_set, error_message, d457_device);
+                    draw_advanced_mode_controls(advanced, amc, get_curr_advanced_controls, was_set, error_message, ae_setpoint_unsupported);
                 }
                 else
                 {
@@ -1306,22 +1337,35 @@ namespace rs2
                     }
                 }
 
-                // PID toggle between Dual-RGB (2C) and Dedicated-RGB (3C) variants:
-                //   D535:       0x0C01 <-> 0x0C02
-                //   D585:       0x0C04 <-> 0x0C05
-                //   D585 Proto: 0x0C07 <-> 0x0C08
-                if (dev.supports(RS2_CAMERA_INFO_PRODUCT_ID) && dev.is<debug_protocol>())
+                // Dual-RGB (2C) / Dedicated-RGB (3C) toggle for D5x5 SKUs whose FW exposes
+                // depth_xu 0x12 (DUAL_RGB_MODE). Backed by RS2_OPTION_SENSORS_CONFIG_MODE on
+                // the depth sensor; the option's set() writes the XU and triggers
+                // hardware_reset internally, so the device re-enumerates under the new PID.
+                std::shared_ptr<subdevice_model> depth_sub;
+                for (auto& sub : subdevices)
                 {
-                    static constexpr uint32_t MWD_OPCODE          = 0x02U;
-                    static constexpr uint32_t MODE_REG_START_ADDR = 0x80000064U;
-                    static constexpr uint32_t MODE_REG_END_ADDR   = 0x80000068U;
-                    static constexpr uint32_t MODE_DEDICATED_RGB  = 0U;
-                    static constexpr uint32_t MODE_DUAL_RGB       = 1U;
+                    if (sub->s->is<depth_sensor>())
+                    {
+                        depth_sub = sub;
+                        break;
+                    }
+                }
+                if (depth_sub)
+                {
+                    // Read the CACHED option value populated by subdevice_model's periodic
+                    // option-value poll, not a fresh FW round-trip: the "more" popup redraws
+                    // every ImGui frame while open, and calling get_option here would spam
+                    // the FW with XU reads at the render rate.
+                    bool is_dual_rgb = false;
+                    bool can_query   = false;
+                    auto opt_it = depth_sub->options_metadata.find(RS2_OPTION_SENSORS_CONFIG_MODE);
+                    if (opt_it != depth_sub->options_metadata.end())
+                    {
+                        is_dual_rgb = opt_it->second.value_as_float() != 0.f;
+                        can_query   = true;
+                    }
 
-                    std::string current_pid = dev.get_info(RS2_CAMERA_INFO_PRODUCT_ID);
-                    const bool is_dual_rgb      = (current_pid == "0C01") || (current_pid == "0C04") || (current_pid == "0C07");
-                    const bool is_dedicated_rgb = (current_pid == "0C02") || (current_pid == "0C05") || (current_pid == "0C08");
-                    if (is_dual_rgb || is_dedicated_rgb)
+                    if (can_query)
                     {
                         const std::string toggle_label = is_dual_rgb
                             ? "Switch to Dedicated-RGB Mode"
@@ -1332,18 +1376,8 @@ namespace rs2
                         {
                             try
                             {
-                                const uint32_t value = is_dual_rgb ? MODE_DEDICATED_RGB : MODE_DUAL_RGB;
-                                const std::vector<uint8_t> data = {
-                                    static_cast<uint8_t>( value         & 0xFF),
-                                    static_cast<uint8_t>((value >>  8 ) & 0xFF),
-                                    static_cast<uint8_t>((value >> 16 ) & 0xFF),
-                                    static_cast<uint8_t>((value >> 24 ) & 0xFF) };
-
-                                auto dp = dev.as<debug_protocol>();
-                                auto cmd = dp.build_command(MWD_OPCODE, MODE_REG_START_ADDR, MODE_REG_END_ADDR, 0, 0, data);
-
-                                dp.send_and_receive_raw_data(cmd);
-                                restarting_device_info = get_device_info(dev, false);
+                                depth_sub->s->set_option(RS2_OPTION_SENSORS_CONFIG_MODE, is_dual_rgb ? 0.f : 1.f);
+                                // XU write only takes effect on the next enumeration.
                                 dev.hardware_reset();
                             }
                             catch (const error& e)
@@ -2204,6 +2238,62 @@ namespace rs2
         return false;
     }
 
+    namespace
+    {
+        // Fits text (plus an optional trailing_width, e.g. a badge drawn alongside it at the same
+        // scale) into max_width pixels: shrinks the window's font scale down to min_font_scale,
+        // then truncates with an ellipsis if it still doesn't fit. Font scale resets to 1.0 when
+        // this object goes out of scope, so callers control its lifetime by choosing that scope.
+        class fitted_string
+        {
+        public:
+            fitted_string(const std::string& text, float max_width, float min_font_scale, float trailing_width = 0.f)
+                : _full(text), _display(" " + text)
+            {
+                float text_width = ImGui::CalcTextSize(_display.c_str()).x;
+                if (max_width <= 0 || text_width + trailing_width <= max_width)
+                    return;
+
+                float scale = std::max(min_font_scale, max_width / (text_width + trailing_width));
+                ImGui::SetWindowFontScale(scale);
+                _condensed = true;
+
+                float text_budget = max_width - scale * trailing_width;
+                if (ImGui::CalcTextSize(_display.c_str()).x > text_budget)
+                    _display = truncate(text, text_budget);
+            }
+
+            ~fitted_string() { ImGui::SetWindowFontScale(1.0f); }
+
+            const char* text() const { return _display.c_str(); }
+            const char* full_text() const { return _full.c_str(); }
+            bool condensed() const { return _condensed; } // full text is available via tooltip
+
+        private:
+            // Truncates text with a trailing ellipsis so " text" fits within max_width pixels
+            // (current font). Uses a binary search on the character count rather than trimming one
+            // character at a time, since this runs every frame the name doesn't fit.
+            static std::string truncate(const std::string& text, float max_width)
+            {
+                const std::string ellipsis = "...";
+                size_t lo = 0, hi = text.size();
+                while (lo < hi)
+                {
+                    size_t mid = (lo + hi + 1) / 2;
+                    if (ImGui::CalcTextSize((" " + text.substr(0, mid) + ellipsis).c_str()).x <= max_width)
+                        lo = mid;
+                    else
+                        hi = mid - 1;
+                }
+                return " " + text.substr(0, lo) + ellipsis;
+            }
+
+            std::string _full;
+            std::string _display;
+            bool _condensed = false;
+        };
+    }
+
     void device_model::draw_controls(float panel_width, float panel_height,
         ux_window& window,
         std::string& error_message,
@@ -2248,13 +2338,21 @@ namespace rs2
         // Draw device name
         ////////////////////////////////////////
         const ImVec2 name_pos = { pos.x + 9, pos.y + 17 };
+        const float name_area_right_margin = 55.f; // leave room for the remove (X) button
+        const float min_name_font_scale = 0.9f; // below this the name shrinks to illegibility - truncate instead
         ImGui::SetCursorPos(name_pos);
         std::stringstream ss;
         if (dev.supports(RS2_CAMERA_INFO_NAME))
             ss << dev.get_info(RS2_CAMERA_INFO_NAME);
         if (is_ip_device)
         {
-            ImGui::Text(" %s", ss.str().substr(0, ss.str().find("\n IP Device")).c_str());
+            std::string full_name = ss.str().substr(0, ss.str().find("\n IP Device"));
+            {
+                fitted_string name(full_name, panel_width - name_pos.x - name_area_right_margin, min_name_font_scale);
+                ImGui::Text("%s", name.text());
+                if (name.condensed() && ImGui::IsItemHovered())
+                    RsImGui::CustomTooltip(" %s", name.full_text());
+            } // name's destructor restores the font scale before the network-device line below
 
             ImGui::PushFont(window.get_font());
             ImGui::Text("\tNetwork Device at %s", dev.get_info(RS2_CAMERA_INFO_IP_ADDRESS));
@@ -2262,42 +2360,64 @@ namespace rs2
         }
         else
         {
-            ImGui::Text(" %s", ss.str().c_str());
+            std::string full_name = ss.str();
+            std::string badge_text; // includes the same leading spaces the old inline "% s" formatting produced
+            std::string usb_desc;
+            bool is_usb_badge = false;
             if (dev.supports(RS2_CAMERA_INFO_CONNECTION_TYPE))
             {
                 std::string connection_type = dev.get_info(RS2_CAMERA_INFO_CONNECTION_TYPE);
                 if (connection_type == "USB" && dev.supports(RS2_CAMERA_INFO_USB_TYPE_DESCRIPTOR))
                 {
-                    std::string desc = dev.get_info(RS2_CAMERA_INFO_USB_TYPE_DESCRIPTOR);
-                    ss.str("");
-                    ss << "   " << textual_icons::usb << " " << desc;
-                    ImGui::SameLine();
-                    if (!starts_with(desc, "3.")) ImGui::PushStyleColor(ImGuiCol_Text, yellow);
-                    else ImGui::PushStyleColor(ImGuiCol_Text, light_grey);
-                    ImGui::Text(" %s", ss.str().c_str());
-                    ImGui::PopStyleColor();
-                    ss.str("");
-                    ss << "The camera was detected by the OS as connected to a USB " << desc << " port";
-                    ImGui::PushFont(window.get_font());
-                    ImGui::PushStyleColor(ImGuiCol_Text, light_grey);
-                    if (ImGui::IsItemHovered())
-                        RsImGui::CustomTooltip(" %s", ss.str().c_str());
-                    ImGui::PopStyleColor();
-                    ImGui::PopFont();
+                    usb_desc = dev.get_info(RS2_CAMERA_INFO_USB_TYPE_DESCRIPTOR);
+                    is_usb_badge = true;
+                    badge_text = rsutils::string::from() << "  " << textual_icons::usb << " " << usb_desc;
                 }
                 else
                 {
-                    ss.str("");
-                    ss << "   " << connection_type;
+                    badge_text = rsutils::string::from() << "  " << connection_type;
+                }
+            }
+
+            {   // Dedicated scope: name and badge share the font scale fitted_string applies, and
+                // its destructor restores scale to 1.0 right after the badge - any code added below
+                // this scope, still inside the outer else, is guaranteed to run at normal scale.
+                fitted_string name(full_name,
+                    panel_width - name_pos.x - name_area_right_margin,
+                    min_name_font_scale,
+                    ImGui::CalcTextSize(badge_text.c_str()).x);
+                ImGui::Text("%s", name.text());
+                if (name.condensed() && ImGui::IsItemHovered())
+                    RsImGui::CustomTooltip(" %s", name.full_text());
+
+                if (!badge_text.empty())
+                {
                     ImGui::SameLine();
-                    ImGui::PushStyleColor(ImGuiCol_Text, white);
-                    ImGui::Text(" %s", ss.str().c_str());
-                    ImGui::PopStyleColor();
+                    if (is_usb_badge)
+                    {
+                        if (!starts_with(usb_desc, "3.")) ImGui::PushStyleColor(ImGuiCol_Text, yellow);
+                        else ImGui::PushStyleColor(ImGuiCol_Text, light_grey);
+                        ImGui::Text("%s", badge_text.c_str());
+                        ImGui::PopStyleColor();
+                        ss.str("");
+                        ss << "The camera was detected by the OS as connected to a USB " << usb_desc << " port";
+                        ImGui::PushFont(window.get_font());
+                        ImGui::PushStyleColor(ImGuiCol_Text, light_grey);
+                        if (ImGui::IsItemHovered())
+                            RsImGui::CustomTooltip(" %s", ss.str().c_str());
+                        ImGui::PopStyleColor();
+                        ImGui::PopFont();
+                    }
+                    else
+                    {
+                        ImGui::PushStyleColor(ImGuiCol_Text, white);
+                        ImGui::Text("%s", badge_text.c_str());
+                        ImGui::PopStyleColor();
+                    }
                 }
             }
         }
 
-        //ImGui::Text(" %s", dev.get_info(RS2_CAMERA_INFO_NAME));
         ImGui::PopFont();
 
         ////////////////////////////////////////
@@ -2428,11 +2548,6 @@ namespace rs2
                 ImGui::SetCursorPos({ rc.x, rc.y + line_h });
             }
 
-            rc = ImGui::GetCursorPos();
-            ImGui::SetCursorPos({ rc.x + 12, rc.y + 4 });
-            std::string download_label = rsutils::string::from() << "Download firmware...##" << id;
-            hyperlink(window, download_label.c_str(), fw_download_url());
-
             ImGui::SetCursorPos({ rc.x + 225, rc.y - 107 });
             ImGui::PopFont();
         }
@@ -2513,9 +2628,12 @@ namespace rs2
                         }
                         if (can_stream)
                         {
-                            // Disable the start button for inference streams unless color and depth are already streaming.
-                            bool disable_inference = subdevice_has_inference_stream_enabled( *sub ) && ! are_color_and_depth_streaming();
-                            if( disable_inference )
+                            // Disable the start button for perception streams unless color and depth are already
+                            // streaming, and while a decimation/temporal embedded filter is enabled (mutually exclusive).
+                            bool sub_has_perception = subdevice_has_perception_stream_enabled( *sub );
+                            bool blocking_filter_enabled = sub_has_perception && is_perception_blocking_filter_enabled();
+                            bool disable_perception = ( sub_has_perception && ! are_color_and_depth_streaming() ) || blocking_filter_enabled;
+                            if( disable_perception )
                                 ImGui::BeginDisabled();
 
                             if( ImGui::Button( label.c_str(), button_size ) )
@@ -2551,11 +2669,13 @@ namespace rs2
                                     viewer.begin_stream(sub, profile);
                                 }
                             }
-                            if( disable_inference )
+                            if( disable_perception )
                             {
                                 ImGui::EndDisabled();
                                 if( ImGui::IsItemHovered( ImGuiHoveredFlags_AllowWhenDisabled ) )
-                                    RsImGui::CustomTooltip( "Color and Depth streams must be streaming before starting inference" );
+                                    RsImGui::CustomTooltip( blocking_filter_enabled
+                                        ? "Disable the decimation/temporal embedded filter before starting perception (cannot run together)"
+                                        : "Color and Depth streams must be streaming before starting perception" );
                             }
                             else if (ImGui::IsItemHovered())
                             {
@@ -2575,7 +2695,7 @@ namespace rs2
                         if( ImGui::Button( label.c_str(), button_size ) )
                         {
                             sub->stop(viewer.not_model);
-                            stop_inference_if_video_stopped( viewer );
+                            stop_perception_if_video_stopped( viewer );
                             std::string friendly_name = sub->s->get_info(RS2_CAMERA_INFO_NAME);
                             if ((friendly_name.find("Tracking") != std::string::npos) ||
                                 (friendly_name.find("Motion") != std::string::npos))
@@ -2658,6 +2778,13 @@ namespace rs2
                     label = rsutils::string::from() << "Controls ##" << sub->s->get_info(RS2_CAMERA_INFO_NAME) << "," << id;
                     if (ImGui::TreeNode(label.c_str()))
                     {
+                        char filter_buf[TEXT_BUFF_SIZE];
+                        std::snprintf(filter_buf, sizeof(filter_buf), "%s", sub->options_filter.c_str());
+                        ImGui::PushItemWidth(295 - ImGui::GetCursorPosX()); // align with the sliders' right edge
+                        if (ImGui::InputTextWithHint("##options_filter", "Search controls...", filter_buf, sizeof(filter_buf)))
+                            sub->options_filter = filter_buf;
+                        ImGui::PopItemWidth();
+
                         auto const & supported_options = sub->options_metadata;
 
                         // moving the color dedicated options to the end of the vector
@@ -2691,9 +2818,15 @@ namespace rs2
                                                so_ordered.push_back( opt );
                                        } );
 
+                        const std::string filter_lc = rsutils::string::to_lower( sub->options_filter );
                         for (auto opt : so_ordered)
                         {
                             if( viewer.is_option_skipped( opt ) )
+                                continue;
+                            auto it = supported_options.find( opt );
+                            if( ! filter_lc.empty() && it != supported_options.end()
+                                && rsutils::string::to_lower( it->second.label.substr( 0, it->second.label.find( "##" ) ) )
+                                       .find( filter_lc ) == std::string::npos )
                                 continue;
                             if (std::find(drawing_order.begin(), drawing_order.end(), opt) == drawing_order.end())
                             {
@@ -2881,15 +3014,7 @@ namespace rs2
                         ImGui::SetCursorPos({ windows_width - 42, pos.y - 3 });
 
                         const bool pb_available = pb->is_available();
-                        // RAII guard pairing BeginDisabled/EndDisabled: keeps them balanced
-                        // even if an exception is thrown between begin and the explicit end()
-                        // call below (which runs before the tooltip hover check).
-                        struct disable_guard {
-                            bool active, ended;
-                            disable_guard( bool a ) : active( a ), ended( false ) { if( active ) ImGui::BeginDisabled( true ); }
-                            void end() { if( active && !ended ) { ended = true; ImGui::EndDisabled(); } }
-                            ~disable_guard() { end(); }
-                        } dg( !pb_available );
+                        disable_guard dg( !pb_available );
                         try
                         {
                             ImGui::PushFont(window.get_font());
@@ -3028,6 +3153,14 @@ namespace rs2
                     draw_later.push_back([windows_width, &window, sub, pos, &viewer, this, pb]() {
                         ImGui::SetCursorPos({ windows_width - 42, pos.y - 3 });
 
+                        const bool pb_available = pb->is_available();
+                        // Block turning a decimation/temporal filter on while perception streams (mutually exclusive).
+                        auto ef_type = pb->get_filter()->get_type();
+                        const bool block_enable_while_perception = !pb->is_enabled()
+                            && ( ef_type == RS2_EMBEDDED_FILTER_TYPE_DECIMATION
+                              || ef_type == RS2_EMBEDDED_FILTER_TYPE_TEMPORAL )
+                            && is_perception_streaming();
+                        disable_guard dg( !pb_available || block_enable_while_perception );
                         try
                         {
                             ImGui::PushFont(window.get_font());
@@ -3080,6 +3213,13 @@ namespace rs2
                                     window.link_hovered();
                                 }
                             }
+
+                            dg.end();
+                            if( !pb_available && !pb->unavailable_tooltip.empty()
+                                && ImGui::IsItemHovered( ImGuiHoveredFlags_AllowWhenDisabled ) )
+                                RsImGui::CustomTooltip( "%s", pb->unavailable_tooltip.c_str() );
+                            else if( block_enable_while_perception && ImGui::IsItemHovered( ImGuiHoveredFlags_AllowWhenDisabled ) )
+                                RsImGui::CustomTooltip( "Stop the perception stream before enabling this filter (cannot run together)" );
 
                             ImGui::PopStyleColor(5);
                             ImGui::PopFont();

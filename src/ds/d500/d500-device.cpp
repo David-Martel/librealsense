@@ -93,9 +93,7 @@ namespace librealsense
 
     void d500_device::hardware_reset()
     {
-        command cmd(ds::HWRST);
-        cmd.require_response = false;
-        _hw_monitor->send(cmd);
+        _ds_device_common->hardware_reset( std::chrono::seconds( 5 ) );
     }
 
     void d500_device::enter_update_state() const
@@ -122,19 +120,6 @@ namespace librealsense
     std::string d500_device::get_opcode_string(int opcode) const 
     {
         return _hw_monitor_response->hwmon_error2str(opcode);
-    }
-
-    bool d500_device::contradicts( const stream_profile_interface * a, const std::vector< stream_profile > & others ) const
-    {
-        if( auto vid_a = dynamic_cast< const video_stream_profile_interface * >( a ) )
-        {
-            for( auto request : others )
-            {
-                if( a->get_framerate() != 0 && request.fps != 0 && ( a->get_framerate() != request.fps ) )
-                    return true;
-            }
-        }
-        return false;
     }
 
     d500_depth_sensor::d500_depth_sensor( d500_device * owner,std::shared_ptr<uvc_sensor> uvc_sensor)
@@ -166,8 +151,27 @@ namespace librealsense
             uvc->set_frame_metadata_modifier(callback);
     }
 
+    void d500_depth_sensor::color_stream_allowed_or_throw( const stream_profiles & requests ) const
+    {
+        bool color_requested = false;
+        for( auto & p : requests )
+            if( p && p->get_stream_type() == RS2_STREAM_COLOR )
+                color_requested = true;
+        if( ! color_requested )
+            return;  // color only lives on this sensor for dual-color devices
+
+        for( auto & f : _embedded_filters )
+            if( f && f->get_type() == RS2_EMBEDDED_FILTER_TYPE_CLOSE_RANGE
+                && f->supports_option( RS2_OPTION_EMBEDDED_FILTER_ENABLED )
+                && f->get_option( RS2_OPTION_EMBEDDED_FILTER_ENABLED ).query() != 0.f )
+                throw wrong_api_call_sequence_exception(
+                    "Color streams cannot be activated while Improved Close Range Depth is enabled" );
+    }
+
     void d500_depth_sensor::open( const stream_profiles & requests )
     {
+        color_stream_allowed_or_throw( requests );
+
         group_multiple_fw_calls(*this, [&]() {
             _depth_units = get_option(RS2_OPTION_DEPTH_UNITS).query();
             set_frame_metadata_modifier([&](frame_additional_data& data) {data.depth_units = _depth_units.load(); });
@@ -225,7 +229,7 @@ namespace librealsense
             }
             else
             {
-                // Streams contributed by feature mixins (e.g. dual-RGB color), matched by stream type + index.
+                // Streams contributed by feature mixins (e.g. dual-color), matched by stream type + index.
                 bool matched = false;
                 for (auto&& extra : _extra_streams)
                 {
@@ -247,7 +251,7 @@ namespace librealsense
             // Register intrinsics
             if (p->get_format() != RS2_FORMAT_Y16) // Y16 format indicate unrectified images, no intrinsics are available for these
             {
-                // TODO: once available, read the dual RGB intrinsics from the new dual-RGB calibration tables instead of reusing IR here.
+                // TODO: once available, read the dual-color intrinsics from the new dual-color calibration tables instead of reusing IR here.
                 const auto&& profile = to_profile(p.get());
                 std::weak_ptr<d500_depth_sensor> wp = std::dynamic_pointer_cast<d500_depth_sensor>(this->shared_from_this());
                 vid_profile->set_intrinsics([profile, wp]()
@@ -356,7 +360,7 @@ namespace librealsense
 
         if (depth_devs_info.empty() || depth_devices.empty())
         {
-            throw backend_exception("cannot access depth sensor", RS2_EXCEPTION_TYPE_BACKEND);
+            throw backend_exception("cannot access depth sensor");
         }
 
         std::unique_ptr< frame_timestamp_reader > timestamp_reader_backup( new ds_timestamp_reader() );
@@ -372,12 +376,6 @@ namespace librealsense
         depth_ep->register_info(RS2_CAMERA_INFO_PHYSICAL_PORT, filter_by_mi(all_device_infos, 0).front().device_path);
 
         depth_ep->register_option(RS2_OPTION_GLOBAL_TIME_ENABLED, enable_global_time_option);
-
-        depth_ep->register_processing_block(processing_block_factory::create_id_pbf(RS2_FORMAT_Y8, RS2_STREAM_INFRARED, 1));
-        depth_ep->register_processing_block(processing_block_factory::create_id_pbf(RS2_FORMAT_Z16, RS2_STREAM_DEPTH));
-
-        depth_ep->register_processing_block({ {RS2_FORMAT_W10} }, { {RS2_FORMAT_RAW10, RS2_STREAM_INFRARED, 1} }, []() { return std::make_shared<w10_converter>(RS2_FORMAT_RAW10); });
-        depth_ep->register_processing_block({ {RS2_FORMAT_W10} }, { {RS2_FORMAT_Y10BPACK, RS2_STREAM_INFRARED, 1} }, []() { return std::make_shared<w10_converter>(RS2_FORMAT_Y10BPACK); });
         
         return depth_ep;
     }
@@ -410,6 +408,7 @@ namespace librealsense
 
         auto raw_sensor = get_raw_depth_sensor();
         _pid = group.uvc_devices.front().pid;
+        _is_mipi_device = group.uvc_devices.front().is_mipi;
 
         _color_calib_table_raw = [this]()
         {
@@ -430,7 +429,7 @@ namespace librealsense
                                                      raw_sensor ), _hw_monitor_response);
         }
 
-        _ds_device_common = std::make_shared<ds_device_common>(this, _hw_monitor);
+        _ds_device_common = std::make_shared<ds_device_common>(this, _hw_monitor, _is_mipi_device);
 
         // Define Left-to-Right extrinsics calculation (lazy)
         // Reference CS - Right-handed; positive [X,Y,Z] point to [Left,Up,Forward] accordingly.
@@ -462,11 +461,7 @@ namespace librealsense
 
         d500_auto_calibrated::set_depth_sensor( &depth_sensor );
 
-        using namespace platform;
-
-        std::string pid_hex_str, usb_type_str;
         d500_gvd_parsed_fields gvd_parsed_fields;
-        bool usb_modality = true;
         group_multiple_fw_calls(depth_sensor, [&]() {
             
             // D500 device can get enumerated before the whole HW in the camera is ready.
@@ -487,31 +482,9 @@ namespace librealsense
 
             _fw_version = rsutils::version(gvd_parsed_fields.fw_version);
 
-            auto _usb_mode = usb3_type;
-            usb_type_str = usb_spec_names.at(_usb_mode);
-            _usb_mode = raw_depth_sensor->get_usb_specification();
-            if (usb_spec_names.count(_usb_mode) && (usb_undefined != _usb_mode))
-                usb_type_str = usb_spec_names.at(_usb_mode);
-            else  // Backend fails to provide USB descriptor  - occurs with RS3 build. Requires further work
-                usb_modality = false;
-
             set_imu_type( gvd_buff, &gvd_parsed_fields );
 
             _is_symmetrization_enabled = check_symmetrization_enabled();
-
-            depth_sensor.register_processing_block(
-                { {RS2_FORMAT_Y8I} },
-                { {RS2_FORMAT_Y8, RS2_STREAM_INFRARED, 1} , {RS2_FORMAT_Y8, RS2_STREAM_INFRARED, 2} },
-                []() { return std::make_shared<y8i_to_y8y8>(); }
-            ); // L+R
-
-            depth_sensor.register_processing_block(
-                { RS2_FORMAT_Y16I },
-                { {RS2_FORMAT_Y16, RS2_STREAM_INFRARED, 1}, {RS2_FORMAT_Y16, RS2_STREAM_INFRARED, 2} },
-                []() {return std::make_shared<y16i_10msb_to_y16y16>(); }
-            );
-                
-            pid_hex_str = rsutils::string::from() << std::uppercase << rsutils::string::hexdump( _pid );
 
             _is_locked = _ds_device_common->is_locked( gvd_buff.data(), d500_gvd_offsets::is_camera_locked_offset );
 
@@ -572,26 +545,38 @@ namespace librealsense
 
             // defining the temperature options
             auto pvt_temperature = std::make_shared< temperature_xu_option >(raw_depth_sensor,
-                depth_xu,
-                DS5_HKR_PVT_TEMPERATURE,
-                "PVT Temperature");
+                                                                             depth_xu,
+                                                                             d500_xu_id::PVT_TEMPERATURE,
+                                                                             "PVT Temperature");
 
             auto ohm_temperature = std::make_shared< temperature_xu_option >(raw_depth_sensor,
-                depth_xu,
-                DS5_HKR_OHM_TEMPERATURE,
-                "OHM Temperature");
+                                                                             depth_xu,
+                                                                             d500_xu_id::OHM_TEMPERATURE,
+                                                                             "OHM Temperature");
 
             // registering the temperature options
             depth_sensor.register_option(RS2_OPTION_SOC_PVT_TEMPERATURE, pvt_temperature);
             depth_sensor.register_option(RS2_OPTION_OHM_TEMPERATURE, ohm_temperature);
 
-            if (_pid == D585S_PID)
+            if (d500_projector_temperature_pids.count(_pid))
             {
                 auto proj_temperature = std::make_shared< temperature_xu_option >(raw_depth_sensor,
-                    depth_xu,
-                    DS5_HKR_PROJECTOR_TEMPERATURE,
-                    "Projector Temperature");
+                                                                                  depth_xu,
+                                                                                  d500_xu_id::PROJECTOR_TEMPERATURE,
+                                                                                  "Projector Temperature");
                 depth_sensor.register_option(RS2_OPTION_PROJECTOR_TEMPERATURE, proj_temperature);
+            }
+
+            if (d5x5_family_pids.count(_pid))
+            {
+                depth_sensor.register_option( RS2_OPTION_SENSORS_CONFIG_MODE,
+                    std::make_shared< uvc_xu_option< uint8_t > >(
+                        raw_depth_sensor,
+                        depth_xu,
+                        d500_xu_id::DUAL_RGB_MODE,
+                        "Dedicated color sensor (0) vs dual RGB (1). Requires a hardware reset to take effect.",
+                        std::map< float, std::string >{ { 0.f, "Dedicated Color Sensor" }, { 1.f, "Dual RGB" } },
+                        false /* not settable while streaming */ ) );
             }
 
             auto error_control = std::make_shared< uvc_xu_option< uint8_t > >( raw_depth_sensor,
@@ -697,8 +682,9 @@ namespace librealsense
         register_info(RS2_CAMERA_INFO_FIRMWARE_UPDATE_ID, gvd_parsed_fields.optical_module_sn);
         register_info(RS2_CAMERA_INFO_FIRMWARE_VERSION, gvd_parsed_fields.fw_version);        
         register_info(RS2_CAMERA_INFO_PHYSICAL_PORT, group.uvc_devices.front().device_path);
-        register_info(RS2_CAMERA_INFO_DEBUG_OP_CODE, std::to_string(static_cast<int>(fw_cmd::GET_FW_LOGS)));
-        register_info(RS2_CAMERA_INFO_PRODUCT_ID, pid_hex_str);
+        register_info(RS2_CAMERA_INFO_DEBUG_OP_CODE, std::to_string(static_cast<int>(d500_fw_cmd::GET_FW_LOGS)));
+        std::string pid_hex_str = rsutils::string::from() << std::uppercase << rsutils::string::hexdump( _pid );
+        register_info( RS2_CAMERA_INFO_PRODUCT_ID, pid_hex_str );
         register_info(RS2_CAMERA_INFO_PRODUCT_LINE, "D500");
         register_info(RS2_CAMERA_INFO_CAMERA_LOCKED, _is_locked ? "YES" : "NO");
 
@@ -706,21 +692,59 @@ namespace librealsense
         {
             register_info(RS2_CAMERA_INFO_SMCU_FW_VERSION, gvd_parsed_fields.safety_sw_suite_version);
         }
+        register_connection_info( raw_depth_sensor->get_usb_specification() );
 
-        if (usb_modality)
-        {
-            register_info(RS2_CAMERA_INFO_CONNECTION_TYPE, "USB");
-            register_info(RS2_CAMERA_INFO_USB_TYPE_DESCRIPTOR, usb_type_str);
-        }
         register_info( RS2_CAMERA_INFO_IMU_TYPE, gvd_parsed_fields.imu_type );
 
         register_features();
+        register_converters( depth_sensor );
 
         d500_auto_calibrated::add_depth_write_observer( [this]()
         {
             _coefficients_table_raw.reset();
             _new_calib_table_raw.reset();
+            // _left_right_extrinsics is derived from _coefficients_table_raw (baseline in mm), but its own lazy<>
+            // caches the computed rs2_extrinsics — without this reset, get_extrinsics(depth, right_ir) keeps
+            // returning the pre-calibration baseline forever, even though the coefficients table cache is fresh.
+            if( _left_right_extrinsics )
+                _left_right_extrinsics->reset();
         } );
+    }
+
+    void d500_device::register_connection_info( platform::usb_spec usb_spec )
+    {
+        using namespace platform;
+
+        if( usb_spec_names.count( usb_spec ) && ( usb_undefined != usb_spec ) )
+        {
+            std::string usb_spec_str = usb_spec_names.at( usb_spec );
+            register_info( RS2_CAMERA_INFO_CONNECTION_TYPE, "USB" );
+            register_info( RS2_CAMERA_INFO_USB_TYPE_DESCRIPTOR, usb_spec_str );
+        }
+        else // Backend fails to provide USB descriptor
+        {
+            if( _is_mipi_device )
+            {
+                register_info( RS2_CAMERA_INFO_CONNECTION_TYPE, "GMSL" );
+                rsutils::version mipi_driver_version = platform::get_jetson_driver_version();
+                if( mipi_driver_version.is_valid() )
+                {
+                    register_info( RS2_CAMERA_INFO_MIPI_DRIVER_VERSION, mipi_driver_version.to_string() );
+
+                    // Log driver version only once across all devices
+                    static bool logged = false;
+                    if( ! logged )
+                    {
+                        LOG_INFO( "MIPI driver version detected: " << mipi_driver_version.to_string() );
+                        logged = true;
+                    }
+                }
+            }
+            else
+            {
+                throw backend_exception( "Unsupported connection type" );
+            }
+        }
     }
 
     void d500_device::register_features()
@@ -729,6 +753,32 @@ namespace librealsense
 
         register_feature( std::make_shared< auto_exposure_roi_feature >( get_depth_sensor(), _hw_monitor ) );
     }
+
+    void d500_device::register_converters( synthetic_sensor & depth_sensor )
+    {
+        depth_sensor.register_processing_block( processing_block_factory::create_id_pbf(RS2_FORMAT_Z16, RS2_STREAM_DEPTH) );
+
+        // On MIPI/GMSL only Y8I is functional, Y8 for left IR only is not supported by FW.
+        if( ! _is_mipi_device )
+            depth_sensor.register_processing_block( processing_block_factory::create_id_pbf(RS2_FORMAT_Y8, RS2_STREAM_INFRARED, 1) );
+
+        depth_sensor.register_processing_block( { {RS2_FORMAT_Y8I} },
+                                                { {RS2_FORMAT_Y8, RS2_STREAM_INFRARED, 1} , {RS2_FORMAT_Y8, RS2_STREAM_INFRARED, 2} },
+                                                []() { return std::make_shared<y8i_to_y8y8>(); } ); // L+R
+
+        depth_sensor.register_processing_block( { RS2_FORMAT_Y16I },
+                                                { {RS2_FORMAT_Y16, RS2_STREAM_INFRARED, 1}, {RS2_FORMAT_Y16, RS2_STREAM_INFRARED, 2} },
+                                                []() {return std::make_shared<y16i_10msb_to_y16y16>(); } );
+
+        
+        depth_sensor.register_processing_block( { { RS2_FORMAT_W10 } },
+                                                { { RS2_FORMAT_RAW10, RS2_STREAM_INFRARED, 1 } },
+                                                []() { return std::make_shared< w10_converter >( RS2_FORMAT_RAW10 ); } );
+        depth_sensor.register_processing_block( { { RS2_FORMAT_W10 } },
+                                                { { RS2_FORMAT_Y10BPACK, RS2_STREAM_INFRARED, 1 } },
+                                                []() { return std::make_shared< w10_converter >( RS2_FORMAT_Y10BPACK ); } );
+    }
+
 
     platform::usb_spec d500_device::get_usb_spec() const
     {

@@ -25,6 +25,8 @@
 #include <src/proc/y8i-to-y8y8-mipi.h>
 #include <src/proc/y12i-to-y16y16.h>
 #include <src/proc/y12i-to-y16y16-mipi.h>
+#include <src/proc/rggb-converter.h>
+#include <src/proc/dual-rgb-rectify-filter.h>
 #include <src/proc/color-formats-converter.h>
 
 #include <src/hdr-config.h>
@@ -34,6 +36,7 @@
 #include <rsutils/lazy.h>
 #include <rsutils/type/fourcc.h>
 using rsutils::type::fourcc;
+#include <set>
 
 #include <rsutils/string/hexdump.h>
 #include <regex>
@@ -62,7 +65,8 @@ namespace librealsense
         {fourcc('Z','1','6',' '), RS2_FORMAT_Z16},
         {fourcc('R','G','B','2'), RS2_FORMAT_BGR8},
         {fourcc('M','J','P','G'), RS2_FORMAT_MJPEG},
-        {fourcc('B','Y','R','2'), RS2_FORMAT_RAW16}
+        {fourcc('B','Y','R','2'), RS2_FORMAT_RAW16},
+        {fourcc('B','A','8','1'), RS2_FORMAT_RAW8}   // D401 GMSL dual-RGB: SBGGR8 8-bit Bayer (RAW8 CSI passthrough, driver PR #459)
 
     };
     std::map<fourcc::value_type, rs2_stream> d400_depth_fourcc_to_rs2_stream = {
@@ -78,8 +82,37 @@ namespace librealsense
         {fourcc('Z','1','6',' '), RS2_STREAM_DEPTH},
         {fourcc('Z','1','6','H'), RS2_STREAM_DEPTH},
         {fourcc('B','Y','R','2'), RS2_STREAM_COLOR},
-        {fourcc('M','J','P','G'), RS2_STREAM_COLOR}
+        {fourcc('M','J','P','G'), RS2_STREAM_COLOR},
+        {fourcc('B','A','8','1'), RS2_STREAM_COLOR}   // D401 GMSL dual-RGB: SBGGR8, expose each OV9782 imager as color
     };
+
+    // D401 GMSL dual-RGB stream-id resolver. The two OV9782 imagers each arrive on a separate backend pin,
+    // both advertising identical SBGGR8 (fourcc BA81). Rank the BA81 color pins by ascending pin_index and
+    // route them to Color 0 / Color 1 (distinct streams), mirroring the IR1/IR2 split. Uses the upstream
+    // per-pin _stream_id_resolver mechanism (cf. d500_dual_rgb::resolve_color_stream).
+    static void resolve_d401_color_stream( const std::vector< platform::stream_profile > & all,
+                                           const platform::stream_profile & p, rs2_stream & type, int & index )
+    {
+        const auto ba81 = fourcc( 'B', 'A', '8', '1' );
+        if( p.format != ba81 )
+            return;  // not a D401 color pin - leave type/index as resolved by the fourcc map
+
+        std::set< uint32_t > color_pins;
+        for( auto & q : all )
+            if( q.format == ba81 )
+                color_pins.insert( q.pin_index );
+
+        int rank = 0;
+        for( auto cp : color_pins )
+        {
+            if( cp == p.pin_index )
+                break;
+            ++rank;
+        }
+
+        type = RS2_STREAM_COLOR;
+        index = rank;   // Color 0 (left imager), Color 1 (right)
+    }
 
     std::vector<uint8_t> d400_device::send_receive_raw_data(const std::vector<uint8_t>& input)
     {
@@ -167,7 +200,12 @@ namespace librealsense
 
     processing_blocks d400_depth_sensor::get_recommended_processing_blocks() const
     {
-        return get_ds_depth_recommended_proccesing_blocks();
+        auto res = get_ds_depth_recommended_proccesing_blocks();
+        // D401 GMSL dual-RGB: rectify the two color streams (default-on, toggleable in the viewer's
+        // Post-Processing). The filter self-configures from the color profiles' SDK calibration.
+        if( _owner->_pid == ds::RS401_GMSL_PID )
+            res.push_back( std::make_shared< dual_rgb_rectify_filter >() );
+        return res;
     }
 
     rs2_intrinsics d400_depth_sensor::get_intrinsics( const stream_profile & profile ) const
@@ -222,7 +260,42 @@ namespace librealsense
 
     rs2_intrinsics d400_depth_sensor::get_color_intrinsics( const stream_profile & profile ) const
     {
-        if( _owner->_pid == ds::RS405_PID || _owner->_pid == ds::RS401_GMSL_PID )
+        if( _owner->_pid == ds::RS401_GMSL_PID )
+        {
+            // D401 dual-RGB: every output resolution is produced by demosaicing the native 1288x808
+            // image, center-cropping to the output aspect ratio, then bilinear-scaling (see
+            // rggb_converter / rggb::crop_scale_rgb8). So a non-native resolution's intrinsics are
+            // the NATIVE intrinsics transformed by that crop + scale -- NOT a plain resize of the
+            // calibration (which get_d405_color_stream_intrinsic would give and which ignores the
+            // crop). Compute native, then apply crop-offset + scale-factor consistently with the
+            // image path so rectify / deprojection / pointcloud stay correct at every resolution.
+            const int native_w = 1288, native_h = 808;
+            rs2_intrinsics in = ds::get_d405_color_stream_intrinsic( *_owner->_color_calib_table_raw,
+                                                                     native_w, native_h );
+            const int out_w = (int)profile.width, out_h = (int)profile.height;
+            if( out_w == native_w && out_h == native_h )
+                return in;
+
+            int cx, cy, cw, ch;
+            rggb::crop_rect_for_output( native_w, native_h, out_w, out_h, &cx, &cy, &cw, &ch );
+            const float sx = (float)out_w / (float)cw;
+            const float sy = (float)out_h / (float)ch;
+
+            rs2_intrinsics out = in;                 // model + distortion coeffs are unchanged
+            out.width  = out_w;
+            out.height = out_h;
+            out.fx  = in.fx * sx;
+            out.fy  = in.fy * sy;
+            // Shift the principal point into crop coordinates, then scale. crop_scale_rgb8 samples
+            // with the pixel-center convention (src = (out+0.5)/scale - 0.5), so carry the matching
+            // +0.5/-0.5 half-pixel terms; otherwise ppx/ppy are biased by 0.5*(sx-1) (~0.3 px at the
+            // smallest resolution). fx/fy need no such term (focal length is origin-independent).
+            out.ppx = ( in.ppx - (float)cx + 0.5f ) * sx - 0.5f;
+            out.ppy = ( in.ppy - (float)cy + 0.5f ) * sy - 0.5f;
+            return out;
+        }
+
+        if( _owner->_pid == ds::RS405_PID )
             return ds::get_d405_color_stream_intrinsic( *_owner->_color_calib_table_raw,
                                                         profile.width,
                                                         profile.height );
@@ -261,7 +334,11 @@ namespace librealsense
             }
             else if (p->get_stream_type() == RS2_STREAM_COLOR)
             {
-                assign_stream(_owner->_color_stream, p);
+                // D401 GMSL dual-RGB: color index 0 = left imager, index 1 = right (distinct streams).
+                if (p->get_stream_index() == 1 && _owner->_color_stream2)
+                    assign_stream(_owner->_color_stream2, p);
+                else
+                    assign_stream(_owner->_color_stream, p);
             }
             auto&& vid_profile = dynamic_cast<video_stream_profile_interface*>(p.get());
 
@@ -501,7 +578,7 @@ namespace librealsense
 
         if (depth_devs_info.empty() || depth_devices.empty())
         {
-            throw backend_exception("cannot access depth sensor", RS2_EXCEPTION_TYPE_BACKEND);
+            throw backend_exception("cannot access depth sensor");
         }
 
         std::unique_ptr< frame_timestamp_reader > timestamp_reader_backup( new ds_timestamp_reader() );
@@ -595,7 +672,7 @@ namespace librealsense
         set_hw_monitor_for_auto_calib(_hw_monitor);
 
 
-        _ds_device_common = std::make_shared<ds_device_common>(this, _hw_monitor, (_is_mipi_device) ? true : false);
+        _ds_device_common = std::make_shared<ds_device_common>(this, _hw_monitor, _is_mipi_device);
         
 
         // Define Left-to-Right extrinsics calculation (lazy)
@@ -691,6 +768,21 @@ namespace librealsense
                     { {RS2_FORMAT_Y16, RS2_STREAM_INFRARED, 1}, {RS2_FORMAT_Y16, RS2_STREAM_INFRARED, 2} },
                     []() {return std::make_shared<y12i_to_y16y16_mipi>(); }
                 );
+
+                // D401 GMSL dual-RGB: the two OV9782 imagers stream 8-bit RGGB Bayer via the FW RAW8
+                // CSI passthrough, routed to Color 0 / Color 1. Only firmware with that passthrough
+                // supports it; older firmware exposes the ISP color path only. Keep this guard identical
+                // to the block registration guard in d400_color::register_processing_blocks() - the
+                // resolver armed here and the RAW8->RGB8 blocks there must be enabled together.
+                if( _is_mipi_device && _pid == RS401_GMSL_PID && _fw_version >= firmware_version( "5.17.4.13" ) )
+                {
+                    // Route the two identical BGGR color pins to Color 0 / Color 1 (ascending pin order).
+                    raw_depth_sensor->set_stream_id_resolver( resolve_d401_color_stream );
+                    // Both imagers share one HW frame counter; without a per-stream counter FPS reads 2x.
+                    raw_depth_sensor->enable_software_color_frame_numbers();
+                    // The RAW8->RGB8 blocks are registered in d400_color::register_processing_blocks(),
+                    // after the ISP blocks, so a lone Color 0 RGB8 stays ISP and only Color 1 forces raw.
+                }
             }
 
             
@@ -852,8 +944,13 @@ namespace librealsense
                 gain_option = uvc_pu_gain_option;
             }
 
-            // DEPTH AUTO EXPOSURE MODE
-            if ((val_in_range(_pid, { RS455_PID })) && (_fw_version >= firmware_version("5.15.0.0")))
+            // DEPTH AUTO EXPOSURE MODE - available on global-shutter D400 SKUs.
+            // D455: since FW 5.15.0.0; other SKUs: FW 5.17.3.20.
+            const bool is_global_shutter = ( _device_capabilities & ds_caps::CAP_GLOBAL_SHUTTER ) == ds_caps::CAP_GLOBAL_SHUTTER;
+            const firmware_version min_fw_for_ae_mode = (_pid == RS455_PID) ? firmware_version("5.15.0.0")
+                                                                            : firmware_version("5.17.3.20");
+            if (is_global_shutter && _fw_version >= min_fw_for_ae_mode &&
+                    (!_is_mipi_device || mipi_driver_version >= rsutils::version("1.0.5.7")))
             {
                 auto depth_auto_exposure_mode = std::make_shared<uvc_xu_option<uint8_t>>( raw_depth_sensor,
                     depth_xu,
@@ -885,7 +982,7 @@ namespace librealsense
             if ((_fw_version >= firmware_version("5.11.3.0")) && ((_device_capabilities & mask) == mask))
             {
                 bool is_fw_version_using_id = (_fw_version >= firmware_version("5.12.8.100"));
-                auto alternating_emitter_opt = std::make_shared<alternating_emitter_option>(*_hw_monitor, is_fw_version_using_id, ds::d400_hwmon_response::opcodes::NO_DATA_TO_RETURN);
+                auto alternating_emitter_opt = std::make_shared<alternating_emitter_option>(*_hw_monitor, is_fw_version_using_id, true, ds::d400_hwmon_response::opcodes::NO_DATA_TO_RETURN);
                 auto emitter_always_on_opt = std::make_shared<emitter_always_on_option>( _hw_monitor, ds::LASERONCONST, ds::LASERONCONST );
 
                 if ((_fw_version >= firmware_version("5.12.1.0")) && ((_device_capabilities & ds_caps::CAP_GLOBAL_SHUTTER) == ds_caps::CAP_GLOBAL_SHUTTER))
@@ -949,6 +1046,15 @@ namespace librealsense
                 }
             }
 
+            if( _fw_version >= firmware_version( "5.17.3.13" )
+                && val_in_range( _pid, { RS405_PID, RS455_PID, RS457_PID, RS435I_PID, RS401_GMSL_PID } ) )
+            {
+                depth_sensor.register_option( RS2_OPTION_READOUT_SHAPING,
+                    std::make_shared< uvc_xu_option< uint8_t > >( raw_depth_sensor, depth_xu,
+                        DS5_READOUT_SHAPING,
+                        "IR/depth sensor readout shaping [0-100%]; higher slows readout to avoid dropped frames" ) );
+            }
+
             depth_sensor.register_option( RS2_OPTION_STEREO_BASELINE,
                                           std::make_shared< const_value_option >(
                                               "Distance in mm between the stereo imagers",
@@ -1001,7 +1107,7 @@ namespace librealsense
         register_info(RS2_CAMERA_INFO_FIRMWARE_UPDATE_ID, asic_serial);
         register_info(RS2_CAMERA_INFO_FIRMWARE_VERSION, _fw_version);
         register_info(RS2_CAMERA_INFO_PHYSICAL_PORT, group.uvc_devices.front().device_path);
-        register_info(RS2_CAMERA_INFO_DEBUG_OP_CODE, std::to_string(static_cast<int>(fw_cmd::GLD)));
+        register_info(RS2_CAMERA_INFO_DEBUG_OP_CODE, std::to_string(static_cast<int>(d400_fw_cmd::GLD)));
         register_info(RS2_CAMERA_INFO_ADVANCED_MODE, ((advanced_mode) ? "YES" : "NO"));
         register_info(RS2_CAMERA_INFO_PRODUCT_ID, pid_hex_str);
         register_info(RS2_CAMERA_INFO_PRODUCT_LINE, "D400");

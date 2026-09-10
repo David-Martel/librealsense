@@ -5,6 +5,7 @@ import pytest
 import time
 import pyrealsense2 as rs
 from pytest_check import check
+from rspy import tests_wrapper as tw
 import logging
 log = logging.getLogger(__name__)
 
@@ -41,7 +42,7 @@ def test_pause_resume_no_impact_on_streaming(test_context):
         check.equal(safety_sensor.get_option(rs.option.safety_mode), float(rs.safety_mode.run))  # verify default
 
         log.debug("Command standby mode")
-        safety_sensor.set_option(rs.option.safety_mode, rs.safety_mode.standby)
+        tw.set_safety_mode(safety_sensor, rs.safety_mode.standby)
         check.equal(safety_sensor.get_option(rs.option.safety_mode), float(rs.safety_mode.standby))
         verify_frames_received(pipe, count=10)
 
@@ -51,7 +52,7 @@ def test_pause_resume_no_impact_on_streaming(test_context):
         verify_frames_received(pipe, count=10)
 
         log.debug("Command run mode")
-        safety_sensor.set_option(rs.option.safety_mode, rs.safety_mode.run)
+        tw.set_safety_mode(safety_sensor, rs.safety_mode.run)
         check.equal(safety_sensor.get_option(rs.option.safety_mode), float(rs.safety_mode.run))
         verify_frames_received(pipe, count=10)
     finally:
@@ -76,7 +77,7 @@ def test_resume_to_maintenance_keeps_video_streaming(test_context):
         safety_sensor = pipeline_device.first_safety_sensor()
 
         log.debug("Command run mode")
-        safety_sensor.set_option(rs.option.safety_mode, rs.safety_mode.run)
+        tw.set_safety_mode(safety_sensor, rs.safety_mode.run)
         log.debug(f"Current mode: {safety_sensor.get_option(rs.option.safety_mode)}")
         check.equal(safety_sensor.get_option(rs.option.safety_mode), float(rs.safety_mode.run))
         # Verify that on RUN mode we get frames
@@ -86,14 +87,14 @@ def test_resume_to_maintenance_keeps_video_streaming(test_context):
         time.sleep(2)
 
         log.debug("Command service mode")
-        safety_sensor.set_option(rs.option.safety_mode, rs.safety_mode.service)
+        tw.set_safety_mode(safety_sensor, rs.safety_mode.service)
         log.debug(f"Current mode: {safety_sensor.get_option(rs.option.safety_mode)}")
         check.equal(safety_sensor.get_option(rs.option.safety_mode), float(rs.safety_mode.service))
         verify_frames_received(pipe, count=10)
 
         # Restore Run mode
         log.debug("Command run mode")
-        safety_sensor.set_option(rs.option.safety_mode, rs.safety_mode.run)
+        tw.set_safety_mode(safety_sensor, rs.safety_mode.run)
         log.debug(f"Current mode: {safety_sensor.get_option(rs.option.safety_mode)}")
         check.equal(safety_sensor.get_option(rs.option.safety_mode), float(rs.safety_mode.run))
         # Verify that on RUN mode we get frames
@@ -118,20 +119,20 @@ def test_resume_to_maintenance_keeps_safety_streaming(test_context):
         safety_sensor = pipeline_device.first_safety_sensor()
 
         log.debug("Command run mode")
-        safety_sensor.set_option(rs.option.safety_mode, rs.safety_mode.run)
+        tw.set_safety_mode(safety_sensor, rs.safety_mode.run)
         check.equal(safety_sensor.get_option(rs.option.safety_mode), float(rs.safety_mode.run))
         # Verify that on RUN mode we get frames
         verify_frames_received(pipe, count=10)
 
         log.debug("Command service mode")
-        safety_sensor.set_option(rs.option.safety_mode, rs.safety_mode.service)
+        tw.set_safety_mode(safety_sensor, rs.safety_mode.service)
         check.equal(safety_sensor.get_option(rs.option.safety_mode), float(rs.safety_mode.service))
         # Verify that on SERVICE mode we still get frames
         verify_frames_received(pipe, count=10)
 
         # Restore Run mode
         log.debug("Command run mode")
-        safety_sensor.set_option(rs.option.safety_mode, rs.safety_mode.run)
+        tw.set_safety_mode(safety_sensor, rs.safety_mode.run)
         check.equal(safety_sensor.get_option(rs.option.safety_mode), float(rs.safety_mode.run))
 
         # We know that returning to run mode will not restart the safety stream.

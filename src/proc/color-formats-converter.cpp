@@ -376,26 +376,23 @@ namespace librealsense
     template<rs2_format FORMAT>
     void m420_parse_one_line(const uint8_t * y_one_line, const uint8_t * uv_one_line, uint8_t** dst, int width)
     {
-        // building 16 pixels at each iteration 
+        // building up to 16 pixels at each iteration; the last iteration may be short when width % 16 != 0
         for (int y_pix = 0, uv_pix = 0; y_pix < width; y_pix += 16, uv_pix += 16)
         {
+            const int pixels_this_iter = std::min( 16, width - y_pix );
+
             // grabbing matching y,u,v values
             uint8_t y[16] = { 0 };
-            std::memcpy( y, &y_one_line[y_pix], 16 );
+            std::memcpy( y, &y_one_line[y_pix], pixels_this_iter );
 
-            uint8_t u[16] = {
-                uv_one_line[uv_pix + 0], uv_one_line[uv_pix + 0], uv_one_line[uv_pix + 2], uv_one_line[uv_pix + 2],
-                uv_one_line[uv_pix + 4], uv_one_line[uv_pix + 4], uv_one_line[uv_pix + 6], uv_one_line[uv_pix + 6],
-                uv_one_line[uv_pix + 8], uv_one_line[uv_pix + 8], uv_one_line[uv_pix + 10], uv_one_line[uv_pix + 10],
-                uv_one_line[uv_pix + 12], uv_one_line[uv_pix + 12], uv_one_line[uv_pix + 14], uv_one_line[uv_pix + 14]
-            };
-
-            uint8_t v[16] = {
-                uv_one_line[uv_pix + 1], uv_one_line[uv_pix + 1], uv_one_line[uv_pix + 3], uv_one_line[uv_pix + 3],
-                uv_one_line[uv_pix + 5], uv_one_line[uv_pix + 5], uv_one_line[uv_pix + 7], uv_one_line[uv_pix + 7],
-                uv_one_line[uv_pix + 9], uv_one_line[uv_pix + 9], uv_one_line[uv_pix + 11], uv_one_line[uv_pix + 11],
-                uv_one_line[uv_pix + 13], uv_one_line[uv_pix + 13], uv_one_line[uv_pix + 15], uv_one_line[uv_pix + 15]
-            };
+            uint8_t u[16] = { 0 };
+            uint8_t v[16] = { 0 };
+            for (int p = 0; p < pixels_this_iter; ++p)
+            {
+                const int uv_base = uv_pix + (p & ~1); // each UV pair covers 2 pixels
+                u[p] = uv_one_line[uv_base];
+                v[p] = uv_one_line[uv_base + 1];
+            }
 
             // converting y,u,v values to r,g,b values
             uint8_t r[16], g[16], b[16];
@@ -413,7 +410,8 @@ namespace librealsense
 #undef clamp
             }
 
-            // outputting r,g,b values in the order needed for each format
+            // outputting r,g,b values in the order needed for each format;
+            // memcpy uses pixels_this_iter so the tail iteration writes only valid pixels
             if (FORMAT == RS2_FORMAT_RGB8)
             {
                 uint8_t out[16 * 3] = {
@@ -426,8 +424,8 @@ namespace librealsense
                     r[12], g[12], b[12], r[13], g[13], b[13],
                     r[14], g[14], b[14], r[15], g[15], b[15]
                 };
-                std::memcpy( *dst, out, sizeof( out ) );
-                *dst += sizeof out;
+                std::memcpy( *dst, out, pixels_this_iter * 3 );
+                *dst += pixels_this_iter * 3;
                 continue;
             }
 
@@ -443,8 +441,8 @@ namespace librealsense
                     b[12], g[12], r[12], b[13], g[13], r[13],
                     b[14], g[14], r[14], b[15], g[15], r[15],
                 };
-                std::memcpy( *dst, out, sizeof out );
-                *dst += sizeof out;
+                std::memcpy( *dst, out, pixels_this_iter * 3 );
+                *dst += pixels_this_iter * 3;
                 continue;
             }
 
@@ -460,8 +458,8 @@ namespace librealsense
                     r[12], g[12], b[12], 255, r[13], g[13], b[13], 255,
                     r[14], g[14], b[14], 255, r[15], g[15], b[15], 255,
                 };
-                std::memcpy( *dst, out, sizeof out );
-                *dst += sizeof out;
+                std::memcpy( *dst, out, pixels_this_iter * 4 );
+                *dst += pixels_this_iter * 4;
                 continue;
             }
 
@@ -477,8 +475,8 @@ namespace librealsense
                     b[12], g[12], r[12], 255, b[13], g[13], r[13], 255,
                     b[14], g[14], r[14], 255, b[15], g[15], r[15], 255,
                 };
-                std::memcpy( *dst, out, sizeof out );
-                *dst += sizeof out;
+                std::memcpy( *dst, out, pixels_this_iter * 4 );
+                *dst += pixels_this_iter * 4;
                 continue;
             }
         }
@@ -635,73 +633,79 @@ namespace librealsense
         assert(n % 16 == 0); // All currently supported color resolutions are multiples of 16 pixels. Could easily extend support to other resolutions by copying final n<16 pixels into a zero-padded buffer and recursively calling self for final iteration.
 
 #if defined __SSSE3__ && ! defined ANDROID
-        static bool do_avx = has_avx();
-
-        auto src = reinterpret_cast<const __m128i*>(s);
-        auto dst = reinterpret_cast<__m128i*>(d[0]);
-
-        __m128i* source_chunks_y = new __m128i[2 * width / 16];
-        __m128i* source_chunks_uv = new __m128i[width / 16];
-
-#pragma omp parallel for
-        for (int j = 0; j < height / 2; ++j)
+        // SSE row-stride math (3*width per row-pair, 2*width per Y-line-pair) assumes width is
+        // a multiple of 16. For non-aligned widths (e.g. 424) the offsets drift and lines shift.
+        if (width % 16 == 0)
         {
+            static bool do_avx = has_avx();
+
+            auto src = reinterpret_cast<const __m128i*>(s);
+            auto dst = reinterpret_cast<__m128i*>(d[0]);
+
+            __m128i* source_chunks_y = new __m128i[2 * width / 16];
+            __m128i* source_chunks_uv = new __m128i[width / 16];
+
 #pragma omp parallel for
-            for (int i = 0; i < 2 * width / 16; ++i)
+            for (int j = 0; j < height / 2; ++j)
             {
-                auto offset_to_current_2_y_lines_for_src = (3 * width * j) / 16;
-                source_chunks_y[i] = _mm_loadu_si128(&src[offset_to_current_2_y_lines_for_src + i]);
-
-                if (FORMAT == RS2_FORMAT_Y8)
+#pragma omp parallel for
+                for (int i = 0; i < 2 * width / 16; ++i)
                 {
-                    auto offset_to_current_2_y_lines_for_dst = (2 * width * j) / 16;
-                    // Align all Y components and output 2 lines of Y at once
-                    _mm_storeu_si128(&dst[offset_to_current_2_y_lines_for_dst + i], source_chunks_y[i]);
-                    continue;
+                    auto offset_to_current_2_y_lines_for_src = (3 * width * j) / 16;
+                    source_chunks_y[i] = _mm_loadu_si128(&src[offset_to_current_2_y_lines_for_src + i]);
+
+                    if (FORMAT == RS2_FORMAT_Y8)
+                    {
+                        auto offset_to_current_2_y_lines_for_dst = (2 * width * j) / 16;
+                        // Align all Y components and output 2 lines of Y at once
+                        _mm_storeu_si128(&dst[offset_to_current_2_y_lines_for_dst + i], source_chunks_y[i]);
+                        continue;
+                    }
+
+                    if (FORMAT == RS2_FORMAT_Y16)
+                    {
+                        auto bpp = 2;
+                        auto offset_to_current_2_y_lines_for_dst = (2 * width * j) / 16 * bpp;
+                        const __m128i zero = _mm_set1_epi8(0);
+                        __m128i y16__0_7 = _mm_unpacklo_epi8(source_chunks_y[i], zero);
+                        __m128i y16__8_F = _mm_unpackhi_epi8(source_chunks_y[i], zero);
+                        __m128i y16_0_7_epi_16 = _mm_slli_epi16(y16__0_7, 8);
+                        __m128i y16_8_F_epi_16 = _mm_slli_epi16(y16__8_F, 8);
+                        // Align all Y components and output 2 _m128i of Y at once
+                        _mm_storeu_si128(&dst[offset_to_current_2_y_lines_for_dst + i * 2], y16_0_7_epi_16);
+                        _mm_storeu_si128(&dst[offset_to_current_2_y_lines_for_dst + i * 2 + 1], y16_8_F_epi_16);
+                        continue;
+                    }
+
+                    auto offset_to_current_uv_line_for_src = offset_to_current_2_y_lines_for_src + 2 * width / 16;
+                    if ( i < width / 16)
+                        source_chunks_uv[i] = _mm_loadu_si128(&src[offset_to_current_uv_line_for_src + i]);
                 }
 
-                if (FORMAT == RS2_FORMAT_Y16)
+                if (FORMAT == RS2_FORMAT_RGB8 || FORMAT == RS2_FORMAT_RGBA8 || FORMAT == RS2_FORMAT_BGR8 || FORMAT == RS2_FORMAT_BGRA8)
                 {
-                    auto bpp = 2;
-                    auto offset_to_current_2_y_lines_for_dst = (2 * width * j) / 16 * bpp;
-                    const __m128i zero = _mm_set1_epi8(0);
-                    __m128i y16__0_7 = _mm_unpacklo_epi8(source_chunks_y[i], zero);
-                    __m128i y16__8_F = _mm_unpackhi_epi8(source_chunks_y[i], zero);
-                    __m128i y16_0_7_epi_16 = _mm_slli_epi16(y16__0_7, 8);
-                    __m128i y16_8_F_epi_16 = _mm_slli_epi16(y16__8_F, 8);
-                    // Align all Y components and output 2 _m128i of Y at once
-                    _mm_storeu_si128(&dst[offset_to_current_2_y_lines_for_dst + i * 2], y16_0_7_epi_16);
-                    _mm_storeu_si128(&dst[offset_to_current_2_y_lines_for_dst + i * 2 + 1], y16_8_F_epi_16);
-                    continue;
+                    int bpp = 3;
+                    if (FORMAT == RS2_FORMAT_RGBA8 || FORMAT == RS2_FORMAT_BGRA8)
+                        bpp = 4;
+
+                    auto offset_to_current_first_line_for_dst = (2 * width * j) / 16 * bpp;
+                    auto offset_to_current_second_line_for_dst = offset_to_current_first_line_for_dst + width * bpp / 16;
+
+                    auto line_length = width / 16;
+                    auto first_line_y = source_chunks_y;
+                    auto second_line_y = source_chunks_y + line_length;
+
+                    m420_sse_parse_one_line<FORMAT>(first_line_y, source_chunks_uv, &dst[offset_to_current_first_line_for_dst], line_length);
+                    m420_sse_parse_one_line<FORMAT>(second_line_y, source_chunks_uv, &dst[offset_to_current_second_line_for_dst], line_length);
                 }
-
-                auto offset_to_current_uv_line_for_src = offset_to_current_2_y_lines_for_src + 2 * width / 16;
-                if ( i < width / 16)
-                    source_chunks_uv[i] = _mm_load_si128(&src[offset_to_current_uv_line_for_src + i]);
             }
 
-            if (FORMAT == RS2_FORMAT_RGB8 || FORMAT == RS2_FORMAT_RGBA8 || FORMAT == RS2_FORMAT_BGR8 || FORMAT == RS2_FORMAT_BGRA8)
-            {
-                int bpp = 3;
-                if (FORMAT == RS2_FORMAT_RGBA8 || FORMAT == RS2_FORMAT_BGRA8)
-                    bpp = 4;
-
-                auto offset_to_current_first_line_for_dst = (2 * width * j) / 16 * bpp;
-                auto offset_to_current_second_line_for_dst = offset_to_current_first_line_for_dst + width * bpp / 16;
-
-                auto line_length = width / 16;
-                auto first_line_y = source_chunks_y;
-                auto second_line_y = source_chunks_y + line_length;
-
-                m420_sse_parse_one_line<FORMAT>(first_line_y, source_chunks_uv, &dst[offset_to_current_first_line_for_dst], line_length);
-                m420_sse_parse_one_line<FORMAT>(second_line_y, source_chunks_uv, &dst[offset_to_current_second_line_for_dst], line_length);
-            }
+            delete[] source_chunks_y;
+            delete[] source_chunks_uv;
+            return;
         }
-
-        delete[] source_chunks_y;
-        delete[] source_chunks_uv;
-
-#else
+        // fall through to scalar path for non-16-aligned widths
+#endif // __SSSE3__
         auto src = reinterpret_cast<const uint8_t*>(s);
         auto dst = reinterpret_cast<uint8_t*>(d[0]);
 
@@ -726,16 +730,24 @@ namespace librealsense
                 // fill the destination with y values
                 // while y is on 2 lines, and uv on the third line
                 auto start_of_y = src + k * width;
-
-                for (int pix = 0; pix < 2 * width; pix += 16)
+                const int total = 2 * width;
+                const int aligned = total - (total % 16);
+                int pix = 0;
+                for (; pix < aligned; pix += 16)
                 {
                     uint16_t y[16];
-                    for (int dst_idx = 0, src_idx = 0; dst_idx < 16; dst_idx += 1, ++src_idx)
+                    for (int i = 0; i < 16; ++i)
                     {
-                        y[dst_idx] = start_of_y[src_idx + pix] << 8;
+                        y[i] = start_of_y[pix + i] << 8;
                     }
                     std::memcpy( dst, y, sizeof y );
                     dst += sizeof y;
+                }
+                for (; pix < total; ++pix)
+                {
+                    uint16_t v = uint16_t(start_of_y[pix]) << 8;
+                    std::memcpy( dst, &v, sizeof v );
+                    dst += sizeof v;
                 }
             }
             return;
@@ -753,8 +765,6 @@ namespace librealsense
             m420_parse_one_line<FORMAT>(start_of_y, start_of_uv, &dst, width);
             m420_parse_one_line<FORMAT>(start_of_second_line, start_of_uv, &dst, width);
         }
-        return;
-#endif // __SSSE3__
     }
 
     void unpack_yuy2(rs2_format dst_format, rs2_stream dst_stream, uint8_t * const d[], const uint8_t * s, int w, int h, int actual_size)
@@ -825,80 +835,85 @@ namespace librealsense
     // The per-line UV layout (UVUVUV...) is identical to M420, only the plane arrangement differs.
     template<rs2_format FORMAT> void unpack_nv12( uint8_t * const d[], const uint8_t * s, int width, int height, int actual_size)
     {
-        assert(width % 16 == 0);
         assert(height % 2 == 0);
 
 #if defined __SSSE3__ && ! defined ANDROID
-        auto dst = reinterpret_cast<__m128i*>(d[0]);
+        // SSE row-stride math (UV row = width bytes, RGB8/BGR8 dst row = 3*width bytes) requires
+        // width to be a multiple of 16; otherwise offsets drift and lines shift (e.g. width=424).
+        if (width % 16 == 0)
+        {
+            auto dst = reinterpret_cast<__m128i*>(d[0]);
 
-        // Y plane starts at offset 0, UV plane starts at offset width*height
-        auto y_plane = reinterpret_cast<const __m128i*>(s);
-        auto uv_plane = reinterpret_cast<const __m128i*>(s + width * height);
+            // Y plane starts at offset 0, UV plane starts at offset width*height
+            auto y_plane = reinterpret_cast<const __m128i*>(s);
+            auto uv_plane = reinterpret_cast<const __m128i*>(s + width * height);
 
 #pragma omp parallel for
-        for (int j = 0; j < height / 2; ++j)
-        {
-            // Per-iteration buffers to avoid data races across threads
-            auto source_chunks_y = new __m128i[2 * width / 16];
-            auto source_chunks_uv = new __m128i[width / 16];
-
-            // Load 2 lines of Y from the Y plane
-            for (int i = 0; i < 2 * width / 16; ++i)
+            for (int j = 0; j < height / 2; ++j)
             {
-                auto y_offset = (2 * j * width) / 16;
-                source_chunks_y[i] = _mm_loadu_si128(&y_plane[y_offset + i]);
+                // Per-iteration buffers to avoid data races across threads
+                auto source_chunks_y = new __m128i[2 * width / 16];
+                auto source_chunks_uv = new __m128i[width / 16];
 
-                if (FORMAT == RS2_FORMAT_Y8)
+                // Load 2 lines of Y from the Y plane
+                for (int i = 0; i < 2 * width / 16; ++i)
                 {
-                    auto dst_offset = (2 * width * j) / 16;
-                    _mm_storeu_si128(&dst[dst_offset + i], source_chunks_y[i]);
-                    continue;
+                    auto y_offset = (2 * j * width) / 16;
+                    source_chunks_y[i] = _mm_loadu_si128(&y_plane[y_offset + i]);
+
+                    if (FORMAT == RS2_FORMAT_Y8)
+                    {
+                        auto dst_offset = (2 * width * j) / 16;
+                        _mm_storeu_si128(&dst[dst_offset + i], source_chunks_y[i]);
+                        continue;
+                    }
+
+                    if (FORMAT == RS2_FORMAT_Y16)
+                    {
+                        auto bpp = 2;
+                        auto dst_offset = (2 * width * j) / 16 * bpp;
+                        const __m128i zero = _mm_set1_epi8(0);
+                        __m128i y16__0_7 = _mm_unpacklo_epi8(source_chunks_y[i], zero);
+                        __m128i y16__8_F = _mm_unpackhi_epi8(source_chunks_y[i], zero);
+                        __m128i y16_0_7_epi_16 = _mm_slli_epi16(y16__0_7, 8);
+                        __m128i y16_8_F_epi_16 = _mm_slli_epi16(y16__8_F, 8);
+                        _mm_storeu_si128(&dst[dst_offset + i * 2], y16_0_7_epi_16);
+                        _mm_storeu_si128(&dst[dst_offset + i * 2 + 1], y16_8_F_epi_16);
+                        continue;
+                    }
+
+                    // Load UV line from the UV plane (one UV row per pair of Y rows)
+                    if ( i < width / 16)
+                    {
+                        auto uv_offset = (j * width) / 16;
+                        source_chunks_uv[i] = _mm_loadu_si128(&uv_plane[uv_offset + i]);
+                    }
                 }
 
-                if (FORMAT == RS2_FORMAT_Y16)
+                if (FORMAT == RS2_FORMAT_RGB8 || FORMAT == RS2_FORMAT_RGBA8 || FORMAT == RS2_FORMAT_BGR8 || FORMAT == RS2_FORMAT_BGRA8)
                 {
-                    auto bpp = 2;
-                    auto dst_offset = (2 * width * j) / 16 * bpp;
-                    const __m128i zero = _mm_set1_epi8(0);
-                    __m128i y16__0_7 = _mm_unpacklo_epi8(source_chunks_y[i], zero);
-                    __m128i y16__8_F = _mm_unpackhi_epi8(source_chunks_y[i], zero);
-                    __m128i y16_0_7_epi_16 = _mm_slli_epi16(y16__0_7, 8);
-                    __m128i y16_8_F_epi_16 = _mm_slli_epi16(y16__8_F, 8);
-                    _mm_storeu_si128(&dst[dst_offset + i * 2], y16_0_7_epi_16);
-                    _mm_storeu_si128(&dst[dst_offset + i * 2 + 1], y16_8_F_epi_16);
-                    continue;
+                    int bpp = 3;
+                    if (FORMAT == RS2_FORMAT_RGBA8 || FORMAT == RS2_FORMAT_BGRA8)
+                        bpp = 4;
+
+                    auto offset_to_current_first_line_for_dst = (2 * width * j) / 16 * bpp;
+                    auto offset_to_current_second_line_for_dst = offset_to_current_first_line_for_dst + width * bpp / 16;
+
+                    auto line_length = width / 16;
+                    auto first_line_y = source_chunks_y;
+                    auto second_line_y = source_chunks_y + line_length;
+
+                    m420_sse_parse_one_line<FORMAT>(first_line_y, source_chunks_uv, &dst[offset_to_current_first_line_for_dst], line_length);
+                    m420_sse_parse_one_line<FORMAT>(second_line_y, source_chunks_uv, &dst[offset_to_current_second_line_for_dst], line_length);
                 }
 
-                // Load UV line from the UV plane (one UV row per pair of Y rows)
-                if ( i < width / 16)
-                {
-                    auto uv_offset = (j * width) / 16;
-                    source_chunks_uv[i] = _mm_loadu_si128(&uv_plane[uv_offset + i]);
-                }
+                delete[] source_chunks_y;
+                delete[] source_chunks_uv;
             }
-
-            if (FORMAT == RS2_FORMAT_RGB8 || FORMAT == RS2_FORMAT_RGBA8 || FORMAT == RS2_FORMAT_BGR8 || FORMAT == RS2_FORMAT_BGRA8)
-            {
-                int bpp = 3;
-                if (FORMAT == RS2_FORMAT_RGBA8 || FORMAT == RS2_FORMAT_BGRA8)
-                    bpp = 4;
-
-                auto offset_to_current_first_line_for_dst = (2 * width * j) / 16 * bpp;
-                auto offset_to_current_second_line_for_dst = offset_to_current_first_line_for_dst + width * bpp / 16;
-
-                auto line_length = width / 16;
-                auto first_line_y = source_chunks_y;
-                auto second_line_y = source_chunks_y + line_length;
-
-                m420_sse_parse_one_line<FORMAT>(first_line_y, source_chunks_uv, &dst[offset_to_current_first_line_for_dst], line_length);
-                m420_sse_parse_one_line<FORMAT>(second_line_y, source_chunks_uv, &dst[offset_to_current_second_line_for_dst], line_length);
-            }
-
-            delete[] source_chunks_y;
-            delete[] source_chunks_uv;
+            return;
         }
-
-#else
+        // fall through to scalar path for non-16-aligned widths
+#endif // __SSSE3__
         auto src = reinterpret_cast<const uint8_t*>(s);
         auto dst = reinterpret_cast<uint8_t*>(d[0]);
 
@@ -914,7 +929,10 @@ namespace librealsense
         }
         if (FORMAT == RS2_FORMAT_Y16)
         {
-            for (int pix = 0; pix < width * height; pix += 16)
+            const int total = width * height;
+            const int aligned = total - (total % 16);
+            int pix = 0;
+            for (; pix < aligned; pix += 16)
             {
                 uint16_t y[16];
                 for (int i = 0; i < 16; ++i)
@@ -923,6 +941,12 @@ namespace librealsense
                 }
                 std::memcpy( dst, y, sizeof y );
                 dst += sizeof y;
+            }
+            for (; pix < total; ++pix)
+            {
+                uint16_t v = uint16_t(y_start[pix]) << 8;
+                std::memcpy( dst, &v, sizeof v );
+                dst += sizeof v;
             }
             return;
         }
@@ -935,8 +959,6 @@ namespace librealsense
             m420_parse_one_line<FORMAT>(y_row0, uv_row, &dst, width);
             m420_parse_one_line<FORMAT>(y_row1, uv_row, &dst, width);
         }
-        return;
-#endif // __SSSE3__
     }
 
     void unpack_nv12(rs2_format dst_format, rs2_stream dst_stream, uint8_t * const d[], const uint8_t * s, int w, int h, int actual_size)

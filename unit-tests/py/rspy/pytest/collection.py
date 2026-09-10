@@ -133,11 +133,22 @@ def filter_and_sort_items(config, items):
     # Within a (module, device) bucket, also sort by pytest-repeat step so pass 0
     # completes before pass 1 — preserves --repeat N module-scoped ordering so
     # module-scoped fixtures see one pass at a time.
+    # Modules are ordered by their most urgent (lowest) item priority so a high-priority
+    # module (e.g. pytest-fw-update, priority 1, which must run before anything that reads
+    # the FW version) runs before all other modules — matching run-unit-tests.py, which
+    # sorted whole test files by priority. Within a bucket the stable sort preserves the
+    # per-item priority order from above.
+    module_priority = {}
+    for item in items:
+        module = item.module.__name__
+        p = get_priority(item)
+        module_priority[module] = min(module_priority.get(module, p), p)
+
     def get_device_group_key(item):
         module = item.module.__name__
         params = item.callspec.params if hasattr(item, 'callspec') else {}
         device_serial = params.get('_test_device_serial', '')
         step = params.get('__pytest_repeat_step_number', 0)
-        return (module, device_serial, step)
+        return (module_priority[module], module, device_serial, step)
 
     items.sort(key=get_device_group_key)

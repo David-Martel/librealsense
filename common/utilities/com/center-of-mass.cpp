@@ -177,31 +177,29 @@ bool center_of_mass_calculator::calc_center_of_mask(
 {
     if (max_y <= 0 || max_y > mask_height) max_y = mask_height;
 
-    // X: full mask height — wider sample for a stable horizontal centroid, blended
-    // toward bbox center proportionally to left-right imbalance (IR depth shadows
-    // cause one-sided coverage that biases the raw centroid).
-    long long sumX = 0; long long cntX = 0;
-    int leftPx = 0, rightPx = 0;
-    int const midX = mask_width / 2;
-    for (int y = 0; y < mask_height; ++y)
-        for (int x = 0; x < mask_width; ++x)
-            if (mask[y * mask_width + x]) {
-                sumX += x; ++cntX;
-                if (x < midX) ++leftPx; else ++rightPx;
-            }
-
-    // Y: upper portion only — excludes leg pixels that pull the centroid downward.
-    long long sumY = 0; long long cntY = 0;
+    // Single pass over the upper portion: accumulate per-column counts for the X
+    // median and the Y centroid from the same pixel set.  Restricting both to max_y
+    // keeps the X and Y coordinates geometrically consistent (same pixels, same region).
+    std::vector<int> colCount(mask_width, 0);
+    long long sumY = 0;
+    int totalX = 0;
     for (int y = 0; y < max_y; ++y)
         for (int x = 0; x < mask_width; ++x)
-            if (mask[y * mask_width + x]) { sumY += y; ++cntY; }
+            if (mask[y * mask_width + x]) { colCount[x]++; totalX++; sumY += y; }
 
-    if (cntX == 0 || cntY == 0) return false;
+    if (totalX == 0) return false;
 
-    float const centroidX = float(sumX) / cntX;
-    float const symmetry  = 2.0f * std::min(leftPx, rightPx) / float(leftPx + rightPx);
-    com.x = (int)(symmetry * centroidX + (1.0f - symmetry) * midX);
-    com.y = (int)(float(sumY) / cntY);
+    // X: leftmost column where the cumulative column count first reaches 50 %.
+    // Torso columns are wide and accumulate far more pixels than thin arm columns,
+    // so the median lands on the torso even for extended-arm or off-centre poses.
+    int cumX = 0, medianX = 0;
+    for (int x = 0; x < mask_width; ++x) {
+        cumX += colCount[x];
+        if (cumX * 2 >= totalX) { medianX = x; break; }
+    }
+
+    com.x = medianX;
+    com.y = (int)(float(sumY) / totalX);
     return true;
 }
 
@@ -396,8 +394,10 @@ bool center_of_mass_calculator::run_non_range_com_calculation_flow(
 
     if (intrinsics && chosenDepth > MIN_DEPTH) {
         vec2i centerPx = {(int)(person_center.x + 0.5f), (int)(person_center.y + 0.5f)};
-        result.world_pos = pixel_to_camera(centerPx, chosenDepth, *intrinsics);
+        vec3f pt = pixel_to_camera(centerPx, chosenDepth, *intrinsics);
+        result.world_pos = pt;
         result.image_pos = {person_center.x, person_center.y};
+        result.mean_body_depth = std::sqrt(pt.x*pt.x + pt.y*pt.y + pt.z*pt.z);
     }
     return true;
 }

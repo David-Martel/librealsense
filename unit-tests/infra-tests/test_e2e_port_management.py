@@ -17,21 +17,40 @@ from helpers import run_e2e, assert_outcomes
 class TestDevicePortManagement:
 
     def test_device_marker_enables_correct_port(self):
-        """@device('D455') should call enable_only(['111'], recycle=True)."""
+        """@device('D455') enables the device (recycle=False -- the power cycle is
+        teardown-disable + setup-enable, so setup itself doesn't recycle)."""
         rc, out, tracking = run_e2e("pytest-device-setup.py", "-k", "test_d455 and not excluded")
         assert_outcomes(out, passed=1)
         assert len(tracking["enable_only_calls"]) == 1
         assert tracking["enable_only_calls"][0]['serials'] == ['111']
+        assert tracking["enable_only_calls"][0]['recycle'] is False
+
+    def test_hubless_recycles_via_hw_reset(self):
+        """On a hub-less bench (e.g. Jetson) teardown-disable is a no-op, so setup MUST recycle --
+        enable_only(recycle=True) falls back to hardware_reset. pytest-hubless-setup.py patches
+        devices.hub to None to exercise the no-hub branch of the conftest recycle decision."""
+        rc, out, tracking = run_e2e("pytest-hubless-setup.py")
+        assert_outcomes(out, passed=1)
+        assert len(tracking["enable_only_calls"]) == 1
+        assert tracking["enable_only_calls"][0]['recycle'] is True
+
+    def test_port_already_on_recycles(self):
+        """With a hub, setup expects the device OFF (prev teardown disabled it). If a required port
+        is still powered -- a skipped/crashed teardown -- setup recycles it clean instead of reusing
+        a stale state. pytest-port-already-on.py patches any_port_powered -> True for this branch."""
+        rc, out, tracking = run_e2e("pytest-port-already-on.py")
+        assert_outcomes(out, passed=1)
+        assert len(tracking["enable_only_calls"]) == 1
         assert tracking["enable_only_calls"][0]['recycle'] is True
 
     def test_device_each_enables_one_port_per_test(self):
-        """@device_each('D400*') should call enable_only once per device, each with recycle=True."""
+        """@device_each('D400*') should call enable_only once per device (recycle=False)."""
         rc, out, tracking = run_e2e("pytest-each-setup.py", "-k", "test_d400 and not d999")
         assert_outcomes(out, passed=3)
         assert len(tracking["enable_only_calls"]) == 3
         serials_enabled = [c['serials'][0] for c in tracking["enable_only_calls"]]
         assert set(serials_enabled) == {'111', '222', '777'}
-        assert all(c['recycle'] is True for c in tracking["enable_only_calls"])
+        assert all(c['recycle'] is False for c in tracking["enable_only_calls"])
         assert all(len(c['serials']) == 1 for c in tracking["enable_only_calls"])
 
     def test_second_test_same_device_no_recycle(self):

@@ -12,10 +12,10 @@ _py_dir = os.path.join(_unit_tests_dir, 'py')
 if _py_dir not in sys.path:
     sys.path.insert(0, _py_dir)
 
-# Fake pyrealsense2 — track log_to_console calls so tests can verify --rslog
+# Fake pyrealsense2 — track LibRS log-bridge calls so tests can verify --rslog
 import json as _json
 _tracking_log = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_tracking.json')
-_tracking = {"rslog_calls": [], "query_kwargs": [], "enable_only_calls": []}
+_tracking = {"rslog_calls": [], "query_kwargs": [], "enable_only_calls": [], "disable_calls": []}
 def _save_tracking():
     with open(_tracking_log, 'w') as _f:
         _json.dump(_tracking, _f)
@@ -26,6 +26,16 @@ def _mock_log_to_console(level):
     _tracking["rslog_calls"].append({"level": level})
     _save_tracking()
 _rs.log_to_console = _mock_log_to_console
+class _FakeLogMessage:
+    def raw(self):
+        return "fake librs log line"
+def _mock_log_to_callback(level, callback):
+    _tracking["rslog_calls"].append({"level": level})
+    _save_tracking()
+    # Exercise the routing path (callback fires -> Python logger receives the record),
+    # not just the registration, so the bridge itself is covered by the E2E test.
+    callback(level, _FakeLogMessage())
+_rs.log_to_callback = _mock_log_to_callback
 class _CameraInfo:
     name = "name"
     product_line = "product_line"
@@ -34,6 +44,10 @@ class _CameraInfo:
 _rs.camera_info = _CameraInfo
 class _LogSeverity:
     debug = 0
+    info = 1
+    warn = 2
+    error = 3
+    fatal = 4
 _rs.log_severity = _LogSeverity
 class _FakeContext:
     @property
@@ -76,7 +90,13 @@ def _mock_get(sn):
 _dev.by_spec = _mock_by_spec
 _dev.get = _mock_get
 _dev._device_by_sn = {sn: FakeDevice(sn, n) for sn, n in _sn_map.items()}
-_dev.hub = None
+# Default: model a hub-equipped bench with a truthy sentinel. Port ops are mocked above, so the
+# object is never actually used. init_hub is stubbed so the real one doesn't probe (absent)
+# hardware and reset this back to None. A scenario test file can patch devices.hub /
+# devices.any_port_powered at import time (before fixtures run) to model a hub-less bench or a
+# port left powered -- see pytest-hubless-setup.py and pytest-port-already-on.py.
+_dev.hub = object()
+_dev.init_hub = lambda: None
 _dev._context = None
 def _mock_query(**kw):
     _tracking["query_kwargs"].append(kw)
@@ -84,12 +104,22 @@ def _mock_query(**kw):
 _dev.query = _mock_query
 _dev.map_unknown_ports = lambda: None
 _dev.wait_until_all_ports_disabled = lambda: None
+# Hub hardware port-state probe used by the conftest recycle decision. Default OFF (the previous
+# teardown powered the device down -> setup just enables). A scenario test file patches this to
+# True to model a port left powered by a skipped teardown -> setup recycles it clean.
+_dev.any_port_powered = lambda serials: False
 
-# Track enable_only calls so tests can verify hub port behavior
-def _mock_enable_only(serials, recycle=True):
-    _tracking["enable_only_calls"].append({"serials": list(serials), "recycle": recycle})
+# Track enable_only / disable calls so tests can verify hub port behavior
+def _mock_enable_only(serials, recycle=True, timeout=None, disable_other_ports=False):
+    _tracking["enable_only_calls"].append(
+        {"serials": list(serials), "recycle": recycle, "disable_other_ports": disable_other_ports})
     _save_tracking()
 _dev.enable_only = _mock_enable_only
+
+def _mock_disable(serials, wait=True):
+    _tracking.setdefault("disable_calls", []).append({"serials": list(serials), "wait": wait})
+    _save_tracking()
+_dev.disable = _mock_disable
 
 # exec() the REAL conftest.py
 _conftest_path = os.path.join(_unit_tests_dir, 'conftest.py')

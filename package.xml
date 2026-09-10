@@ -6,9 +6,9 @@
 <package format="2">
   <name>librealsense2</name>
   <!-- The version tag needs to be updated with each new release of librealsense -->
-  <version>2.58.3</version>
+  <version>2.58.4</version>
   <description>
-  Library for controlling and capturing data from the Intel(R) RealSense(TM) D400 devices.
+  Library for controlling and capturing data from the RealSense depth streaming devices.
   </description>
 
   <maintainer email="rsswsdk@realsensecloud.onmicrosoft.com">LibRealSense ROS Team</maintainer>

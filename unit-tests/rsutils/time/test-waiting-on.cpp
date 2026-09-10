@@ -2,7 +2,6 @@
 // Copyright(c) 2021 RealSense, Inc. All Rights Reserved.
 
 //#cmake:dependencies rsutils
-//#test:donotrun:!nightly
 
 #include <rsutils/string/chrono.h>  // must be before catch.h!
 #include <unit-tests/catch.h>

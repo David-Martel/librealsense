@@ -50,7 +50,7 @@ class TestCliOptionsRegistered:
         assert "timeout method: thread" in out
 
     def test_rslog(self):
-        """--rslog should call rs.log_to_console."""
+        """--rslog should install the LibRS log bridge (rs.log_to_callback)."""
         rc, out, tracking = run_e2e("pytest-passthrough.py", "--rslog")
         assert rc == 0
         assert len(tracking["rslog_calls"]) > 0
@@ -67,47 +67,51 @@ class TestCliOptionsRegistered:
         assert rc == 0
 
     def test_retries(self):
-        """--retries 1: a flaky call-phase failure is rescued by retry → single PASS.
+        """--reruns 1: a flaky call-phase failure is rescued by a rerun → single PASS.
 
-        pytest-retry tears down module-scoped fixtures (incl. module_device_setup)
-        between attempts via its preliminary-teardown trick, which is how the device
-        gets recycled and module preconditions re-applied on retry.
+        The conftest recycle hook (pytest_runtest_logreport, outcome=="rerun") tears down
+        every local fixture (incl. module_device_setup) between attempts, which is how the
+        device gets power-cycled and module preconditions re-applied on the rerun.
         """
-        rc, out, tracking = run_e2e("pytest-retry.py", "--retries", "1")
+        rc, out, tracking = run_e2e("pytest-retry.py", "--reruns", "1")
         assert_outcomes(out, passed=2)
         assert rc == 0
         calls = tracking["enable_only_calls"]
-        # Two enable_only calls: initial module-fixture creation + post-retry-teardown re-creation.
+        # Two enable_only calls: initial module-fixture creation + post-recycle re-creation.
         assert len(calls) == 2
-        assert all(c['recycle'] is True for c in calls)
+        assert all(c['recycle'] is False for c in calls)
+        # the device recycle comes from the teardown-disable between attempts, not recycle=True
+        assert len(tracking["disable_calls"]) >= 1
 
     def test_retries_recreate_module_fixture(self):
         """Module-scoped fixtures must be torn down and re-instantiated between
-        retry attempts.  This is the core mechanic the conftest's
+        rerun attempts.  This is the core mechanic the conftest's
         ``test_device_wrapped`` (and any other module-scoped precondition fixture)
-        relies on for the device recycle / re-apply behaviour on retry."""
-        rc, out, _ = run_e2e("pytest-retry-module-fixture.py", "--retries", "1")
+        relies on for the device recycle / re-apply behaviour on rerun."""
+        rc, out, _ = run_e2e("pytest-retry-module-fixture.py", "--reruns", "1")
         assert_outcomes(out, passed=1)
         assert rc == 0
 
     def test_retries_on_setup_error(self):
-        """Setup-phase ERROR on attempt 1 must still trigger a retry.
+        """Setup-phase ERROR on attempt 1 must still trigger a rerun.
 
-        Regression for Jenkins win #113344.  Native pytest-retry skips setup
-        failures by default (retry_plugin.py:148-149); conftest.py patches
-        ``should_handle_retry`` to relax that gate."""
-        rc, out, _ = run_e2e("pytest-retry-setup-fail.py", "--retries", "1")
+        Regression for Jenkins win #113344.  pytest-rerunfailures reruns setup-phase
+        failures natively (it reruns the whole protocol), so no conftest patching is
+        involved — this locks the behavior in against plugin/config regressions."""
+        rc, out, _ = run_e2e("pytest-retry-setup-fail.py", "--reruns", "1")
         assert_outcomes(out, passed=1)
         assert rc == 0
 
     def test_repeat(self):
-        """--repeat 3 should repeat the test 3 times, recycling the device each time."""
+        """--repeat 3 repeats the test 3 times; each pass power-cycles the device via
+        teardown-disable + setup-enable (setup itself uses recycle=False)."""
         rc, out, tracking = run_e2e("pytest-device-setup.py", "-k", "test_d455 and not excluded",
                                      "--repeat", "3")
         assert_outcomes(out, passed=3)
         calls = tracking["enable_only_calls"]
         assert len(calls) == 3
-        assert all(c['recycle'] is True for c in calls)
+        assert all(c['recycle'] is False for c in calls)
+        assert len(tracking["disable_calls"]) >= 1  # teardown disables each pass -> the cycle
 
     def test_repeat_no_reset(self):
         """--repeat 3 --no-reset should repeat without recycling."""
@@ -115,9 +119,11 @@ class TestCliOptionsRegistered:
                                      "--repeat", "3", "--no-reset")
         assert_outcomes(out, passed=3)
         calls = tracking["enable_only_calls"]
-        # First run enables without recycle, subsequent runs skip enable_only entirely
-        assert len(calls) == 1
-        assert calls[0]['recycle'] is False
+        # --no-reset re-enables each pass but never disables on teardown, so the device is
+        # NOT power-cycled (left on) -- the distinguishing behavior vs the default path.
+        assert len(calls) == 3
+        assert all(c['recycle'] is False for c in calls)
+        assert tracking["disable_calls"] == []
 
     def test_device_nonexistent(self):
         """--device D999 with no matching device should produce 0 parametrized instances."""
@@ -136,16 +142,16 @@ class TestCliOptionsRegistered:
                                "--exclude-device", "D455", "--exclude-device", "D435")
         assert_outcomes(out, passed=1)  # only D401 remains
 
-    def test_exclude_device_space_separated(self):
-        """--exclude-device 'D455 D435' (single flag, space-separated) — Jenkins TEST_EXCLUDE_DEVICES form."""
+    def test_exclude_device_comma_separated(self):
+        """--exclude-device 'D455,D435' (single flag, comma-separated) — Jenkins TEST_EXCLUDE_DEVICES form."""
         rc, out, *_ = run_e2e("pytest-cli.py", "-k", "test_multi_exclude",
-                               "--exclude-device", "D455 D435")
+                               "--exclude-device", "D455,D435")
         assert_outcomes(out, passed=1)  # only D401 remains
 
-    def test_device_space_separated(self):
-        """--device 'D455 D435' (single flag, space-separated) must include both devices."""
+    def test_device_comma_separated(self):
+        """--device 'D455,D435' (single flag, comma-separated) must include both devices."""
         rc, out, *_ = run_e2e("pytest-cli.py", "-k", "test_multi_include",
-                               "--device", "D455 D435")
+                               "--device", "D455,D435")
         assert_outcomes(out, passed=2)
 
     def test_device_and_exclude_combined(self):
@@ -158,6 +164,20 @@ class TestCliOptionsRegistered:
         """--not-live is accepted and skips device tests."""
         rc, out, *_ = run_e2e("pytest-live.py", "--not-live")
         assert_outcomes(out, passed=1, skipped=1)
+
+    def test_custom_fw_options(self):
+        """--custom-fw-d400/-d555/-d585 are accepted and their values reach the tests
+        via request.config.getoption (consumed by pytest-fw-update)."""
+        rc, out, *_ = run_e2e("pytest-custom-fw.py", "-k", "test_values",
+                               "--custom-fw-d400", "d400.bin",
+                               "--custom-fw-d555", "d555.bin",
+                               "--custom-fw-d585", "d585.bin")
+        assert_outcomes(out, passed=1)
+
+    def test_custom_fw_defaults(self):
+        """Without --custom-fw-* flags the options default to None (pytest-fw-update skips)."""
+        rc, out, *_ = run_e2e("pytest-custom-fw.py", "-k", "test_defaults")
+        assert_outcomes(out, passed=1)
 
     def test_tag_filters_by_marker(self):
         """--tag <name> should run only tests with pytest.mark.<name> (alias for -m)."""

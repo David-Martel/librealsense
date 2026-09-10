@@ -138,12 +138,15 @@ _E2E_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'e2e')
 _E2E_CONFTEST = os.path.join(_E2E_DIR, 'e2e_conftest.py')
 
 
-def run_e2e(test_filename, *extra_pytest_args):
+def run_e2e(test_filename, *extra_pytest_args, env=None):
     """Run a pytest subprocess on a static test file from e2e/.
 
     Copies e2e_conftest.py and the test file to a temp dir for isolation
     from the parent unit-tests/conftest.py. No content is generated — both
     files are static and checked into the repo.
+
+    :param env: optional dict of extra environment variables for the subprocess
+                (e.g. {'E2E_NO_HUB': '1'} to model a hub-less bench).
 
     Returns (returncode, stdout, tracking) where tracking is a dict with:
         - enable_only_calls: list of {serials, recycle} dicts
@@ -156,13 +159,19 @@ def run_e2e(test_filename, *extra_pytest_args):
         shutil.copy(_E2E_CONFTEST, os.path.join(tmpdir, 'conftest.py'))
         shutil.copy(os.path.join(_E2E_DIR, test_filename), os.path.join(tmpdir, test_filename))
 
-        env = os.environ.copy()
-        env['INFRA_UNIT_TESTS_DIR'] = os.path.normpath(os.path.join(_E2E_DIR, '..', '..'))  # unit-tests/
+        sub_env = os.environ.copy()
+        sub_env['INFRA_UNIT_TESTS_DIR'] = os.path.normpath(os.path.join(_E2E_DIR, '..', '..'))  # unit-tests/
+        # Force per-test logs into the tmpdir so they're deterministic (independent of any build
+        # tree) and collectable below; otherwise the location varies (build dir vs unit-tests/logs).
+        e2e_logdir = os.path.join(tmpdir, 'testlogs')
+        sub_env['RS_TEST_LOGDIR'] = e2e_logdir
+        if env:
+            sub_env.update(env)
 
         p = subprocess.run(
             [sys.executable, "-m", "pytest", test_filename, "-v", *extra_pytest_args],
             cwd=tmpdir,
-            env=env,
+            env=sub_env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             universal_newlines=True,
@@ -176,8 +185,18 @@ def run_e2e(test_filename, *extra_pytest_args):
 
         tracking_file = os.path.join(tmpdir, '_tracking.json')
         tracking = json.loads(open(tracking_file).read()) if os.path.exists(tracking_file) else {
-            "enable_only_calls": [], "rslog_calls": [], "query_kwargs": []
+            "enable_only_calls": [], "rslog_calls": [], "query_kwargs": [], "disable_calls": []
         }
+
+        # Collect per-test log files (name -> content) before the tmpdir is removed, so tests can
+        # assert on log content without depending on where the logs would otherwise land.
+        tracking["logs"] = {}
+        if os.path.isdir(e2e_logdir):
+            for name in os.listdir(e2e_logdir):
+                path = os.path.join(e2e_logdir, name)
+                if os.path.isfile(path):
+                    with open(path, encoding="utf-8", errors="replace") as fh:
+                        tracking["logs"][name] = fh.read()
 
         return p.returncode, p.stdout, tracking
 

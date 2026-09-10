@@ -4,6 +4,9 @@
 #include "viewer-test-helpers.h"
 #include "imgui_te_context.h"
 
+#include <rsutils/string/string-utilities.h>
+#include <algorithm>
+
 
 // ---------------------------------------------------------------------------
 // viewer_test method implementations
@@ -211,6 +214,54 @@ std::string viewer_test::get_control_value( rs2::device_model & model,
         seed = sensor_id_seed( model, sub );
 
     return get_value_by_seed( opt, seed );
+}
+
+void viewer_test::set_controls_filter( rs2::device_model & model,
+                                       std::shared_ptr< rs2::subdevice_model > sub,
+                                       const std::string & text )
+{
+    imgui->SetRef( "Control Panel" );
+    imgui->ItemInput( ImHashStr( "##options_filter", 0, controls_id_seed( model, sub ) ) );
+    imgui->KeyCharsReplaceEnter( text.c_str() );
+    imgui->SleepNoSkip( 0.3f, 0.1f );
+}
+
+std::vector< rs2_option > viewer_test::controls_options( rs2::device_model & model,
+                                                         std::shared_ptr< rs2::subdevice_model > sub )
+{
+    imgui->SetRef( "Control Panel" );
+    ImGuiID seed = controls_id_seed( model, sub );
+    ImGuiTestItemList items;
+    imgui->GatherItems( &items, seed, -1 );
+
+    std::vector< rs2_option > result;
+    for( auto & kvp : sub->options_metadata )
+    {
+        auto & opt = kvp.second;
+        const std::string & widget = opt.is_checkbox() ? opt.label : opt.id;
+        ImGuiID id = ImHashStr( widget.c_str(), 0, seed );
+        for( auto const & item : items )
+            if( item.ID == id )
+            {
+                result.push_back( kvp.first );
+                break;
+            }
+    }
+    return result;
+}
+
+std::string viewer_test::control_name( std::shared_ptr< rs2::subdevice_model > sub, rs2_option option )
+{
+    // label format is "<name>##<imgui id>"
+    auto & label = find_option( sub, option ).label;
+    return rsutils::string::to_lower( label.substr( 0, label.find( "##" ) ) );
+}
+
+bool viewer_test::control_visible( rs2::device_model & model,
+                                   std::shared_ptr< rs2::subdevice_model > sub, rs2_option option )
+{
+    auto v = controls_options( model, sub );
+    return std::find( v.begin(), v.end(), option ) != v.end();
 }
 
 void viewer_test::select_combo_item( ImGuiID combo_id, const std::string & item )

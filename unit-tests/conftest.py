@@ -18,6 +18,8 @@ and fixtures that pytest requires in conftest.py for auto-discovery.
 import pytest
 import sys
 import os
+import re
+import time
 import logging
 
 # Defense against ROS 2 launch.logging: when ROS is sourced, launch_testing's
@@ -56,14 +58,15 @@ from rspy import devices, repo
 from rspy.signals import register_signal_handlers
 from rspy.pytest.logging_setup import (
     setup_test_logging, bridge_rspy_log, ensure_newline, configure_logging,
-    start_test_log, stop_test_log, print_terminal_summary,
-    configure_junit_logging,
+    open_log, close_log, _compose_log_name, print_terminal_summary,
+    configure_junit_logging, install_rs_log_bridge,
 )
 from rspy.pytest.log_live_format import install as install_live_log_format
 from rspy.pytest.cli import consume_legacy_flags, apply_pending_flags
 from rspy.pytest.device_helpers import (
     resolve_device_each_serials,
     select_target_device,
+    split_cli_patterns,
     _MISSING_SENTINEL_PREFIX,
     _SKIP_SENTINEL_PREFIX,
 )
@@ -71,6 +74,11 @@ from rspy.pytest.collection import filter_and_sort_items, assert_module_fixtures
 from rspy.pytest.plugins import check_required_plugins
 
 log = logging.getLogger('librealsense')
+
+# D585 Prototype FW accel bring-up window (RSDEV-13011): seconds to wait after powering the
+# device on before letting tests stream. Threshold measured at ~3s; +1s margin.
+# TODO(RSDEV-13011): remove once the FW fix is deployed (removal tracked in RSDSO-21766).
+D585_BRINGUP_SETTLE_SEC = 4
 
 # Bridge rspy.log → Python logging early, before any test output
 bridge_rspy_log()
@@ -124,14 +132,14 @@ def pytest_addoption(parser):
         action="append",
         default=[],
         help="Include only devices matching pattern (e.g., --device D455). "
-             "Can be used multiple times or with a space-separated value (--device 'D455 D435')."
+             "Can be used multiple times or with a comma-separated value (--device 'D455,D435')."
     )
     group.addoption(
         "--exclude-device",
         action="append",
         default=[],
         help="Exclude devices matching pattern (e.g., --exclude-device D455). "
-             "Can be used multiple times or with a space-separated value (--exclude-device 'D555 D585S')."
+             "Can be used multiple times or with a comma-separated value (--exclude-device 'D585 Proto,D585S')."
     )
     group.addoption(
         "--context",
@@ -143,7 +151,7 @@ def pytest_addoption(parser):
         "--rslog",
         action="store_true",
         default=False,
-        help="Enable LibRS debug logging (rs.log_to_console)."
+        help="Enable LibRS debug logging (routed into the per-test log files)."
     )
     group.addoption(
         "--no-reset",
@@ -185,6 +193,27 @@ def pytest_addoption(parser):
         dest="repeat_count",
         help="Run all tests in each file N times (module-scoped alias for pytest-repeat's --count). Use --count for per-test repetition."
     )
+    group.addoption(
+        "--custom-fw-d400",
+        action="store",
+        default=None,
+        help="Path to a custom D400 firmware image; pytest-fw-update flashes it if it differs "
+             "from the installed FW."
+    )
+    group.addoption(
+        "--custom-fw-d555",
+        action="store",
+        default=None,
+        help="Path to a custom D555 firmware image; pytest-fw-update flashes it if it differs "
+             "from the installed FW."
+    )
+    group.addoption(
+        "--custom-fw-d585",
+        action="store",
+        default=None,
+        help="Path to a custom D585 (non-safety) firmware image; pytest-fw-update flashes it if "
+             "it differs from the installed FW. Applies to D585 only -- never flashed onto D585S."
+    )
     # --debug and -r/--regex conflict with pytest built-ins and are consumed before
     # pytest parses args. Document them here so they show up in --help:
     group.addoption(
@@ -195,14 +224,14 @@ def pytest_addoption(parser):
              "--debug (enable -D- debug logs), "
              "-r/--regex <pattern> (filter tests by name, maps to -k), "
              "--tag <name> (run only tests with marker, maps to -m), "
-             "--retries N (retry failed tests N times)."
+             "--reruns N (pytest-rerunfailures retries a failed test N times)."
     )
     group.addoption(
         "--test-dir",
         action="append",
         default=[],
         help="Restrict pytest discovery to tests under this directory or file. "
-             "May be repeated (e.g. `--test-dir live/image-quality --test-dir test-fw-update.py`). "
+             "May be repeated (e.g. `--test-dir live/image-quality --test-dir pytest-fw-update.py`). "
              "Matches run-unit-tests.py --test-dir for shared UNIT_TESTS_ARGS."
     )
 
@@ -232,31 +261,9 @@ def pytest_configure(config):
         config.option.count = repeat_val
         config.option.repeat_scope = 'module'
 
-    # --retries N is handled natively by the pytest-retry plugin: failed tests rerun
-    # up to N times, and the plugin tears down + re-creates module/class-scoped
-    # fixtures between attempts (pytest-retry's "preliminary teardown trick" -
-    # see pytest_retry.retry_plugin in the version pinned by requirements.txt).
-    # This gives us free device recycling and precondition re-apply.
-    #
-    # By default pytest-retry's `should_handle_retry` skips setup/teardown phase
-    # failures.  We relax that to also retry setup-phase failures (call.when ==
-    # "setup"), since those are the common case for transient hub/USB glitches
-    # at fixture time — the retry loop already does the right thing (tears down
-    # then re-runs setup + call), it just refuses to enter for setup failures.
-    # Teardown still excluded — re-running teardown after a teardown failure
-    # is brittle and matches pytest-retry's upstream stance.
-    # Regression for Jenkins win #113344 (fixture-time ERRORs must trigger retry).
-    # Version pinned by requirements.txt so upstream renames give a deterministic
-    # ImportError rather than silent behaviour drift.
-    try:
-        from pytest_retry import retry_plugin
-        def _retry_setup_too(call):
-            if call.excinfo is None or call.excinfo.typename == "Skipped":
-                return False
-            return call.when in ("setup", "call")
-        retry_plugin.should_handle_retry = _retry_setup_too
-    except ImportError:
-        pass
+    # Retries: pytest-rerunfailures (--reruns N). It reruns the full protocol, so setup-phase
+    # failures retry natively; device power-cycle between attempts is done by the
+    # pytest_runtest_logreport hook below.
 
     # We override pytest-repeat's `__pytest_repeat_step_number` to module scope so
     # module-scoped fixtures (e.g. module_device_setup) can depend on it and re-instantiate
@@ -278,14 +285,12 @@ def pytest_configure(config):
     # Set up test log directory
     setup_test_logging(config)
 
-    # Enable LibRS debug logging if --rslog (once, globally)
-    # log_to_console writes directly to stderr from C++. Pytest's default fd-level
-    # capture swallows it, so we downgrade to sys-level capture (Python only) which
-    # lets C++ stderr through while still capturing Python stdout/stderr.
+    # Enable LibRS debug logging if --rslog (once, globally). Route the C++ logs through
+    # Python logging so they reach the per-test log files (and console under -s) for every
+    # test and every --repeat/--count pass -- see install_rs_log_bridge for why log_to_console
+    # (fd-level, swallowed by pytest's default capture) only ever showed the first enumeration.
     if rs and config.getoption("--rslog", default=False):
-        rs.log_to_console(rs.log_severity.debug)
-        if config.option.capture == 'fd':
-            config.option.capture = 'sys'
+        install_rs_log_bridge(rs)
 
     # Test discovery defaults (replaces pytest.ini which is .gitignored)
     config.addinivalue_line("python_files", "pytest-*.py")
@@ -359,13 +364,13 @@ def pytest_configure(config):
     # Create hub after logging is configured so discovery prints are visible
     devices.init_hub()
 
-    # Echo CLI device filters once (' '.join handles both repeated-flag and space-separated forms)
-    exclude_list = config.getoption("--exclude-device", default=[])
+    # Echo CLI device filters once (split handles both repeated-flag and comma-separated forms)
+    exclude_list = split_cli_patterns(config.getoption("--exclude-device", default=[]))
     if exclude_list:
-        print(f"-D- excluding devices: {' '.join(exclude_list)}")
-    include_list = config.getoption("--device", default=[])
+        print(f"-D- excluding devices: {', '.join(exclude_list)}")
+    include_list = split_cli_patterns(config.getoption("--device", default=[]))
     if include_list:
-        print(f"-D- including only devices: {' '.join(include_list)}")
+        print(f"-D- including only devices: {', '.join(include_list)}")
 
     # Skip under --not-live: nothing reads harness devices then, and the DDS context it
     # creates would otherwise pollute discovery for the forked DDS servers.
@@ -397,24 +402,37 @@ def pytest_collection_modifyitems(session, config, items):
     filter_and_sort_items(config, items)
 
 
-@pytest.hookimpl(hookwrapper=True)
-def pytest_runtest_protocol(item, nextitem):
-    """Wrap each test with log separators and write per-test log file."""
-    file_handler = start_test_log(item)
+def _emit_test_header(nodeid):
+    """Write the ``Test: <nodeid>`` banner into the current module+camera log."""
     ensure_newline()
     log.info("-" * 80)
-    log.info(f"Test: {item.nodeid}")
+    log.info(f"Test: {nodeid}")
     log.info("-" * 80)
 
-    outcome = yield
-    stop_test_log(file_handler, nextitem)
 
+@pytest.fixture(autouse=True)
+def _test_log_banner(request):
+    """Emit the per-test header into the log. Runs during test setup -- i.e. AFTER the
+    module-scoped log handler (module_log) is open and the device is enabled -- so the header
+    lands in the correct module+camera file. (Logging it from a per-test protocol hook instead
+    would race a parametrized module fixture's deferred teardown and land in the wrong file.)
+
+    Setup-phase failures in module_device_setup happen BEFORE this fixture runs, so those paths
+    emit the header themselves (via _emit_test_header) to keep the error anchored to its item."""
+    _emit_test_header(request.node.nodeid)
+    _record_log_alias(request)
+    yield
     ensure_newline()
 
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item, call):
-    """Log test duration and any failures/errors."""
+    """Log test duration and any failures/errors, and stash the item's live request for the
+    rerun-recycle hook (item._request is cleared at teardown, before that hook fires)."""
+    req = getattr(item, "_request", None)
+    if req:
+        _rerun_recycle_ctx[item.nodeid] = (item, req)
+
     outcome = yield
     report = outcome.get_result()
 
@@ -422,7 +440,9 @@ def pytest_runtest_makereport(item, call):
         ensure_newline()
         reason = report.longrepr[-1]
         log.info(reason)
-    if report.failed and call.excinfo:
+    # Call-phase failures are logged from pytest_runtest_call (one place for every attempt);
+    # here we cover setup/teardown.
+    if report.failed and call.excinfo and call.when != "call":
         ensure_newline()
         log.error(f"{call.when} {report.outcome}: {call.excinfo.typename}: {call.excinfo.value}")
     if call.when == "call":
@@ -430,24 +450,82 @@ def pytest_runtest_makereport(item, call):
         log.debug(f"Test execution took {report.duration:.3f}s")
 
 
+# ============================================================================
+# Device recycle between rerun attempts
+# ============================================================================
+# pytest-rerunfailures keeps successful module-scoped fixtures cached across a rerun, so the
+# rerun would reuse the same (possibly wedged) device with no power cycle. On the "rerun" report
+# (logged once per failed attempt, before the next attempt) we finish every local fixture of the
+# item; finishing module_device_setup cascades to its dependents and its teardown powers the port
+# off, and the rerun's setup powers it back on — the power cycle. finish() is idempotent so the
+# blanket sweep is order-independent. See test_e2e_cli_options / test_e2e_rerun_console_leak.
+
+_rerun_recycle_ctx = {}  # nodeid -> (item, live request) captured in pytest_runtest_makereport
+
+
+def pytest_runtest_logreport(report):
+    # Recycle on rerun, and keep _rerun_recycle_ctx bounded: drop the entry on the rerun that
+    # consumes it (makereport re-stores it for the next attempt) and on any test's final teardown.
+    if report.outcome != "rerun":
+        if report.when == "teardown":
+            _rerun_recycle_ctx.pop(report.nodeid, None)
+        return
+    item, req = _rerun_recycle_ctx.pop(report.nodeid, (None, None))
+    if item is None:
+        return
+    name2defs = getattr(getattr(item, "_fixtureinfo", None), "name2fixturedefs", {})
+    # This hook runs between phases, where pytest capture is off — swallow stdout so rspy's raw
+    # "-D-" teardown prints don't leak into the console (the logging bridge still logs them).
+    import contextlib, io
+    with contextlib.redirect_stdout(io.StringIO()):
+        for name, defs in name2defs.items():
+            fixturedef = defs[-1]
+            if getattr(fixturedef, "scope", "function") in ("session", "package"):
+                continue
+            try:
+                fixturedef.finish(req)
+            except Exception as e:
+                log.warning(f"recycle of fixture '{name}' between rerun attempts failed: {e!r}")
+
+
+def _reset_pytest_timeout_for_retry(item):
+    """Re-arm pytest-timeout so each rerun attempt gets a fresh --timeout budget: pytest-timeout
+    arms ONE timer around the whole runtest protocol, and pytest-rerunfailures runs all attempts
+    inside that single protocol call, so without this reset attempts share the first attempt's
+    budget. Also fires on first call: setup no longer counts against the call budget."""
+    try:
+        from pytest_timeout import _get_item_settings
+    except (ImportError, AttributeError):
+        return
+    settings = _get_item_settings(item)
+    if not (settings.timeout and settings.timeout > 0 and not settings.func_only):
+        return
+    hooks = item.config.pluginmanager.hook
+    hooks.pytest_timeout_cancel_timer(item=item)
+    hooks.pytest_timeout_set_timer(item=item, settings=settings)
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_call(item):
-    """Surface pytest-check soft-check failures in the call phase.
+    """Reset pytest-timeout between rerun attempts + surface pytest-check
+    soft-check failures in the call phase.
 
-    pytest-check defers its failures to pytest_runtest_makereport. But pytest-retry
-    reruns a test by invoking pytest_runtest_call directly and building the report
-    with TestReport.from_item_and_call, which never fires makereport. So on a retry
-    attempt the soft-check failures are invisible to the retry decision (the test
-    looks passed) and instead surface later against the teardown phase, which
-    pytest-retry refuses to retry. Net effect: a retried test is reported "passed"
-    yet still fails the run with a teardown error.
-
-    Flushing the failures here, in the call phase, makes them visible to pytest-retry
-    on every attempt (a genuinely flaky soft-check test passes on retry; a persistent
-    one stays failed) and keeps them off the teardown report. Scoped to fire only for
-    the buggy case; every other path is left to pytest-check unchanged.
+    Raising the soft-check failures here (instead of leaving them to pytest-check's
+    makereport handling) attributes them to the call phase, where they are visible to
+    the rerun decision and logged per attempt into the per-test .log file. A genuinely
+    flaky soft-check test passes on rerun; a persistent one stays a plain call-phase
+    FAILURE. Every other path is left to pytest-check unchanged.
     """
+    _reset_pytest_timeout_for_retry(item)
+
     outcome = yield
+
+    # Log every call-phase failure here — one place that fires on every rerun attempt —
+    # so each attempt's failure is captured in the per-test .log file.
+    if outcome.excinfo is not None and not issubclass(outcome.excinfo[0], pytest.skip.Exception):
+        ensure_newline()
+        log.error(f"call failed: {outcome.excinfo[0].__name__}: {outcome.excinfo[1]}")
+
     try:
         from pytest_check import check_log
     except ImportError:
@@ -460,7 +538,10 @@ def pytest_runtest_call(item):
         return
     num_failures = check_log._num_failures
     check_log.clear_failures()
-    raise AssertionError("\n".join(failures + ["-" * 60, f"Failed Checks: {num_failures}"]))
+    message = "\n".join(failures + ["-" * 60, f"Failed Checks: {num_failures}"])
+    ensure_newline()
+    log.error(f"call failed: {num_failures} soft-check failure(s):\n{message}")
+    raise AssertionError(message)
 
 
 def pytest_sessionstart(session):
@@ -495,24 +576,34 @@ def _cleanup_devices():
 
 
 @pytest.fixture(scope="session", autouse=True)
-def session_setup_teardown():
-    """Runs once per session: log startup info, yield, then clean up hub/devices on exit."""
+def session_setup_teardown(request):
+    """Runs once per session: register cleanup, yield, then clean up hub/devices on exit."""
     # Setup — runs once before the first test
     register_signal_handlers(_cleanup_devices)
 
     yield  # All tests run here
 
-    # Teardown — runs once after the last test
-    ensure_newline()
-    log.info("")
-    log.info("=" * 80)
-    log.info("Pytest Session Ending")
-    log.info("=" * 80)
+    # Teardown — runs once after the last test. The module-scoped log handler is already closed
+    # (at the last module's teardown), so this output never tails a test's .log. Emit it with
+    # pytest's output capture suspended and via print() so it reaches the console -- otherwise
+    # fixture-teardown stdout is captured and discarded, and a logging.info would have no handler.
+    def _emit_session_end():
+        print(f"\n-I- {'=' * 80}")  # leading newline: pytest's last progress line has no EOL yet
+        print("-I- Pytest Session Ending")
+        print(f"-I- {'=' * 80}")
+        try:
+            _cleanup_devices()
+        except Exception as e:
+            print(f"-W- Error during cleanup: {e}")
 
-    try:
-        _cleanup_devices()
-    except Exception as e:
-        log.warning(f"Error during cleanup: {e}")
+    # getplugin returns None if capture is disabled (e.g. -p no:capture); guard so teardown
+    # (and _cleanup_devices) still runs instead of raising AttributeError.
+    capmanager = request.config.pluginmanager.getplugin("capturemanager")
+    if capmanager is not None:
+        with capmanager.global_and_fixture_disabled():
+            _emit_session_end()
+    else:
+        _emit_session_end()
 
     log.info("=" * 80)
 
@@ -555,25 +646,133 @@ def __pytest_repeat_step_number(request):
     return getattr(request, 'param', 0)
 
 
-@pytest.fixture(scope="module", autouse=True)
-def module_device_setup(request, _test_device_serial, __pytest_repeat_step_number):
-    """Enable the target device(s) via the hub. Runs once per (module, parametrized value).
+def _device_log_id(serial):
+    """Device-portion id used for the per-(module, camera) log filename.
 
-    All resolution (markers, CLI filters, sentinels for missing/skipped devices) happens
-    in ``resolve_device_each_serials`` at collection time.  The fixture just consumes
-    ``_test_device_serial`` and dispatches:
+    Mirrors the device parametrize ids built in ``resolve_device_each_serials`` (``<name>-<sn>``,
+    ``+``-joined for multi-device, ``MISSING-``/``SKIP-`` for sentinels) -- and deliberately omits
+    any extra ``@pytest.mark.parametrize`` dimensions (config/resolution). So every parametrize
+    case of one camera shares ONE file (``<module>_<name>-<sn>.log``), with the device enable at
+    the top and disable at the bottom, while each camera still gets its own file. ``None`` for a
+    test with no device markers.
+    """
+    if serial is None:
+        return None
+    if isinstance(serial, list):
+        return '+'.join(f"{devices.get(sn).name}-{sn}" if devices.get(sn) else sn for sn in serial)
+    if serial.startswith(_MISSING_SENTINEL_PREFIX):
+        return f"MISSING-{serial[len(_MISSING_SENTINEL_PREFIX):]}"
+    if serial.startswith(_SKIP_SENTINEL_PREFIX):
+        return f"SKIP-{serial[len(_SKIP_SENTINEL_PREFIX):]}"
+    dev = devices.get(serial)
+    return f"{dev.name}-{serial}" if dev else serial
+
+
+# Per-item log filenames to hardlink onto a camera's collapsed log, keyed by the camera log's
+# absolute path. Lets Jenkins' per-case report links (which reconstruct <module>_<full-bracket>.log
+# per item) resolve to the collapsed file WITHOUT any Jenkins/deploy-repo change.
+_log_alias_registry = {}
+
+
+def _per_item_log_name(fspath, item_name):
+    """The legacy per-item log filename (full bracket id) Jenkins reconstructs for an item."""
+    m = re.search(r'\[(.+)\]', item_name)
+    return _compose_log_name(fspath, m.group(1) if m else None)
+
+
+def _record_log_alias(request):
+    """Record this item's per-item log filename so module_log teardown can link it to the camera's
+    collapsed log. No-op for non-device tests or when the per-item name already equals the camera
+    name (single-param modules -- the common case -- need no alias)."""
+    logdir = getattr(request.config, '_test_logdir', None)
+    cs = getattr(request.node, 'callspec', None)
+    device_id = _device_log_id(cs.params.get('_test_device_serial') if cs else None)
+    if not logdir or device_id is None:
+        return
+    fspath = str(request.node.fspath)
+    camera_name = _compose_log_name(fspath, device_id)
+    item_name = _per_item_log_name(fspath, request.node.name)
+    if item_name != camera_name:
+        _log_alias_registry.setdefault(os.path.join(logdir, camera_name), set()).add(item_name)
+
+
+def _create_log_aliases(config, fspath, device_id):
+    """Hardlink (copy fallback) each recorded per-item name to the camera's collapsed log, so a
+    multi-param module's per-case Jenkins links all resolve to the one camera file."""
+    logdir = getattr(config, '_test_logdir', None)
+    if not logdir or device_id is None:
+        return
+    camera_path = os.path.join(logdir, _compose_log_name(fspath, device_id))
+    names = _log_alias_registry.pop(camera_path, ())
+    if not names or not os.path.exists(camera_path):
+        return
+    for item_name in names:
+        alias = os.path.join(logdir, item_name)
+        if alias == camera_path:
+            continue
+        try:
+            if os.path.lexists(alias):
+                os.remove(alias)          # retries re-create the alias; replace any stale one
+            os.link(camera_path, alias)   # hardlink: no content copy, archived as a real file
+        except OSError:
+            try:
+                import shutil
+                shutil.copyfile(camera_path, alias)
+            except OSError as e:
+                log.warning(f"Could not create per-case log alias {alias}: {e}")
+
+
+@pytest.fixture(scope="module", autouse=True)
+def module_log(request, _test_device_serial):
+    """Own the per-(module, camera) log file for the whole module lifecycle.
+
+    Module-scoped so one file spans setup (device enable) -> every test -> teardown (device
+    disable). Depends on ``_test_device_serial`` so pytest re-instantiates it per camera (one file
+    per module+camera) and so it satisfies the cross-camera module-fixture guard. The filename uses
+    the device-portion id only (``_device_log_id``), so all of a camera's ``@parametrize`` cases
+    collapse into that camera's single file.
+
+    ``module_device_setup`` depends on this fixture, so the handler opens before the device is
+    enabled and closes after it is disabled -- keeping a parametrized module fixture's deferred
+    teardown (pytest runs the previous camera's teardown during the next camera's protocol) from
+    leaking the disable into the next camera's file.
+    """
+    device_id = _device_log_id(_test_device_serial)
+    handler = open_log(str(request.node.fspath), device_id, request.config)
+    try:
+        yield
+    finally:
+        close_log(handler)
+        # link any extra-param cases' per-item names to this camera's collapsed log (Jenkins links)
+        _create_log_aliases(request.config, str(request.node.fspath), device_id)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def module_device_setup(request, _test_device_serial, __pytest_repeat_step_number, module_log):
+    """Power the target device(s) on for the module and off again at teardown — once per
+    (module, parametrized value).
+
+    Resolution (markers, CLI filters, missing/skip sentinels) happens in
+    ``resolve_device_each_serials`` at collection time; this fixture just consumes
+    ``_test_device_serial`` and owns the hub-port lifecycle:
 
     - ``None``            → test has no device markers; yield None.
-    - ``list[str]``       → multi-device marker; enable all serials and yield the list.
+    - ``list[str]``       → multi-device marker; enable all serials, yield the list, disable on teardown.
     - sentinel strings    → ``pytest.skip`` / ``pytest.fail``.
-    - plain serial string → enable that device and yield it.
+    - plain serial string → enable that device, yield it, disable on teardown.
 
-    ``autouse=True`` so the hub recycle fires at the first parametrized test in each
-    device group, not lazily at whichever test happens to be the first device-consumer.
-    Without it, a synthetic-only test that runs before a live-device test in the same
-    parametrize group would defer the recycle — making the recycle landing point
-    depend on test declaration order. For tests without any device marker
-    (``_test_device_serial is None``) the body yields None immediately, costing nothing.
+    Port state is owned by this fixture's lifecycle — enable on setup, disable on teardown — so
+    isolation and recycle fall out of pytest re-instantiating the fixture per
+    (module, device, repeat-step); there is no global port tracking. Isolation in the default
+    path comes from the *previous* module's teardown having powered its device off, so setup only
+    needs to power on its own. With ``--no-reset`` the device is isolated without a power-cycle
+    (``disable_other_ports=True``) and left on at teardown — matching the legacy fast path.
+
+    ``autouse=True`` is REQUIRED, not just an optimization: some tests build their own
+    ``rs.context()`` and never request ``test_device``/``test_context`` (e.g.
+    ``live/streaming/pytest-jpeg-compressed-format.py``, ``live/d500/pytest-detect-D555.py``);
+    they get their port powered only because this fixture runs automatically for every
+    device-marked module.
     """
     serial_number = _test_device_serial
 
@@ -581,6 +780,59 @@ def module_device_setup(request, _test_device_serial, __pytest_repeat_step_numbe
         log.debug(f"Module {request.node.name} has no device requirements")
         yield None
         return
+
+    # nodeid of the item that triggered this module fixture -- used to anchor setup-phase failures
+    # (which happen before _test_log_banner runs) to the failing test in the log.
+    item_id = getattr(getattr(request, '_pyfuncitem', None), 'nodeid', None) or request.node.nodeid
+
+    no_reset = request.config.getoption("--no-reset", default=False)
+    # Decide whether setup power-cycles the device (vs just turning it on):
+    #  --no-reset            -> never recycle; isolate statelessly and leave the device on.
+    #  no hub (Jetson/MIPI)  -> recycle; teardown-disable is a no-op there, so enable_only(recycle=
+    #                           True) falls back to hardware_reset() to clear prior state.
+    #  hub, port already ON  -> recycle. The device should be OFF here (prev module's teardown
+    #                           disabled it, or query()'s initial disable-all did). A powered port
+    #                           means a teardown was skipped (crash/kill) and the device was left
+    #                           in an unknown state -> power-cycle it clean. Self-heals the
+    #                           within-session leak that the old recycle=True sweep used to catch.
+    #  hub, port OFF         -> don't recycle; enabling it here IS the power-on (teardown-off +
+    #                           setup-on = the cycle). Avoids re-disabling an already-off port.
+    serials = serial_number if isinstance(serial_number, list) else [serial_number]
+    if no_reset:
+        recycle = False
+    elif devices.hub is None:
+        recycle = True
+    else:
+        recycle = devices.any_port_powered(serials)
+    disable_other_ports = no_reset
+    teardown_disable = not no_reset
+
+    def _bringup_settle(serials):
+        # D585 Prototype FW: the accelerometer produces no data if streaming starts within the
+        # first ~5-7 seconds after power-on (RSDEV-13011), failing any test whose config
+        # includes it. Wait out the bring-up window after enabling such a device.
+        # Matches "D585 Prototype" / "D585 Proto Dual RGB" only — D585S is not affected.
+        if any('D585 Proto' in (getattr(devices.get(sn), 'name', '') or '') for sn in serials):
+            log.info(f"D585 bring-up settle: waiting {D585_BRINGUP_SETTLE_SEC}s before tests")
+            time.sleep(D585_BRINGUP_SETTLE_SEC)
+
+    def _teardown(serials):
+        # Log the teardown so the per-test file shows the module's cleanup -- not just
+        # setup + test. Runs while this module+camera's log handler is still open.
+        ensure_newline()
+        if not teardown_disable:
+            log.info(f"Teardown: leaving {serials} enabled (--no-reset)")
+            return
+        if devices.hub is None:
+            # No hub to power the port off: disable() is a no-op, so nothing is removed here.
+            # The device is cleared by hardware_reset at the next module's setup recycle.
+            log.info(f"Teardown: {serials} left enumerated (no hub; recycled at next setup)")
+            return
+        log.info(f"Teardown: disabling {serials} and waiting for removal")
+        try:
+            devices.disable(serials)
+        except Exception as e:
+            log.warning(f"Failed to disable {serials} on teardown: {e}")
 
     if isinstance(serial_number, list):
         # Multi-device path: parametrized list of serials. Sentinels are always strings,
@@ -591,51 +843,54 @@ def module_device_setup(request, _test_device_serial, __pytest_repeat_step_numbe
         ]
         log.info(f"Configuration: {', '.join(names)}")
         try:
-            devices.enable_only(serial_number, recycle=True)
+            devices.enable_only(serial_number, recycle=recycle, disable_other_ports=disable_other_ports)
             log.debug(f"All {len(serial_number)} devices enabled and ready")
+            _bringup_settle(serial_number)
         except Exception as e:
+            # Setup failed after possibly powering the port(s): teardown won't run (no yield),
+            # so power off what we tried to enable here, lest it linger into the next module.
+            _emit_test_header(item_id)
+            try:
+                devices.disable(serial_number)
+            except Exception as cleanup_err:
+                log.warning(f"Cleanup after failed enable raised: {cleanup_err}")
             pytest.fail(f"Failed to enable devices: {e}")
         yield serial_number
+        _teardown(serial_number)
         return
 
     # Single-device path (parametrized string value, including sentinels).
     if serial_number.startswith(_SKIP_SENTINEL_PREFIX):
         pattern = serial_number[len(_SKIP_SENTINEL_PREFIX):]
+        _emit_test_header(item_id)
         pytest.skip(f"No suitable devices for requirements: {pattern}")
     if serial_number.startswith(_MISSING_SENTINEL_PREFIX):
         pattern = serial_number[len(_MISSING_SENTINEL_PREFIX):]
+        _emit_test_header(item_id)
         pytest.fail(f"No devices found matching requirements: {pattern}")
     log.debug(f"Test using parametrized device: {serial_number}")
 
-    # Enable the device for this module. Module-scoped fixture lifecycle handles
-    # recycle/reuse automatically: pytest re-instantiates this fixture per
-    # (module, _test_device_serial, __pytest_repeat_step_number), so the device
-    # is power-cycled exactly when it needs to change.
-    #
-    # --no-reset additionally skips enable_only on subsequent passes for the same
-    # serial within the same module, matching the legacy behavior.
     device = devices.get(serial_number)
     device_name = device.name if device else serial_number
     log.info(f"Configuration: {device_name} [{serial_number}]")
 
-    no_reset = request.config.getoption("--no-reset", default=False)
-    module_obj = request.module
-    already_enabled_serial = getattr(module_obj, '_module_last_serial', None)
-    if no_reset and already_enabled_serial == serial_number:
-        log.debug(f"Device {serial_number} already enabled (--no-reset), skipping hub setup")
-        yield serial_number
-        return
-
-    recycle = not no_reset
     try:
-        log.debug(f"{'Recycling' if recycle else 'Enabling'} device via hub...")
-        devices.enable_only([serial_number], recycle=recycle)
-        module_obj._module_last_serial = serial_number
+        log.debug(f"{'Recycling' if recycle else 'Enabling'} device...")
+        devices.enable_only([serial_number], recycle=recycle, disable_other_ports=disable_other_ports)
         log.debug(f"Device enabled and ready")
+        _bringup_settle([serial_number])
     except Exception as e:
+        # Setup failed after possibly powering the port: teardown won't run (no yield), so power
+        # off what we tried to enable here, lest it linger into the next module.
+        _emit_test_header(item_id)
+        try:
+            devices.disable([serial_number])
+        except Exception as cleanup_err:
+            log.warning(f"Cleanup after failed enable raised: {cleanup_err}")
         pytest.fail(f"Failed to enable device {serial_number}: {e}")
 
     yield serial_number
+    _teardown([serial_number])
 
 
 @pytest.fixture(scope="module")
@@ -733,14 +988,17 @@ def test_device_wrapped(test_device):
     is_d585s = dev.supports(rs.camera_info.name) and "D585S" in dev.get_info(rs.camera_info.name)
     safety_sensor = None
     if is_d585s:
+        from rspy import tests_wrapper  # local import: pulls in pyrealsense2, unavailable in infra-tests
         safety_sensor = dev.first_safety_sensor()
         if safety_sensor.get_option(rs.option.safety_mode) != rs.safety_mode.service:
             # Will throw on failure — intentional so we fail the test rather than run without service mode.
-            safety_sensor.set_option(rs.option.safety_mode, rs.safety_mode.service)
+            # Retries internally: the FW needs a few seconds after enumeration before it accepts the switch.
+            tests_wrapper.set_safety_mode(safety_sensor, rs.safety_mode.service)
     yield dev, ctx
     if safety_sensor is not None:
         try:
-            safety_sensor.set_option(rs.option.safety_mode, rs.safety_mode.run)
+            # tests_wrapper already imported in the setup block above (still bound across the yield)
+            tests_wrapper.set_safety_mode(safety_sensor, rs.safety_mode.run)
         except Exception as e:
             # Best-effort: don't mask test failures, and the device may already be reset by teardown time.
             log.warning(f"safety_mode restore skipped for {sn}: {e}")

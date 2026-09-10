@@ -114,8 +114,9 @@ stream_profiles formats_converter::get_all_possible_profiles( const stream_profi
                     for( const auto & target : pbf->get_target_info() )
                     {
                         // When a converter declares multiple indexed targets for one source stream (e.g. interleaved
-                        // infrared split into IR1/IR2, or the two color pins routed to Color 1/2), match each raw
-                        // profile to the target whose index equals the raw stream index.
+                        // infrared split into IR1/IR2, or dual-RGB color pins routed to distinct Color streams -
+                        // D500 Color 1/2, D401 GMSL Color 0/1), match each raw profile to the target whose index
+                        // equals the raw stream index. (Single-stream color: raw index 0 == target index 0 → still matches.)
                         if( ( source.stream == RS2_STREAM_INFRARED || source.stream == RS2_STREAM_COLOR )
                             && raw_profile->get_stream_index() != target.index )
                             continue;
@@ -178,13 +179,13 @@ formats_converter::clone_profile( const std::shared_ptr< stream_profile_interfac
 {
     std::shared_ptr< stream_profile_interface > cloned = nullptr;
 
-    // Inference streams (e.g. object detection) carry a variable-length binary payload rather than
-    // an image. When the target stream is inference, produce an inference_stream_profile regardless
-    // of the raw profile's type, so record/playback take the inference path and dims are not advertised.
+    // Perception streams (e.g. object detection) carry a variable-length binary payload rather than
+    // an image. When the target stream is perception, produce a perception_stream_profile regardless
+    // of the raw profile's type, so record/playback take the perception path and dims are not advertised.
     if( target_stream == RS2_STREAM_OBJECT_DETECTION
-        && ! std::dynamic_pointer_cast< inference_stream_profile >( raw_profile ) )
+        && ! std::dynamic_pointer_cast< perception_stream_profile >( raw_profile ) )
     {
-        cloned = std::make_shared< inference_stream_profile >();
+        cloned = std::make_shared< perception_stream_profile >();
         if( ! cloned )
             throw librealsense::invalid_value_exception( "failed to clone profile" );
     }
@@ -210,9 +211,9 @@ formats_converter::clone_profile( const std::shared_ptr< stream_profile_interfac
         auto motion_clone = std::dynamic_pointer_cast< motion_stream_profile >( cloned );
         // motion_clone->set_intrinsics( [msp]() { return msp->get_intrinsics(); } );
     }
-    else if( auto isp = std::dynamic_pointer_cast< inference_stream_profile >( raw_profile ) )
+    else if( auto isp = std::dynamic_pointer_cast< perception_stream_profile >( raw_profile ) )
     {
-        cloned = std::make_shared< inference_stream_profile >();
+        cloned = std::make_shared< perception_stream_profile >();
         if( ! cloned )
             throw librealsense::invalid_value_exception( "failed to clone profile" );
     }
@@ -317,7 +318,7 @@ void formats_converter::update_target_profiles_data( const stream_profiles & fro
             raw_profile->set_stream_type( from_profile->get_stream_type() );
             auto video_raw_profile = As< video_stream_profile, stream_profile_interface >( raw_profile );
             const auto video_from_profile = As< video_stream_profile, stream_profile_interface >( from_profile );
-            // Skip both intrinsics and dims forwarding when from_profile is non-video (e.g. inference):
+            // Skip both intrinsics and dims forwarding when from_profile is non-video (e.g. perception):
             // the raw UVC profile keeps its enumerated dims, and no synthetic intrinsics callback is installed.
             if( video_raw_profile && video_from_profile )
             {
@@ -328,7 +329,14 @@ void formats_converter::update_target_profiles_data( const stream_profiles & fro
 
                 // Hack for L515 confidence.
                 // Requesting source resolution from the camera, getting frame size of target (*2 y axis resolution)
-                video_raw_profile->set_dims( video_from_profile->get_width(), video_from_profile->get_height() );
+                // Do NOT shrink the raw/source profile below its native resolution: a resolution-reducing
+                // converter (e.g. the D401 GMSL RGGB crop 1612 -> 1288) must keep the backend capturing at
+                // the full source resolution, otherwise the V4L2 buffer is sized for the (smaller) target and
+                // the packed raw data is truncated. For every non-reducing conversion (all others today) the
+                // target dims equal the native dims, so this guard is a no-op and behavior is unchanged.
+                if( ! ( video_raw_profile->get_width()  > video_from_profile->get_width()
+                        || video_raw_profile->get_height() > video_from_profile->get_height() ) )
+                    video_raw_profile->set_dims( video_from_profile->get_width(), video_from_profile->get_height() );
             }
         }
     }
