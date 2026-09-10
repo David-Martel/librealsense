@@ -681,3 +681,93 @@ It is not staged because `scripts/build-dgx-spark-gb10.sh` is GB10-specific (CUD
 2.58.4 build for asuspro13 needs its own recipe. Note the pin path differs from the Sparks'
 (`/opt/vigil/librealsense`, not `/opt/vigil/opt/librealsense-v2.58.1-…`), so any fleet-wide re-pin
 script that assumes one layout will miss this host. asuspro13 and dtm-p1gen7 remain future work.
+
+---
+
+## 15. 720p multistream — measured on BOTH Sparks, 2026-09-10
+
+Run under explicit direction to remove the single-high-rate-stream envelope and compare the two
+Sparks against each other. Harness: `scripts/gb10/rs-gb10-stress-matrix.py`, new 720p tier, kernel
+tripwire armed, headless, SDK = the canonical `librealsense-v2.58.4-dgx-spark-gb10` prefix.
+
+### 15.1 The hardware ceiling at 720p is 30 Hz
+
+A D435 advertises 1280×720 at **30/15/6 Hz only** — on depth, colour **and** infrared. There is no
+faster 720p mode on this SKU, so "720p at the highest frame rate possible" is 1280×720@30 and no
+host-side change can raise it. `960×540 @ 60 Hz` is the only >30 fps 16:9 colour mode; `848×480` gets
+60 Hz colour and 90 Hz depth/IR; `848×100` and `256×144` depth reach 300 Hz.
+
+What host-side work *can* do is sustain **all four streams** at 720p30 at once. That is a heavier
+wire load than `HEAVY_60fps_848x480_D+C+IR`, the configuration that killed the GB10 xHCI on
+2026-06-02, so it is the right thing to soak.
+
+### 15.2 Sweep result — 7/7 on both hosts
+
+20 s per entry. Every stream on every entry delivered 29.95–30.00 fps against a 30 fps request.
+
+| Entry | spark-3066 (`6-1`, `NVDA8000:02`) | spark-0060 (`2-1.1`, `NVDA8000:00`) |
+|---|---|---|
+| `30fps_1280x720_depth` | PASS 29.96, g=0 | PASS 29.95, g=1 |
+| `30fps_1280x720_color` (bgr8) | PASS 29.98, g=0 | PASS 29.98, g=0 |
+| `30fps_1280x720_color_yuyv` | PASS 29.95, g=0 | PASS 29.98, g=0 |
+| `30fps_1280x720_D+C` | PASS 29.98/29.98, g=0 | PASS 29.98/29.98, g=0 |
+| `30fps_1280x720_D+IR` | PASS 29.98/29.98, g=0 | PASS 29.98/29.98, g=0 † |
+| `30fps_1280x720_D+C+IR` | PASS ×3 @ 29.98, g=0 | PASS ×3 @ 29.97, g=0 † |
+| **`HEAVY_…D+C+IR1+IR2`** | **PASS ×4 @ 29.98, g=0** | **PASS ×4 @ 30.00, g=0** |
+
+Kernel danger signatures (`Host halt`, `HC died`, `not responding`, `Not enough bandwidth`,
+`controller not`, `over-current`) across every run on both hosts: **0**. The only USB lines emitted
+were the benign `981ae2 Region of Interest Auto Ctrls` UVC non-compliance notice, which the harness
+already excludes by name.
+
+† **These two entries first reported PASS with an empty stream list** — the pipeline started, nothing
+raised, and *no frame arrived*. That was a false green in the harness itself, not a camera result:
+`ok` was seeded as `(err == "")` and then only ever narrowed inside the per-stream loop, which never
+ran when no stream delivered. Fixed in `eb0120a05` (zero streams → FAIL; fewer streams than
+requested → FAIL, naming which arrived), and the two entries were re-run under the fixed harness to
+produce the numbers above. The cause of the original zeros was transient: it was the first camera
+open after an 8.5-hour `vigil_c2` session released the device. **Any earlier ramp result in this
+document that shows a passing entry should be re-read with that defect in mind** — the 2026-09-10
+R6 ramp (§12) rows were re-checked and all carry real frame counts, so none of them relied on it.
+
+### 15.3 Colour format: YUYV saves host work, not bandwidth
+
+The obvious reading — "request YUYV instead of RGB8/BGR8 and save a third of the USB bandwidth" — is
+**wrong on D400**, and the source settles it:
+
+- `src/ds/d400/d400-color.cpp:25-26` maps the UVC fourccs `YUY2`/`YUYV` to `RS2_FORMAT_YUYV`. That is
+  what the device advertises on the wire.
+- `src/ds/d400/d400-color.cpp:342` registers a **processing block**,
+  `create_pbf_vector<yuy2_converter>(RS2_FORMAT_YUYV, map_supported_color_formats(RS2_FORMAT_YUYV), …)`.
+- `src/device.cpp:255` defines those targets: `{ RGB8, RGBA8, BGR8, BGRA8 }`.
+
+So RGB8, BGR8, RGBA8 and BGRA8 at 1280×720 are **host-side conversions from YUYV**; the wire carries
+YUY2 at 2 bytes/pixel regardless of what the application asks for. Requesting `yuyv` therefore saves
+**zero USB bandwidth** and instead skips the `yuy2_converter` pass. That is still worth having when
+the consumer can take YUYV directly, but it must not be sold as a bandwidth saving.
+
+Measured cost of the conversion at 720p30, single colour stream: bgr8 29.98 fps vs yuyv 29.95 fps on
+3066 and 29.98 vs 29.98 on 0060 — i.e. **at 30 Hz the conversion is not the bottleneck and does not
+show up in delivered frame rate at all.** The saving is CPU headroom, not throughput, and it should
+be justified on that basis or not at all.
+
+### 15.4 The two hosts are not topologically identical
+
+| | spark-3066 | spark-0060 |
+|---|---|---|
+| sysfs path | `6-1` | `2-1.1` |
+| upstream of the camera | root port directly | `2109:0211` VIA Labs "USB3.0 Hub", 1 downstream port |
+| xHCI controller | `NVDA8000:02` (bus 6) | `NVDA8000:00` (bus 2) |
+| root port / negotiated rate | 20 Gbps / **5 Gbps SuperSpeed** | 20 Gbps / **5 Gbps SuperSpeed** |
+| camera s/n, firmware | 347622075921, 5.17.3.10 | 327122076391, 5.17.3.10 |
+
+The account owner states 0060's camera is on the spark-bus rather than behind a hub; the sysfs chain
+does show a VL2109 between the root port and the camera. Both readings are recorded without
+adjudicating whether that hub sits on the mainboard, in a captive cable, or in an adapter — nothing
+was opened or traced physically. **What matters for these results is that both links negotiate the
+same 5 Gbps SuperSpeed rate, so the bandwidth ceiling is identical, and that the two cameras hang
+off different xHCI controller instances** — which is the variable a controller-death defect actually
+turns on, and the one this two-host comparison controls for.
+
+Earlier notes in this repo that treated 0060 as "behind a hub, therefore unvalidated" over-weighted
+the hub and under-weighted the controller instance.
