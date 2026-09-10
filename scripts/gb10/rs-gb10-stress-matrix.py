@@ -285,6 +285,22 @@ def main():
     ap.add_argument("--json", default="")
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--serial", default="")
+    ap.add_argument(
+        "--match",
+        default="",
+        help="only run matrix entries whose name contains this substring "
+        "(case-insensitive). Use it to soak a single config for hours "
+        "instead of sweeping the whole matrix.",
+    )
+    ap.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="run the selected entries this many times, in order. A soak is "
+        "--match <entry> --duration <s> --repeat <n>: each pass re-opens the "
+        "pipeline, so start/stop cycling is exercised too, which is what "
+        "preceded every observed GB10 controller death.",
+    )
     args = ap.parse_args()
     render = (not args.headless) and bool(os.environ.get("DISPLAY"))
 
@@ -305,9 +321,24 @@ def main():
         )
     }
 
+    selected = [
+        (n, st)
+        for (n, st) in MATRIX
+        if not args.match or args.match.lower() in n.lower()
+    ]
+    if not selected:
+        print(
+            f"[ERROR] --match {args.match!r} selected no matrix entries. "
+            f"Available: {', '.join(n for n, _ in MATRIX)}",
+            file=sys.stderr,
+        )
+        return 2
+    if args.repeat > 1:
+        selected = selected * args.repeat
+
     results = []
     aborted = False
-    for name, streams in MATRIX:
+    for name, streams in selected:
         r = run_entry(name, streams, args.duration, render)
         results.append(r)
         s = " ".join(
