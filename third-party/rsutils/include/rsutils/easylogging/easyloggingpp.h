@@ -2,6 +2,8 @@
 // Copyright(c) 2021-4 RealSense, Inc. All Rights Reserved.
 #pragma once
 
+#include <rsutils/visibility.h>
+
 // When including this file outside LibRealSense you also need to:
 // 1. Compile the easylogging++.cc file
 // 2. With static linkage, ELPP is initialized by librealsense, so doing it here will
@@ -108,8 +110,10 @@ inline bool elpp_enabled( el::Logger * logger__, el::Level level )
 namespace rsutils {
 
 
-// This is a caching of LIBREALSENSE_ELPP_ID in a string, as a performance optimization
-extern std::string const g_librealsense_elpp_id;
+// This is a caching of LIBREALSENSE_ELPP_ID in a string, as a performance optimization.
+// RSUTILS_LOCAL: rsutils is static and linked into both librealsense2 and its executables, so
+// without it this std::string is constructed and destroyed twice (see rsutils/visibility.h).
+extern std::string const RSUTILS_LOCAL g_librealsense_elpp_id;
 
 
 // Configure the same logger as librealsense (by default), to disable/enable debug output

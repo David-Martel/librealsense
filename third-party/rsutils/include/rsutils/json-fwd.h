@@ -2,6 +2,8 @@
 // Copyright(c) 2023 RealSense, Inc. All Rights Reserved.
 #pragma once
 
+#include <rsutils/visibility.h>
+
 // Turn off normal JSON I/O (operator<<) serialization
 // This disables a few things like json::parse, but we do it because of conflict between our operator<< and the built-in
 // one by json. Otherwise (if we do not need custom stream serialization) it's not needed...
@@ -73,33 +75,16 @@ using json = nlohmann::basic_json< std::map,  // all template arguments are defa
 
 // We can't put these inside json, unfortunately...
 //
-// These four are defined in json.cpp, which lives in rsutils -- a STATIC library that is linked
-// PUBLIC into the shared realsense2 (see the top-level CMakeLists.txt). A static library linked
-// into both a shared object and the executables that load it produces TWO definitions of every
-// global it owns. With default (preemptible) visibility, ELF resolves both to the executable's
-// copy, so librealsense2.so's initializer constructs the executable's object and registers a
-// destructor for it -- and the executable does the same. The object is then constructed twice and
-// destroyed twice: an exit-time double free (SIGABRT) in every tool that links both.
-//
-// Hidden visibility makes each module's copy private and non-preemptible, so each is constructed
-// and destroyed exactly once. That is safe here because these are immutable sentinels compared by
-// VALUE, never by address: "missing" is detected as _j.is_discarded() in json_ref::exists(), not
-// as &_j == &missing_json.
-//
-// Without this, the crash is latent -- it only surfaces when the linker happens to pull json.cpp's
-// archive member into the executable, which depends on the language standard and on which other
-// rsutils members are referenced. It was observed at -std=c++20 against nlohmann 3.12 while
-// -std=c++14 silently avoided it. See docs/gb10/UPGRADE-PLAN-2026-09-10.md section 11.
-#if defined( _WIN32 )
-#define RSUTILS_SENTINEL  // exports are controlled by the .def file
-#else
-#define RSUTILS_SENTINEL __attribute__( ( visibility( "hidden" ) ) )
-#endif
-
-extern json const RSUTILS_SENTINEL null_json;     // default json state
-extern json const RSUTILS_SENTINEL missing_json;  // i.e., not there: exists() will be 'false'
-extern json const RSUTILS_SENTINEL empty_json_string;
-extern json const RSUTILS_SENTINEL empty_json_object;
+// RSUTILS_LOCAL (see rsutils/visibility.h) keeps each module's copy of these private: rsutils is a
+// static library linked into both librealsense2 and every executable that loads it, and with
+// default visibility the duplicate definitions collapse onto one object that is then constructed
+// and destroyed twice -- an exit-time double free. It is safe here because these are immutable
+// sentinels compared by VALUE, never by address: "missing" is detected as _j.is_discarded() in
+// json_ref::exists(), not as &_j == &missing_json.
+extern json const RSUTILS_LOCAL null_json;     // default json state
+extern json const RSUTILS_LOCAL missing_json;  // i.e., not there: exists() will be 'false'
+extern json const RSUTILS_LOCAL empty_json_string;
+extern json const RSUTILS_LOCAL empty_json_object;
 
 
 std::ostream & operator<<( std::ostream &, const json & );
