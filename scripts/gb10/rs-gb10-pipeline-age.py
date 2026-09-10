@@ -47,7 +47,13 @@ exactly 250.0 ms in the past, at 30 Hz:
     /control/aged        n=652   p50 250.83 ms   jitter 0.85 ms
 
 0.83 ms off truth, and that residual is real publish-to-receive latency rather
-than error. The two deliberate poison topics behaved as designed in the same
+than error. Repeated under DEFAULT fleet config once spark-3066's firewall was
+fixed -- no CycloneDDS workaround, the configuration the fleet actually runs:
+
+    /control/aged        n=648   p50 250.75 ms   jitter 0.61 ms
+
+Two runs, two DDS configurations, both within 0.9 ms of an injected 250.0
+ms. The two deliberate poison topics behaved as designed in the same
 run: 651 frames stamped 500 ms in the FUTURE were all reported as a negative-age
 defect rather than clamped or averaged in, and 651 frames with a zero stamp were
 counted as unstamped rather than treated as age 0. The run exited 1 because two
