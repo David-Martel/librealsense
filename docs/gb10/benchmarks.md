@@ -748,8 +748,22 @@ the consumer can take YUYV directly, but it must not be sold as a bandwidth savi
 
 Measured cost of the conversion at 720p30, single colour stream: bgr8 29.98 fps vs yuyv 29.95 fps on
 3066 and 29.98 vs 29.98 on 0060 — i.e. **at 30 Hz the conversion is not the bottleneck and does not
-show up in delivered frame rate at all.** The saving is CPU headroom, not throughput, and it should
-be justified on that basis or not at all.
+show up in delivered frame rate at all.**
+
+**And on this platform, asking for YUYV is a pessimisation rather than a saving.** The conversion
+being "skipped" runs on the **GPU**: `src/proc/color-formats-converter.cpp:63-69` wraps the YUY2
+unpack in `#ifdef RS2_USE_CUDA` and returns early into `rscuda::unpack_yuy2_cuda<FORMAT>` whenever
+`rs2_is_cuda_available()` — which also makes the NEON implementations at `:232-240` dead code in
+every CUDA-enabled GB10 build. Meanwhile vigil-spark's node, having negotiated `yuyv`, converts it
+with `cv2.cvtColor(image, cv2.COLOR_YUV2BGR_YUYV)` on a single Grace core
+(`realsensenode.py:859-861`). So the fallback trades a GPU conversion for a CPU one and saves nothing
+on the wire.
+
+Request `yuyv` only when a downstream **GPU** consumer takes YUYV directly. Otherwise `bgr8` is the
+right request on GB10, and a fallback to `yuyv` should be logged as a fault rather than accepted as
+a tuning outcome. Credit for catching this: it inverts the conclusion an earlier draft of this
+section reached from the wire-format fact alone, which was correct about the wire and wrong about
+the consequence because it never asked *where* the skipped conversion would have run.
 
 ### 15.4 The two hosts are not topologically identical
 

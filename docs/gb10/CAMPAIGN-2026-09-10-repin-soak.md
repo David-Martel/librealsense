@@ -230,16 +230,26 @@ about a third and dropped no frames on either host.
 
 | # | Change | Why | Cost |
 |---|---|---|---|
-| **M1** | **640×480 → 1280×720 @30, depth + colour** | 3× the pixels for identification/segmentation/clustering. Measured 29.98/30 fps, 0 drops, 0 USB faults on **both** hosts. Still only ~22% of the link. | Two literals in `realsensenode.py`. Downstream models must accept the larger frame. |
-| **M2** | **Request `yuyv` rather than `bgr8`** *when the consumer can take it* | Skips the `yuy2_converter` pass per frame. The node already has the fallback wired, so this is a preference flip. **Not a bandwidth saving** — the wire is YUY2 either way. | Frees CPU only; unmeasured at 30 Hz (see caveat). |
+| **M1** | **640×480 → colour 1280×720@30, depth 848×480@30** | 3× the colour pixels for identification/segmentation/clustering. Measured 29.98/30 fps, 0 drops, 0 USB faults on **both** hosts. Note the split: the D435's depth imager is 1280×800 and Intel's tuning guidance centres on **848×480**, so 720p *depth* buys upsampled detail while costing align and pointcloud time on every frame. Raise colour first; raise depth only against a measured depth-quality gain. | Two literals in `realsensenode.py`. Downstream models must accept the larger frame. |
+| **M2** | **Keep `bgr8`; treat the `yuyv` fallback as an error path, not a tuning knob** | **Inverted from an earlier draft of this table.** On a CUDA build the SDK's YUY2 unpack runs *on the GPU* — `src/proc/color-formats-converter.cpp:63-69` returns early into `rscuda::unpack_yuy2_cuda` whenever `rs2_is_cuda_available()`, which also makes the NEON path at `:232-240` dead code on GB10. vigil-spark's node, having negotiated `yuyv`, then converts with `cv2.cvtColor(…, COLOR_YUV2BGR_YUYV)` on a single Grace core (`realsensenode.py:859-861`). So taking the fallback saves no bandwidth **and moves the conversion off the GPU onto the CPU**. | Log the fallback as a fault instead of accepting it silently. |
 | **M3** | **Add IR1 (+IR2) only if a consumer uses them** | Proven safe at 720p30 alongside D+C. Stereo IR is the honest input for depth-quality work. | +55 MB/s. No benefit unless consumed. |
 | **M4** | **960×540@60 for >30 fps colour** | The **only** 16:9 colour mode above 30 Hz on this SKU. Use this, not 720p, if motion is the constraint. | Lower resolution than 720p. |
 | **M5** | **848×100@300 or 256×144@300 depth for a latency-first path** | 300 Hz depth exists. If a controller needs fast depth rather than detailed depth, this is a different operating point entirely. | Tiny frames; a separate pipeline. |
 | **M6** | **Rebuild with Armv9.2 flags** (F6) | Both the incumbent and replacement SDK are baseline armv8-a. Affects every hot path. | Rebuild + A/B + byte-identity gate. |
 
-**Caveat on M2**, stated because it has not been measured: at 720p30 the conversion does not show up
-in delivered frame rate (bgr8 29.98 vs yuyv 29.95 on 3066; 29.98 vs 29.98 on 0060), so the argument
-for it is CPU headroom, which was *not* instrumented here. Do not adopt M2 on a throughput claim.
+**How M2 got inverted, since it is instructive.** The chain "YUYV is the wire format → requesting it
+skips a conversion → therefore request it" is correct in each link and wrong at the end, because it
+stops one step short: it never asks *where* the conversion it skips would have run. On this platform
+it runs on the GPU, and the code that consumes the raw YUYV runs on the CPU. The measured frame
+rates are consistent with either story — bgr8 29.98 vs yuyv 29.95 on 3066, 29.98 vs 29.98 on 0060 —
+which is exactly why they could not settle it and the source had to.
+
+`yuyv` is still the right request **if and only if** a downstream *GPU* consumer takes YUYV directly.
+Never to feed `cv2.cvtColor`.
+
+The one thing still unmeasured is the size of the effect: neither leg was instrumented for host CPU,
+so "moves work onto a Grace core" is a claim about *where* the work happens, established from source,
+not about how much it costs. Instrument before quoting a number.
 
 ### ROS 2 / CycloneDDS — what is already right, and what is missing
 
