@@ -444,6 +444,26 @@ grounds for changing a default:
   device-local memory could plausibly have taken different rounding paths, which would have made
   −42% a silent output change rather than a win.
 
+**`BUILD_WITH_CUDA_ZEROCOPY=OFF` is compiled and gated, not merely reasoned about** (2026-09-10).
+`OFF` is upstream's default in `CMake/lrs_options.cmake`, so the `#else` legs of `align_zc_mode()`
+and the `try_device_ptr → nullptr` path are what every other downstream actually builds — and until
+this run they had never been compiled with the align patch in the tree. A scratch prefix
+(`LRS_GB10_CUDA_ZEROCOPY=OFF`, spark-3066, CUDA 13.0) was built from merged master `df4693bcb`:
+
+| Check | Result |
+|---|---|
+| `cuda-align.cu.o` compiles in the OFF config | yes (137 KiB object) |
+| full `ninja` + `ninja install`, incl. `pyrealsense2` | rc=0 |
+| provenance line | `build.BUILD_WITH_CUDA_ZEROCOPY=0` |
+| `rs-gb10-profiler --self-test` | **32/0** |
+| `rs-enumerate-devices` / `rs-fw-update` / `rs-record` | rc=0 |
+| aligned-depth SHA-256 over the 164-frame fixture | `2bf7df33fea0d19c…` |
+
+That SHA-256 is **identical** to the canonical ON prefix under both `RS2_ALIGN_ZC=1` (the new
+default) and `RS2_ALIGN_ZC=0`. So all three configurations — upstream-default OFF, ON/staging, and
+ON/inputs-mapped — produce bit-identical aligned depth; the optimization is a pure timing change and
+the non-zero-copy path is genuinely untouched. The probe prefix was pruned after the gate.
+
 **Reproduced on a clean artifact.** The numbers above were first measured on a build assembled
 incrementally, so they were re-taken on the canonical prefix built from merged master
 (`164f19674`, `v2.58.2-1474-g164f19674`): align p50 **0.308 ms**, pointcloud p50 **0.136 ms**,
@@ -644,3 +664,20 @@ Two notes on spark-0060 specifically:
 - Staging 0060's *build* is **not** validating 0060's *envelope*. Its camera sits behind a hub
   rather than on a native root port, and the multistream ramp (§12) has only ever run on 3066. That
   remains the open item.
+
+**asuspro13 is the third pin target and was deliberately NOT staged.** `vigil-spark` pins this
+compiled code on the ASUS host as well as the Sparks, so its current state belongs in this table
+even though nothing was changed there:
+
+| | asuspro13 |
+|---|---|
+| resolved `librealsense2.so` | `/opt/vigil/librealsense/lib/librealsense2.so.2.58` (via `ldconfig`) |
+| `/usr/local/lib/librealsense2.so` | absent — the ASUS host does **not** use that path |
+| `/opt/vigil/opt/librealsense-asus-system` | present but holds only `lib/python3.12/site-packages` |
+| 2.58.4 artifact staged | **no** |
+
+It is not staged because `scripts/build-dgx-spark-gb10.sh` is GB10-specific (CUDA arch, the
+`/opt/gb10-cuda` OpenCV, the aarch64 pins) and does not apply to an x86_64 host with no CUDA — a
+2.58.4 build for asuspro13 needs its own recipe. Note the pin path differs from the Sparks'
+(`/opt/vigil/librealsense`, not `/opt/vigil/opt/librealsense-v2.58.1-…`), so any fleet-wide re-pin
+script that assumes one layout will miss this host. asuspro13 and dtm-p1gen7 remain future work.
