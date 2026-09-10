@@ -977,3 +977,119 @@ Adopt it anyway, because the cost is zero and the alternative is worse than slow
 **Anyone hoping for a large win from arch flags on this SDK should read §17.3 first.** The lever that
 would actually matter is moving more work onto the GPU — the NVENC colour path in F10 — not
 recompiling the CPU paths.
+
+---
+
+## §18 Frame-delivery jitter — the tail, not the mean (2026-09-10)
+
+The optimisation target changed: operators perceive *randomly timed* visual and audio events far
+more readily than they perceive throughput. That invalidates the statistic every earlier section
+used. §9–§17 report p50 and, in places, best-of-N — both are throughput statistics. Nothing before
+this section measured how bad a *bad* frame is, which is the number a human actually notices.
+
+Measured with `scripts/gb10/rs-gb10-jitter.py` (new). It reports p50/p90/p99/p99.9/max/stddev for
+inter-arrival and frame age, and quotes **p99 − p50** as the jitter figure. Host receipt is
+`time.perf_counter()` at the instant `wait_for_frames()` returns — the moment a downstream consumer
+could first touch the data.
+
+All runs: spark-3066, D435 sn 347622075921 fw 5.17.3.10, deployed 2.58.4 build `a8977ca55`,
+1280×720@30 depth + colour, under the host's normal co-tenancy (vLLM `vigil-router` + CI runners
+resident). 180 s and 300 s windows.
+
+### §18.1 Steady-state cadence is excellent
+
+| leg | n | p50 | p99 | p99.9 | max | **jitter p99−p50** |
+|---|---:|---:|---:|---:|---:|---:|
+| queue 16 (SDK default) | 5389 | 33.354 | 34.748 | 35.491 | 268.458 | **1.394** |
+| queue 16 (repeat) | 5389 | 33.343 | 34.670 | 35.378 | 268.453 | **1.327** |
+| 300 s run | 8986 | 33.345 | 34.752 | 35.322 | 268.832 | **1.407** |
+
+Inter-arrival ms. Ideal is 33.333. **A p99 within 1.4 ms of p50 across ~20,000 frames is a tight,
+watchable stream** — the SDK is not the jitter problem. Depth/colour skew is p50 = p99 = **0.024 ms**:
+the two imagers are hardware-synchronised to ~24 µs, so anything fusing them is combining
+observations of the same instant.
+
+### §18.2 Two levers measured and REJECTED — record them so they are not re-run
+
+**`RS2_OPTION_FRAMES_QUEUE_SIZE=1` is not a win.** The reasoning for trying it was sound (default 16
+buffers under consumer stall, then delivers a burst). Measured, it is neutral-to-worse:
+
+| | p99 | p99.9 | depth/colour skew max |
+|---|---:|---:|---:|
+| queue 16 | 34.748 | 35.491 | 500.219 |
+| queue 1 | 34.719 | **37.300** | **4662.769** |
+
+No p99 improvement, a worse p99.9, and a pathological 4.66 s skew event that the default never
+produced. `min` inter-arrival also drops 31.095 → 15.658 ms, i.e. queue 1 introduces the very
+burstiness it was meant to remove. **Keep the default.**
+
+**`RS2_OPTION_GLOBAL_TIME_ENABLED=0` is not a win either.** The hypothesis was that the periodic
+device↔host clock re-fit issues a hardware-monitor command down the same USB control path and
+stalls the stream. It does not: max is 269.602 ms with global time off versus 268.453 ms with it on
+— unchanged. Global time costs nothing measurable here, and it is what makes cross-host camera
+stamps comparable, so **leave it on**.
+
+Both are negative results, and both are worth more than a positive would have been: they close two
+plausible-sounding rabbit holes that the next person would otherwise re-run.
+
+### §18.3 The one real artifact: a single ~268 ms stall per pipeline start
+
+Every run shows exactly one gap of 268.5 / 268.7 / 269.6 / 268.5 / 268.8 ms. The consistency
+initially read as a periodic event roughly every three minutes. **It is not periodic — it is
+once per pipeline start**, and the discriminator is the frame index: in the 300 s run
+(8986 samples) the single stall lands at **frame 24**, a few seconds after warm-up ends. Each
+earlier run showed one only because each run restarted the pipeline.
+
+It is frame **loss**, not buffering: `min` inter-arrival is 31.095 ms, so nothing was held back and
+released in a burst, and 5390 frames arrive of 5400 expected. ~268 ms ≈ 8 depth frames.
+
+Attributed, not guessed. `dmesg` during the run:
+
+```
+usb 6-1: Process 2435042 (python3) called USBDEVFS_CLEAR_HALT for active endpoint 0x82
+```
+
+`lsusb -v` puts endpoint **0x82 on the Depth interface**. So: the depth streaming endpoint halts
+shortly after streaming begins, the SDK clears the halt, and the eight frames in flight are lost.
+The SDK cannot prevent a device/xHCI endpoint halt — it can only recover from it, which it does.
+
+**Consequence for vigil-spark:** this is a known, bounded, once-per-start event, not an unknown.
+The mitigation is downstream, not in the SDK — a consumer should settle for ~6 s after pipeline
+start before treating cadence as reliable (the harness's own 3 s warm-up is not enough; the stall
+lands after it), and should hold the last good frame rather than publishing a gap.
+
+### §18.4 Depth resolution: only 1280×720 negotiates on this fleet
+
+Discovered while trying to test whether depth at 848×480@90 would cut the frame interval from
+33.3 ms to 11.1 ms — which would have been the single largest latency win available. It is not
+available:
+
+| depth z16 mode | advertised by `get_stream_profiles()` | actually opens |
+|---|:-:|:-:|
+| 1280×720@30 | yes | **yes** |
+| 848×480 @30/60/90 | yes | no |
+| 640×480 @30/90 | yes | no |
+| 640×360, 480×270, 424×240 | yes | no |
+
+`RS2_USB_STATUS_PIPE` — a probe-commit control-transfer stall at `uvc-device.cpp:873` — which the
+SDK surfaces as the misleading `Failed to resolve the request`. **The SDK advertises depth profiles
+it cannot open**, so any code that enumerates modes and picks one can pick an unopenable one.
+
+Eliminated as causes, each by test rather than by argument:
+
+- **not a 2.58.4 regression** — 2.58.1 fails identically, with the mapped `.so` verified via
+  `/proc/self/maps`, not merely the package path
+- **not host-specific** — reproduced on spark-3066 (native root port) and spark-0060 (spark-bus)
+- **not a wedged endpoint** — survives a USB port de-authorise/re-authorise power cycle
+- **not missing IR pairing** — depth+IR1+IR2 and depth+colour at 848×480 fail the same way
+- **not kernel driver contention** — no driver holds any interface of the device
+- **not fixable by the V4L2 backend** — a `FORCE_RSUSB_BACKEND=OFF` build was made and tested:
+  it enumerates **zero devices**, which vindicates the fork's `LRS_GB10_FORCE_RSUSB=ON` default
+
+This also **retracts a June result**: the stress-matrix entry `HEAVY_60fps_848x480_D+C+IR` was
+recorded as passing. It was a false green from the bug fixed in `eb0120a05` (zero frames delivered
+reported as PASS). 848×480 has not actually been streaming on this fleet.
+
+**Consequence:** 1280×720@30 is not a preference, it is the only depth mode that runs, and 30 Hz is
+therefore a hard floor on frame interval until the probe-commit stall is understood. Any plan that
+assumed a lower-resolution/higher-rate depth mode — including this campaign's own M1 — is void.
