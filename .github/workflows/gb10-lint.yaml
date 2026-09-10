@@ -1,0 +1,153 @@
+# Lint gate for the FORK'S OWN GB10 code. Nothing here touches upstream sources.
+#
+# WHY THIS EXISTS
+# ---------------
+# This fork had no dispatchable CI at all. `Build_CI` and `static_analysis` are
+# `disabled_manually` (both failed on the June 2.58.2 upstream sync), and every
+# remaining workflow targets GitHub-hosted runners, which are disabled
+# account-wide. PRs therefore merged with an EMPTY check list -- including the
+# 2.58.4 fleet re-pin. That is a quieter failure than a suite that is collected
+# and never run, because nobody reads an absent check as evidence, but it is
+# still a hole.
+#
+# SCOPED TO CHANGED FILES, DELIBERATELY
+# -------------------------------------
+# `ruff check scripts/gb10/*.py` reports 171 errors today and 19 of 25 files
+# would be reformatted. Wiring that as a blocking gate would paint the repo
+# permanently red, which trades a silent gap for a loud useless one -- switching
+# a light on to look finished. Linting only the files a change actually touches
+# is green from day one AND ratchets: every new or modified GB10 file must be
+# clean, and the pre-existing debt is paid down file by file as files are
+# touched, not in one unreviewable sweep.
+#
+# UPSTREAM CODE IS NEVER LINTED. The fork's standing rule is that imported
+# upstream sources are not edited, so linting them could only produce findings
+# nobody is allowed to fix.
+name: gb10_lint
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+permissions: read-all
+
+env:
+  # Pinned to the version the local git-guard commit gate runs, so CI and the
+  # pre-commit hook cannot disagree about what "clean" means. Drift between the
+  # two is how a contributor gets blocked at commit time by a rule CI never
+  # mentioned, or waved through by CI and blocked locally.
+  RUFF_VERSION: "0.16.3"
+
+jobs:
+  gb10-lint:
+    # `no-realsense-hardware` is load-bearing, not decorative. The fleet's D435s
+    # are deployed on spark-0060 and spark-3066 under live vigil workers, on a
+    # networked ROS 2 / CycloneDDS graph (ROS_DOMAIN_ID=42). A CI job that opened
+    # a camera would contend with a deployed sensor, and on this fleet that
+    # contention would not stay local to the host that caused it. This label
+    # matches only the camera-less asuspro13 runner.
+    runs-on: [self-hosted, Linux, X64, no-realsense-hardware]
+    timeout-minutes: 15
+
+    steps:
+      - name: Refuse to run on a host with a RealSense attached
+        # Defence in depth behind the label. If someone ever adds this label to a
+        # Spark, or plugs a camera into asuspro13, this job must stop rather than
+        # become a lint job quietly sharing a host with a live HIL soak.
+        run: |
+          set -euo pipefail
+          if lsusb 2>/dev/null | grep -qiE '8086:0b(07|3a|64)'; then
+            echo "::error::A RealSense device is attached to this runner host." \
+                 "This job is lint-only and must never share a host with a deployed camera."
+            lsusb | grep -iE '8086:0b' || true
+            exit 1
+          fi
+          echo "no RealSense device on this host - safe to lint"
+
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the gate diffs against the merge base, which a shallow
+          # clone cannot resolve.
+          fetch-depth: 0
+
+      - name: Resolve the changed fork-owned files
+        id: changed
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          # A first push to a new branch, or a force-push, can leave `before` as
+          # the null SHA or an object this clone does not have. Fall back to the
+          # merge-base with the default branch rather than silently linting
+          # nothing, which would be a pass that proves nothing.
+          if [[ -z "$base" || "$base" == "0000000000000000000000000000000000000000" ]] \
+             || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            base="$(git merge-base HEAD origin/master 2>/dev/null || echo '')"
+          fi
+          if [[ -z "$base" ]]; then
+            echo "::error::could not resolve a base commit to diff against"
+            exit 1
+          fi
+          echo "diffing $base..HEAD"
+          git diff --name-only --diff-filter=ACMR "$base" HEAD \
+            | grep -E '^(scripts/gb10/.*\.(py|sh)|scripts/build-dgx-spark-gb10\.sh)$' \
+            > changed.txt || true
+          echo "--- fork-owned files changed ---"
+          cat changed.txt
+          echo "count=$(wc -l < changed.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Prove the linter actually runs
+        # A gate that cannot fire is indistinguishable from a gate that passes.
+        # This repo has already shipped one false green (a stress entry that
+        # delivered zero frames and reported PASS), so the linter is required to
+        # demonstrate a finding on a known-bad fixture before its silence on real
+        # files is allowed to mean anything.
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/lintctl
+          printf 'import os\nx=1\n' > /tmp/lintctl/bad_fixture.py
+          if uvx --quiet "ruff@${RUFF_VERSION}" check --select F401 --no-cache \
+               /tmp/lintctl/bad_fixture.py 2>/dev/null; then
+            echo "::error::positive control FAILED - ruff reported no finding on a file" \
+                 "with an unused import, so a clean result from this job proves nothing."
+            exit 1
+          fi
+          echo "positive control passed - ruff detects a planted violation"
+
+      - name: ruff (changed Python only)
+        if: steps.changed.outputs.count != '0'
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(grep -E '\.py$' changed.txt || true)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "no Python among the changed fork-owned files"; exit 0
+          fi
+          printf '  %s\n' "${files[@]}"
+          uvx --quiet "ruff@${RUFF_VERSION}" check --no-cache -- "${files[@]}"
+          uvx --quiet "ruff@${RUFF_VERSION}" format --check --no-cache -- "${files[@]}"
+
+      - name: shell syntax and shellcheck (changed shell only)
+        if: steps.changed.outputs.count != '0'
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(grep -E '\.sh$' changed.txt || true)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "no shell among the changed fork-owned files"; exit 0
+          fi
+          printf '  %s\n' "${files[@]}"
+          for f in "${files[@]}"; do bash -n "$f"; done
+          # -S error matches the severity the fork's build script is already held
+          # to; raising it to warning would be a separate, reviewable decision.
+          uvx --quiet --from shellcheck-py shellcheck -S error -- "${files[@]}"
+
+      - name: Report when there was nothing in scope
+        if: steps.changed.outputs.count == '0'
+        run: |
+          echo "No fork-owned GB10 files changed - this gate had nothing to lint."
+          echo "That is a real pass over an empty set, not a pass over unchecked files:"
+          echo "upstream sources are intentionally out of scope for this gate."
