@@ -34,10 +34,16 @@ on:
 permissions: read-all
 
 env:
-  # Pinned to the version the local git-guard commit gate runs, so CI and the
-  # pre-commit hook cannot disagree about what "clean" means. Drift between the
-  # two is how a contributor gets blocked at commit time by a rule CI never
-  # mentioned, or waved through by CI and blocked locally.
+  # Pinned to the version the local git-guard commit gate runs. NOTE that
+  # pinning the version is NOT sufficient on its own -- the RULE SELECTION has
+  # to match too, and it is easy to get wrong: ruff's default set is
+  # `E4,E7,E9,F`, which EXCLUDES E5xx, so a default `ruff check` does not report
+  # E501 line-length at all. git-guard runs `--select E,F --isolated` when a repo
+  # ships no ruff config (this one does not), so every ruff invocation below
+  # passes those same flags. Without them CI would be strictly weaker than the
+  # commit hook and would wave through code the hook blocks -- which is the exact
+  # contributor confusion this pin exists to prevent, and it was caught here only
+  # because the hook rejected a file CI would have passed.
   RUFF_VERSION: "0.16.3"
 
 jobs:
@@ -111,7 +117,7 @@ jobs:
           set -euo pipefail
           mkdir -p /tmp/lintctl
           printf 'import os\nx=1\n' > /tmp/lintctl/bad_fixture.py
-          if uvx --quiet "ruff@${RUFF_VERSION}" check --select F401 --no-cache \
+          if uvx --quiet "ruff@${RUFF_VERSION}" check --select E,F --isolated --no-cache \
                /tmp/lintctl/bad_fixture.py 2>/dev/null; then
             echo "::error::positive control FAILED - ruff reported no finding on a file" \
                  "with an unused import, so a clean result from this job proves nothing."
@@ -128,7 +134,7 @@ jobs:
             echo "no Python among the changed fork-owned files"; exit 0
           fi
           printf '  %s\n' "${files[@]}"
-          uvx --quiet "ruff@${RUFF_VERSION}" check --no-cache -- "${files[@]}"
+          uvx --quiet "ruff@${RUFF_VERSION}" check --select E,F --isolated --no-cache -- "${files[@]}"
           uvx --quiet "ruff@${RUFF_VERSION}" format --check --no-cache -- "${files[@]}"
 
       - name: shell syntax and shellcheck (changed shell only)
