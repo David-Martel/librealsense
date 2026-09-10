@@ -434,9 +434,21 @@ The discriminator is the **access pattern of the mapped buffer, not zero-copy it
 
 ### Correctness
 
-All four modes are **byte-identical**: a 164-frame `.db3` playback aligned under modes 0, 1 and 3
-produces the same SHA-256 over every aligned depth plane. Profiler self-test 32/0 and all 10 tools
-rc=0 ×3 on the zero-copy build.
+**Both** optimizations are byte-identical, checked independently — timing alone was not accepted as
+grounds for changing a default:
+
+- **align**: a 164-frame `.db3` playback under `RS2_ALIGN_ZC` modes 0, 1 and 3 produces the same
+  SHA-256 over every aligned depth plane.
+- **pointcloud**: the same playback with zero-copy **OFF** and **ON** produces the same SHA-256 over
+  every vertex buffer (164 frames, `2880dcd326d0…`). This matters more than it looks: mapped and
+  device-local memory could plausibly have taken different rounding paths, which would have made
+  −42% a silent output change rather than a win.
+
+**Reproduced on a clean artifact.** The numbers above were first measured on a build assembled
+incrementally, so they were re-taken on the canonical prefix built from merged master
+(`164f19674`, `v2.58.2-1474-g164f19674`): align p50 **0.308 ms**, pointcloud p50 **0.136 ms**,
+colorize 1.921 ms — matching to within run-to-run noise. Profiler self-test **32/0** reporting
+`BUILD_WITH_CUDA_ZEROCOPY=1`, all 10 tools rc=0 ×3, 0 duplicated globals exported.
 
 `LRS_GB10_CUDA_ZEROCOPY` now defaults **ON** in `scripts/build-dgx-spark-gb10.sh` on this evidence.
 
@@ -547,7 +559,10 @@ now measured rather than assumed. It is **not** sufficient to change fleet polic
 2. **~12 minutes is not a soak.** The June defect was intermittent, so absence over minutes is much
    weaker evidence than the original presence.
 3. Nothing here isolates *which* change fixed it — kernel, BIOS, and camera firmware all moved
-   together since June.
+   together since June. **And so did the SDK**: the June crash was 2.58.1, whereas this ramp ran
+   2.58.4 with zero-copy and the align patch. The GB10 USB mitigations (`RS2_GB10_USB_TUNING`) are
+   present in both, so the SDK is an unlikely cause — but it is a fourth uncontrolled variable and
+   should be named as one.
 
 **Recommendation: keep the single-high-rate-stream envelope until a long soak and an equivalent
 spark-0060 run agree.** What this result does justify is *scheduling* that work instead of treating
