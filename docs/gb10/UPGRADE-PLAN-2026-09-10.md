@@ -240,41 +240,75 @@ Ordered by measured value. "Gate" = what must be true before the item is called 
       and `rs-gb10-profiler --self-test` passes, before **any** re-pin (A7) is even considered.
 
 ### P0 — verification and the measurements the plan turns on
-- [ ] **A6 · Build `d976b8a08` on spark-3066** into a **new** isolated prefix
+- [x] **A6 · DONE 2026-09-10** (built `ff345476a`, not `d976b8a08` — the branch advanced). Build `d976b8a08` on spark-3066 into a **new** isolated prefix
       (`LRS_GB10_PREFIX=...-v2.58.4-...-canary`; the script's default still says `v2.58.3` and would
       collide with the PR #12 canary). Do **not** repoint `/usr/local/lib/librealsense2.so*`.
       *Gate:* this is the **first compile of every `.cu` file and of `rs-gb10-profiler`** against the
       2.58.4 API (§3.1) — it is verification, not deployment. Targets built, matching the PR #12
       canary receipt convention.
-- [ ] **A2 · A/B zero-copy as a 2×2: {RSUSB, V4L2} × {`BUILD_WITH_CUDA_ZEROCOPY` ON, OFF}** (§5.1).
-      *Gate:* pointcloud 848×480 and align depth→color, p50/p95 over ≥3 runs, against the
-      `benchmarks.md` baselines (pointcloud CUDA 0.57× NEON; align 15–19× NEON), plus output
-      byte-identity. Report concurrent host load — spark-3066 carries vLLM and CI, so numbers are
-      noisy and must be stated as such. Adopt only on a measured win.
-- [ ] **A1 · Run the R6 guarded ramp on spark-3066.** **Blocked on a coordination window (§6)** —
-      this is the multistream provocation, the only item that can wedge the controller.
-      *Gate:* ramp result recorded with kernel/driver/BIOS stamped; envelope decision written into
-      `realsense.TODO.md` either way.
+- [x] **A2 · zero-copy A/B — DONE 2026-09-10, adopted.** `benchmarks.md` §9. The runtime gate was
+      verified rather than inferred (GB10 reports `cudaDevAttrIntegrated=1`). Measured on spark-3066:
+      **pointcloud p50 0.234 → 0.135 ms (−42%)**, **align 0.321 → 0.301 ms (−6.2%)**, colorize
+      unchanged as the control, output byte-identical. `LRS_GB10_CUDA_ZEROCOPY` now defaults **ON**.
+      The V4L2 leg of the 2×2 was **not** run: `LRS_GB10_FORCE_RSUSB` already existed, but RSUSB is
+      the GB10 default for controller-safety reasons and the V4L2-only mechanism (capture buffers
+      borrowed from the V4L2 ring, `uvc-sensor.cpp`) is a separate change of risk class. Deferred,
+      not forgotten.
+      **It also produced a code optimization:** `cuda-align.cu` was never wired for zero-copy
+      upstream, and wiring it *naively* is **6.6× slower** — mapping the output puts
+      `atomic_min_uint16` on host memory over the coherence fabric. Landed as the `RS2_ALIGN_ZC`
+      ladder defaulting to inputs-only (`81068f1b4`). Rule: **map streaming reads, keep atomic or
+      scattered writes device-local.**
+- [x] ~~**A2 (original scope) · 2×2 {RSUSB, V4L2} × {ON, OFF}**~~ — superseded by the above.
+- [x] **A1 · R6 guarded ramp — DONE 2026-09-10. Controller SURVIVED; envelope NOT lifted.**
+      `benchmarks.md` §12. Two full stress sweeps (12 s and 60 s per entry) each **12/12 PASS with
+      zero kernel USB faults**, including `HEAVY_60fps_848x480_D+C+IR` which the source annotates as
+      having crashed the xHCI on 2026-06-02, plus 5/5 clean dual-stream + align runs. No reboot was
+      needed and no service was disrupted. Kernel/BIOS stamped as the gate required
+      (6.17.0-1029-nvidia, up from 6.17.0-1021 in June; BIOS 5.36_0ACUM018 — **the first GB10
+      baseline to record one at all**).
+      **Envelope decision, written both here and in `realsense.TODO.md`: KEEP the single-high-rate-
+      stream envelope for now.** The lethal class is no longer lethal *on this host*, but
+      spark-3066's camera is on a native root port while **spark-0060's is behind a hub** and is
+      unvalidated; ~12 min is not a soak against an intermittent defect; and kernel, BIOS and camera
+      firmware all moved together, so nothing isolates the cause. The result justifies *scheduling*
+      the soak and the 0060 run, not relaxing policy.
 
 ### P1 — build correctness the merge introduced
-- [ ] **A3 · A/B `-ffp-contract=off`.** Upstream `08b6d0031` added it to `CMake/unix_config.cmake`,
+- [x] **A3 · A/B `-ffp-contract=off` — DONE.** Upstream `08b6d0031` added it to `CMake/unix_config.cmake`,
       noting FMA fusion is "always on aarch64". It **does apply** to the GB10 build: the script
       passes `CMAKE_{C,CXX}_FLAGS_RELEASE`, which GCC receives *after* the base flags, and never
       re-enables contraction. Upstream traded aarch64 filter throughput for cross-toolchain
       bit-identity; that cost is unmeasured on GB10.
-      *Gate:* filter/convert p50 with and without. If the cost is real, add an opt-in
-      `LRS_GB10_FP_CONTRACT=fast` and **document the 1-LSB output delta**. Note the CUDA side is
-      unaffected (`nvcc -fmad=true` is untouched), so enabling contraction on CPU actually *narrows*
-      CPU↔GPU divergence.
-- [ ] **A4 · Test whether `4bbc18032` (`--exclude-libs` symbol hiding) closes the open RealDDS
-      duplicate static/shared symbol item** still listed in `realsense.TODO.md`.
-      *Gate:* `rs-dds-adapter` shuts down cleanly, or the item is re-scoped with evidence.
-- [ ] **A5 · Correct the stale environment facts** in `realsense.TODO.md`: CUDA is **13.2**, not 13.0;
+      **DONE 2026-09-10 — negative result, keep `off`.** `benchmarks.md` §10. Made selectable
+      (`RS2_FP_CONTRACT`, `FP_CONTRACT=` in `bench-filters.sh`) and measured: across eight
+      deterministic filter rows the cost of bit-identity is **≤2.5% and mostly under 1%**, inside
+      run-to-run noise for most rows. Both modes also reported *all variants bit-identical to the
+      scalar reference*, so GCC is not actually contracting differently across flavours here — the
+      guarantee upstream wanted is being had for free. No `LRS_GB10_FP_CONTRACT=fast` default is
+      warranted; the knob exists for future hosts. Scope note: these flags never reach device code
+      (`nvcc` defaults `--fmad=true`), so this measures **host** filters only.
+- [x] **A4 · DONE 2026-09-10 — closed.** It was the same defect as §11. Across all eight bundled
+      archives (543 global data objects, 80 of them realdds') **zero** are now exported by the `.so`
+      *and* present in an executable's dynamic symbol table: `hide_bundled_archive_symbols` covers
+      seven archives and `16382ef5c` covers `rsutils`, which that list omits. Verified beyond
+      `--help`/`--version` as the gate demanded: `rs-dds-adapter` started, allowed to reach "Start
+      listening to RS devices", then SIGINTed — **rc=0 on 3/3 runs**, on both architectures.
+- [x] **A5 · DONE** — the corrections are in `realsense.TODO.md` (CUDA 13.2, `/usr/local/cuda-13.2` exists, kernel/driver). Correct the stale environment facts in `realsense.TODO.md`: CUDA is **13.2**, not 13.0;
       `/usr/local/cuda-13.2` **exists** (the June note calls it nonexistent); kernel/driver per §4.
 
 ### P2 — deployment
 - [ ] **A7 · Re-pin fleet consumers only after A1+A2+A6.** Codex's 05:20Z bus finding already reports
       build skew (ASUS `b22` consumers vs `3b145` on both Sparks) — re-pinning into skew makes it worse.
+      **New hard requirement (`benchmarks.md` §13):** upstream 2.58.4 breaks ABI against 2.58.3
+      (issue #15617) — `RS2_EXTENSION_OBJECT_DETECTION_SENSOR` was removed from the **middle** of
+      `rs2_extension`, shifting every later value. Checked against this fleet the blast radius is
+      negligible (it sat at position 69 of 71; only the two D555/perception values shift, which the
+      D435 fleet never references), but the failure mode is silent. **A7 must rebuild every consumer
+      against the 2.58.4 headers — `pyrealsense2` and any ROS 2 node binary included — not merely
+      repoint the `.so`.** Note vigil-spark is already internally inconsistent here:
+      `ops/build_gb10_realsense.sh` builds a **2.58.3** prefix while `ops/deploy_gb10_realsense.sh`
+      defaults to **2.58.1**, and both Sparks currently resolve to the 2.58.1 prefix.
 - [ ] **A8 · Hand `ops/build_gb10_realsense.sh` / `ops/deploy_gb10_realsense.sh` deltas to the
       vigil-spark network-consolidation owner.** Those files are in a repo with active codex lanes;
       this lane does **not** write them. Needed changes: plumb `BUILD_WITH_CUDA_ZEROCOPY`, the

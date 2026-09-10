@@ -18,6 +18,10 @@ accelerated processing paths from an isolated prefix.
   any control-path `-110` timeout, with no recovery (→ reboot). **Not fixable in librealsense** — file with NVIDIA.
 - **Empirical safe envelope is SINGLE high-rate stream only.** Dual 848×480@60 killed a controller (2026-06-03);
   3-stream is lethal. The earlier "1–2 streams rock-solid" note does NOT hold for dual@60 + start/stop cycling.
+  **Superseded in part, 2026-09-10:** on kernel 6.17.0-1029-nvidia this is no longer reproducible on
+  spark-3066 — dual@60 and 3-stream both ran clean with zero kernel USB faults. The envelope is being
+  KEPT regardless, pending a soak and a spark-0060 (behind-a-hub) run. See the 2026-09-10 entry below
+  and [`docs/gb10/benchmarks.md`](docs/gb10/benchmarks.md) §12 before citing this line as current.
 - **Mitigations**: opt-in `RS2_GB10_USB_TUNING` patches P2 (deeper URB pool), P3 (usbfs advisory), P4 (gentler
   stop) reduce the *trigger* only; statically validated, not HIL-validated. **P1 eager-uvcvideo-detach and the
   udev-unbind approach were DROPPED — contraindicated** (the unbind can itself wedge the GB10 controller).
@@ -49,8 +53,27 @@ accelerated processing paths from an isolated prefix.
 - **USB topology improved.** Both D435s now negotiate **5000 Mbps**; spark-3066's sits on a **native
   xHCI root port** (`6-1`), which is the precondition PR #12 was blocked on. Cameras were physically
   swapped — all serials differ from those recorded above.
-- **The single-stream envelope is UNCHANGED until the R6 ramp is re-run.** Zero controller deaths over
-  7+ days is *not* evidence of a fix: both hosts have only run inside the safe envelope.
+- **The single-stream envelope is UNCHANGED — but the R6 ramp HAS now been re-run (2026-09-10) and
+  the controller SURVIVED.** The reasoning above was right: zero controller deaths over 7+ days was
+  not evidence of a fix, because both hosts had only ever run inside the safe envelope. So the ramp
+  was run to separate "fixed" from "never provoked".
+
+  **Result: 12/12 PASS on two full stress sweeps (12 s and 60 s per entry), zero kernel USB faults**,
+  including `HEAVY_60fps_848x480_D+C+IR` — the configuration the source annotates as having crashed
+  the GB10 xHCI on 2026-06-02 — at 59.53/60 fps on all three streams with zero gaps. Dual
+  848×480@60 + per-frame align also ran 5/5 clean. No reboot was needed; no service was disrupted.
+  The platform had moved: kernel **6.17.0-1029-nvidia** (June baseline 6.17.0-1021), BIOS
+  **5.36_0ACUM018**.
+
+  **Decision: KEEP the envelope anyway, for now.** Three reasons, and none of them is caution for
+  its own sake: (1) this is **spark-3066 only**, whose D435 is on a native xHCI root port, while
+  **spark-0060's is behind a hub** — a materially different USB topology, unvalidated; (2) ~12
+  minutes of streaming is a probe, not a soak, and the June defect was *intermittent*, so absence
+  over minutes is far weaker evidence than the original presence; (3) kernel, BIOS and camera
+  firmware all moved together, so nothing here isolates a cause that could be relied on.
+  What the result *does* justify is scheduling the soak and the spark-0060 run, instead of treating
+  multistream as permanently forbidden. Evidence:
+  [`docs/gb10/benchmarks.md`](docs/gb10/benchmarks.md) §12.
 - **Upstream v2.58.4 is merged** on `claude/upstream-2.58.4-gb10-20260910` (`d976b8a08`, zero
   conflicts). It brings `BUILD_WITH_CUDA_ZEROCOPY`, which self-gates to integrated GPUs and **does
   open on GB10** (`CU_DEVICE_ATTRIBUTE_INTEGRATED = 1`, verified). See the plan doc before enabling —
