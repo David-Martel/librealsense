@@ -56,10 +56,14 @@ WITH_IPO="${LRS_GB10_WITH_IPO:-OFF}"
 WITH_EXTERNAL_LZ4="${LRS_GB10_EXTERNAL_LZ4:-OFF}"
 FORCE_RSUSB="${LRS_GB10_FORCE_RSUSB:-ON}"
 # Upstream 2.58.4 zero-copy: cudaHostAlloc(...Mapped) frame buffers, gated at RUNTIME to
-# integrated GPUs (CU_DEVICE_ATTRIBUTE_INTEGRATED), which GB10 is. Default OFF matches upstream;
-# turn ON to build the leg that A2 measures against the NEON/CUDA baselines in docs/gb10.
-# NOT the same thing as LRS_GB10_PC_ZEROCOPY below, which is the fork's retired ladder.
-CUDA_ZEROCOPY="${LRS_GB10_CUDA_ZEROCOPY:-OFF}"
+# integrated GPUs (cudaDevAttrIntegrated). GB10 reports 1, measured, so the gate passes.
+# Default ON for GB10 because it was measured to win on spark-3066 (D435, CUDA 13.0):
+#   rs.pointcloud  p50 0.234 -> 0.135 ms   -42%
+#   rs.align       p50 0.321 -> 0.301 ms   -6.2%   (inputs mapped; see RS2_ALIGN_ZC)
+#   rs.colorize    unchanged (no CUDA path) -- the control
+# Byte-identical output, profiler self-test 32/0, all 10 tools clean. Set OFF for the
+# upstream-default leg. NOT the same as LRS_GB10_PC_ZEROCOPY below (the fork's retired ladder).
+CUDA_ZEROCOPY="${LRS_GB10_CUDA_ZEROCOPY:-ON}"
 # -ffp-contract= value. "off" is upstream's default and keeps filter output bit-identical across
 # hosts; "fast" lets aarch64 fuse multiply-add in every vector lane. A3 measures the difference.
 FP_CONTRACT="${LRS_GB10_FP_CONTRACT:-off}"
@@ -112,8 +116,10 @@ Useful environment:
                            Set OFF to validate the native Linux V4L2 backend.
   LRS_GB10_CXX_STANDARD    C++ standard for unpinned targets, default 20
   LRS_GB10_CUDA_ZEROCOPY   Upstream mapped-host-memory frame buffers
-                           (BUILD_WITH_CUDA_ZEROCOPY), default OFF. Runtime-gated to
+                           (BUILD_WITH_CUDA_ZEROCOPY), default ON -- measured
+                           pointcloud -42%, align -6.2% on GB10. Runtime-gated to
                            integrated GPUs. Distinct from LRS_GB10_PC_ZEROCOPY.
+                           Runtime knob RS2_ALIGN_ZC selects which align buffers map.
   LRS_GB10_FP_CONTRACT     -ffp-contract= value: off (default, bit-identical) | on | fast
   PYTHON_EXECUTABLE        Python ABI for pyrealsense2
   LRS_GB10_PYTHON_INSTALL_DIR

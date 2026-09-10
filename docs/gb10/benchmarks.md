@@ -35,6 +35,11 @@ Numbers marked **cited** come from dated HIL logs or docs; camera is required to
 | **Advanced single-stream HIL** (depth 848×480@60, 300 frames) | effective fps | **57.17 fps** (1 stream gap; full CUDA+pointcloud+postproc chain) | cited — HIL-RESULTS-2026-06-03.md §2 | Yes |
 | **Long soak — RSUSB clean bus** (phased single→dual→churn→quad) | controller | **GREEN, zero -110, SURVIVED** | cited — HIL-SOAK-AND-ACCEL-2026-06-03.md §1 | Yes |
 | **P7 re-acquire guard false-fire** under strict REFUSE | false-fire rate | **0 / 5 opens** (guard stays silent; never fires on a valid session) | cited — HIL-RESULTS-2026-06-03.md §P7 | Yes |
+| **CUDA zero-copy — rs.pointcloud** 848×480 (2026-09-10) | p50 ms | **0.234 → 0.135 ms (−42%)** with `BUILD_WITH_CUDA_ZEROCOPY=ON` | §9 below | Yes |
+| **CUDA zero-copy — rs.align** depth→color 848×480 (2026-09-10) | p50 ms | **0.321 → 0.301 ms (−6.2%)**, inputs mapped only | §9 below | Yes |
+| **CUDA zero-copy — align OUTPUT mapped** (2026-09-10) | p50 ms | **0.321 → 2.237 ms (+6.9×, REGRESSION)** — atomics on host memory | §9 below | Yes |
+| **`-ffp-contract=off` cost** on GB10 depth filters (2026-09-10) | relative perf | **≤2.5%, mostly <1%** — bit-identity is effectively free; keep `off` | §10 below | No |
+| **D435 codec capability** — firmware 5.17.3.10 (2026-09-10) | formats | **Y8/Y16/Z16/RGB8/RAW16/YUYV/BGRA only** — no MJPEG, no H.264/H.265, no Z16H | §11 below | Yes |
 
 ---
 
@@ -367,3 +372,122 @@ Multi-stream operations are **eyes-open** — the GB10 xHCI controller can die (
 6. **Multi-stream safety boundary.** Long soak on the clean USB-3 bus SURVIVED (HIL-SOAK-AND-ACCEL). This is NOT an envelope relaxation — four confounds changed at once, runs were ~5 minutes, and V4L2 soak data is still absent. Conservative single-stream guidance remains for anything that must not fail.
 
 7. **ROS2 0x0300 root cause.** The minimal-config fix is proven (4/4 PASS); H1 (manual-exposure-under-AE write) is REFUTED. The actual cause is a combination of node-default parameter overrides that cannot be isolated to a single variable with the current A/B runs. A follow-on 2^N parameter-subset scan is deferred.
+
+
+---
+
+## 9. CUDA zero-copy on GB10 — measured 2026-09-10
+
+**Not comparable to the June rows above without care.** Different SDK (**2.58.4**, not 2.58.1) and
+different camera firmware (**5.17.3.10**, not 5.15.1.55). Every number in this section was measured
+in one session on `spark-3066` with CUDA 13.0, so the ON/OFF comparisons within it are internally
+valid; comparisons against June's absolute figures are not.
+
+### The runtime gate does pass
+
+`BUILD_WITH_CUDA_ZEROCOPY` allocates frame buffers with `cudaHostAlloc(cudaHostAllocMapped)` and is
+gated at runtime on `cudaDevAttrIntegrated`. That GB10 satisfies this was **measured, not assumed**:
+
+```
+device            : NVIDIA GB10 (sm_121)
+INTEGRATED        : 1        <- the gate librealsense uses
+canMapHostMemory  : 1     pageableMemAccess : 1
+concurrentManaged : 1     usesHostPageTables: 1
+```
+
+### Results — D435 848×480, 200–400 frames per leg
+
+| Op | zero-copy OFF | zero-copy ON | Δ |
+|---|---:|---:|---|
+| `rs.pointcloud` (p50) | 0.234 ms | **0.135 ms** | **−42%** |
+| `rs.align` depth→color (p50) | 0.321 ms | **0.301 ms** | **−6.2%** |
+| `rs.colorize` (p50) — control, no CUDA path | 1.952 ms | 1.943 ms | ~0 |
+
+align was measured over 400 frames × 3 alternating runs per leg to cancel scene and thermal drift;
+p95 also improved (0.367 → 0.334 ms).
+
+### The important part: zero-copy is NOT uniformly a win
+
+`cuda-align.cu` was not wired for zero-copy upstream. Wiring it naively made align **6.6× slower**.
+The per-buffer ladder (`RS2_ALIGN_ZC`, added in this session) isolates why:
+
+| Mode | What maps | p50 |
+|---|---|---:|
+| 0 | nothing (upstream staging) | 0.321 ms |
+| **1** | **inputs only — default** | **0.301 ms** |
+| 2 | output only | 2.237 ms (**+6.9×**) |
+| 3 | inputs and output | 2.195 ms (**+6.8×**) |
+
+The discriminator is the **access pattern of the mapped buffer, not zero-copy itself**:
+
+- Reads of the depth/colour planes are streaming and coalesced → serving them from mapped host
+  memory costs almost nothing and saves a full-frame H2D.
+- `kernel_depth_to_other` resolves occlusion with `atomic_min_uint16`. **Atomics against host memory
+  over the coherence fabric are dramatically slower than against device-local memory.** Keeping the
+  output in device memory and paying one D2H is far cheaper.
+- `cuda-pointcloud.cu` writes its output with no atomics — one point per thread — which is why
+  upstream's mapping of *its* output is a 42% win rather than a regression.
+
+**Generalisable rule for GB10: map streaming reads, keep atomic or scattered writes device-local.**
+"Unified memory means copies are free" is wrong here, and by a factor of ~7.
+
+### Correctness
+
+All four modes are **byte-identical**: a 164-frame `.db3` playback aligned under modes 0, 1 and 3
+produces the same SHA-256 over every aligned depth plane. Profiler self-test 32/0 and all 10 tools
+rc=0 ×3 on the zero-copy build.
+
+`LRS_GB10_CUDA_ZEROCOPY` now defaults **ON** in `scripts/build-dgx-spark-gb10.sh` on this evidence.
+
+---
+
+## 10. `-ffp-contract` — measured 2026-09-10, camera-free
+
+Upstream `08b6d0031` hard-coded `-ffp-contract=off` for bit-identical filter output. On aarch64
+every NEON lane has a fused multiply-add, so the question is what that bit-identity costs. Made
+selectable (`RS2_FP_CONTRACT` / `FP_CONTRACT=` in `bench-filters.sh`) and measured, 300 iterations:
+
+| Filter (1280×720, deterministic rows) | `off` | `fast` | Δ |
+|---|---:|---:|---|
+| threshold scalar/autovec | 1.5686 | 1.5405 | −1.8% |
+| threshold neon | 0.2861 | 0.2856 | −0.2% |
+| disparity scalar/autovec | 1.3003 | 1.3063 | +0.5% |
+| disparity neon | 0.2600 | 0.2599 | ~0 |
+| temporal scalar/autovec | 4.2597 | 4.2433 | −0.4% |
+| temporal neon | 0.9050 | 0.8824 | −2.5% |
+| decimation scalar/autovec | 2.0602 | 2.0565 | −0.2% |
+| spatial-hv scalar/autovec | 15.7042 | 15.6897 | −0.1% |
+
+**Verdict: keep `off`.** The cost is ≤2.5% and mostly under 1% — inside run-to-run noise for most
+rows — so there is nothing to buy by giving up bit-identity. Both modes also reported *all variants
+bit-identical to the scalar reference*, so on these filters GCC does not actually contract
+differently across flavours; the guarantee upstream wanted is being had for free.
+
+The OpenMP rows are excluded from the comparison: they swing far more than the effect size
+(e.g. temporal neon+omp 0.393 vs 0.213 ms) because of thread scheduling, not contraction.
+
+**Scope:** this measures **host** filter code only. `-ffp-contract` in `CMAKE_C/CXX_FLAGS` never
+reaches device code — `nvcc` defaults to `--fmad=true`, so the CUDA kernels already fuse regardless.
+
+---
+
+## 11. D435 codec capability — measured 2026-09-10
+
+The question was whether the camera can compress on-device (H.264/H.265/smarter depth coding) to
+relieve the USB link. **It cannot.** Firmware **5.17.3.10** advertises only:
+
+```
+Y8   Y16   Z16   RGB8   RAW16   YUYV   BGRA
+```
+
+No MJPEG, no H.264, no H.265, no Z16H. The D4 ASIC has no video encoder, so **compression cannot
+come from firmware on this camera** — it must be host-side on GB10 (NVENC/NVDEC), which the June
+NVENC rows above already characterise (h264_nvenc cq=23 → 10.9× real-time, 39.14 dB XPSNR-Y).
+
+This also means the USB link carries raw frames, and the binding constraint is the **xHCI
+controller defect, not bandwidth**: 848×480 Z16@60 ≈ 49 MB/s plus 1080p YUYV@30 ≈ 124 MB/s sit well
+inside USB 3.2 Gen 1.
+
+**Caveat for any depth-compression work:** H.264/HEVC are 8-bit-luma codecs and quantise 16-bit Z16
+destructively. Encoding depth needs either a plane-split into two 8-bit channels or a lossless /
+Main12 HEVC profile. That is a real experiment, not a settled result, and is not claimed here.
