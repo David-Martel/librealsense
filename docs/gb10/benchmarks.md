@@ -1202,3 +1202,121 @@ otherwise disturbed, which has not been done.
 
 **Operational status:** spark-0060's RealSense is unavailable until the host is power-cycled.
 spark-3066 is unaffected and still streaming.
+
+## §20 Fleet clock topology — where PTP can and cannot go (2026-09-10)
+
+Jitter work (§18) established that the SDK is not the jitter source and that the two
+imagers are hardware-synchronised to ~24 us *within one camera*. The next question is
+different and is a fleet property, not an SDK one: can two cameras on two hosts be put
+on a common time base tight enough that a fused view is not itself a jitter source?
+
+That is a PTP question, and on this fleet it is answered by **hardware**, before any
+switch configuration is considered. Measured with `ethtool -T`, `ls /dev/ptp*`,
+`ethtool -i`, and `lldpctl` on all three hosts.
+
+### 20.1 PTP hardware clocks, per host
+
+| Host | `/dev/ptp*` | Interfaces with a PHC |
+|---|---|---|
+| asuspro13 | ptp0..2 | `enp86s0` (ptp0), `enp85s0` (ptp2) |
+| spark-0060 | ptp0..3 | `enp1s0f0np0`, `enp1s0f1np1`, `enP2p1s0f0np0`, `enP2p1s0f1np1` |
+| spark-3066 | ptp0..3 | the same four |
+
+All four Spark PHCs belong to the **ConnectX-7** ports. `linuxptp` is installed on no
+host — `ptp4l`, `phc2sys` and `pmc` are all absent fleet-wide. `chrony.service` is
+enabled on both Sparks, so the system clock is currently NTP-disciplined.
+
+### 20.2 The switch-facing path has no hardware timestamping at all
+
+`enP7p1s0` is the interface carrying the 10 GbE segment on both Sparks — the default
+route, the `192.168.50.x/32` address, and the `10.60.4.0/29` host-to-host segment. It
+is a **Realtek `r8127`** (driver 11.014.00-NAPI, 10000Mb/s full duplex) and it reports
+`PTP Hardware Clock: none` with zero hardware-transmit timestamp modes. asuspro13
+reaches both Sparks over `enxf44dad092514`, a **USB** NIC holding `10.60.0.1`,
+`10.60.1.1`, `10.60.2.1` and `10.60.4.1` — also no PHC.
+
+So there is no hardware-timestamp path between asuspro13 and either Spark, in either
+direction, on any address. That conclusion does not depend on the switch.
+
+### 20.3 The switch is unmanaged, and LLDP is how we know
+
+`lldpctl` on spark-0060 reports exactly one neighbour on `enP7p1s0`: **spark-3066**
+(ChassisID `4c:bb:47:7d:30:66`, SysName `spark-3066`). From spark-3066 the neighbours
+on the same interface are **spark-0060** and **asuspro13**. No switch chassis appears
+from either side.
+
+A managed switch runs an LLDP agent and announces itself as a chassis on every port.
+Seeing only the far-end *hosts* means the device between them does not participate in
+LLDP — it forwards the frames rather than terminating them. That is an unmanaged
+switch, which by construction offers **no IEEE 1588 boundary clock and no transparent
+clock**: PTP event messages cross it as ordinary traffic and accumulate uncorrected
+queuing delay.
+
+This is worth stating precisely because the intuitive question — "does the switch
+support PTP?" — is not the binding constraint. Even a switch with full 1588 support
+would not help here, because §20.2 means neither endpoint on that segment can stamp a
+packet in hardware.
+
+### 20.4 Where PTP *can* work: the ConnectX-7 fabric, which has no switch in it
+
+The four `10.55.15{2,3,4,5}.0/24` links are **direct Spark-to-Spark** QSFP connections
+(`.1` = spark-0060, `.2` = spark-3066), MTU 9000 on the `f0np0` pair. Both ends are
+ConnectX-7 ports with a PHC and hardware transmit and receive timestamping, and there
+is no switch between them to add uncorrected residence time.
+
+That is the one path on this fleet where PTP has both prerequisites. The measurement
+to run — deliberately **non-disruptive**, so it can be done on a production host — is
+`ptp4l` master on one Spark and slave on the other, **PHC-only**: no `phc2sys`, chrony
+untouched, system clock untouched. Read `master offset` from `ptp4l -m` and report
+p50/p99/max in ns, the same tail-first way §18 reports frame delivery. That answers
+"how good is the achievable common time base" without perturbing either host's
+timekeeping.
+
+Only if that number justifies it does the disruptive question arise, and it should be
+answered deliberately: `chronyd` and `phc2sys` both discipline the system clock and
+must not both run. chrony 4.x can consume the PHC as a `refclock`, which is the less
+invasive integration than handing the system clock to `phc2sys`.
+
+**Not yet measured.** The ptp4l run needs both Sparks, and spark-0060 was down at the
+time of writing (§21).
+
+### 20.5 What this means for multi-camera fusion
+
+Within one camera, depth and colour are hardware-synced (§18.1, skew p50 = p99 =
+0.024 ms) and need no network time at all. Across hosts, the achievable bound is set
+by §20.4, and until it is measured, **cross-host frame stamps should not be treated as
+comparable at sub-millisecond resolution** merely because `GLOBAL_TIME_ENABLED` puts
+them all on a host wall clock — that clock is NTP-disciplined per host, which is the
+wrong order of magnitude for frame-level fusion.
+
+## §21 spark-0060 did not return from a warm reboot (2026-09-10)
+
+§19 recorded that the xHCI host controller on spark-0060 died mid-capture and that
+unbind/rebind fails `-110` three ways, leaving a host power cycle as the only recovery.
+The reboot was authorised and performed at 17:19Z, CI having been drained first
+(`Runner.Worker` = 0 on both hosts).
+
+**It did not come back.** Unreachable for 15+ minutes on all eight known addresses:
+LAN `192.168.50.86`, tailnet `100.64.0.4`, both `/30` p2p addresses, and all four
+ConnectX-7 QSFP addresses. The QSFP paths were probed **from spark-3066**, which rules
+out an asuspro13-side or single-segment fault.
+
+Three facts that make this expensive, and that should be recorded before the next
+person plans a fleet reboot:
+
+- **Neither Spark has a BMC.** `ls /dev/ipmi*` returns nothing on both. A warm
+  `systemctl reboot` is therefore the *only* remote lever, and there is no remote
+  power-on. A Spark that does not come back needs hands.
+- **Wake-on-LAN does not recover it.** A magic packet to `4c:bb:47:7d:00:60`, sent on
+  the shared `10.60.4.0/29` segment from asuspro13, produced no response. WoL answers a
+  powered-down NIC, not a host wedged in firmware.
+- **A dead host controller plausibly wedges POST.** The same fault that killed
+  `xhci-hcd NVDA8000:00` is a candidate cause of the failure to boot, so this is not
+  necessarily a second, independent problem.
+
+**Operational rule this establishes: never reboot the second Spark while the first is
+down.** With no BMC on either, doing so puts the entire Spark fleet behind physical
+access. spark-3066's reboot was held for exactly this reason and remains held until
+0060 returns — which inverts the original "sequential reboot" plan's ordering
+assumption. Sequential means *verify, then proceed*, and a host that never returns is
+not a verification that permits proceeding.
