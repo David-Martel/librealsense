@@ -1,0 +1,124 @@
+# Campaign plan — fleet re-pin, envelope removal, 720p soak (2026-09-10)
+
+**Authorization.** The account owner explicitly directed, in one message: do the fleet re-pin and
+rebuild; do **not** push or file anything to upstream librealsense; ditch the envelope and test both
+Sparks against each other; check for newer firmware and update if beneficial; soak 720p at the
+highest achievable frame rate; identify modes better suited to vigil-spark (latency, bandwidth,
+deployment simplicity, segmentation/clustering/rendering); research ROS 2 / CycloneDDS / networked
+topologies / compiler acceleration; produce this plan and then implement it.
+
+This supersedes three self-imposed gates from earlier today: **A7 was gated** (now authorized),
+**A10 upstream filing was pending authorization** (now permanently CANCELLED — drafts stay local),
+and **"do not touch vigil-spark"** (now scoped-open for the two `ops/` pin scripts only).
+
+---
+
+## Findings that reshape the plan (established before execution)
+
+### F1 — 720p on a D435 is capped at 30 Hz in hardware
+
+`rs-enumerate-devices` on spark-3066, firmware 5.17.3.10:
+
+| Stream | 1280×720 | next tier up in rate |
+|---|---|---|
+| Depth Z16 | **30**/15/6 Hz | 848×480 @ 90 Hz |
+| Color RGB8/BGR8/RGBA8/BGRA8/YUYV | **30**/15/6 Hz | 960×540 @ 60 Hz |
+| Infrared 1/2 Y8 | **30**/15/6 Hz | 848×480 @ 90 Hz |
+
+There is no 720p mode above 30 Hz on this SKU, so "720p at the highest framerate possible" resolves
+to **1280×720 @ 30 Hz**, and no host-side change can raise it. What host-side work *can* deliver is
+**sustaining all four streams at 720p30 concurrently, indefinitely, with zero drops and zero xHCI
+faults** — a config heavier on the wire than the June killer (848×480@60 D+C+IR). That is the soak.
+
+**960×540 @ 60 Hz** is the answer if vigil-spark ever needs >30 fps at 16:9; it is recorded as a
+mode recommendation, not as a substitute for the 720p soak.
+
+### F2 — the fleet is already on the newest published firmware; there is nothing to flash
+
+Both cameras report **5.17.3.10**. The vendor's D400 firmware release page lists 5.17.3.10 (June
+2026, SDK 2.58.1) as the newest release for the D435, with 5.17.0.10 before it. The newer version
+constants that appear in the SDK source are **not** D435-USB releases:
+
+| Constant in source | Gate | Applies to our D435 (`8086:0b07`)? |
+|---|---|---|
+| `5.17.4.13` (`d400-device.cpp:777`, `d400-color.cpp:374`) | `_is_mipi_device && _pid == RS401_GMSL_PID` | no — GMSL/MIPI only |
+| `5.17.3.151` (`d400-factory.cpp:100`) | D401 GMSL dual-RGB | no |
+| `5.17.3.15` (`d400-color.cpp:217`) | `_is_mipi_device` + d4xx driver ≥ 1.0.4.9 | no |
+| `5.17.3.13` (`d400-device.cpp:1049`) | `RS2_OPTION_READOUT_SHAPING`, pid ∈ {D405, D455, D457, **D435i**, D401-GMSL} | no — plain D435 is not in the list |
+| `5.17.3.20` (`d400-device.cpp:948`) | depth AE mode, global-shutter, non-D455 SKUs | **would apply**, but no such image is published |
+
+Two of these are worth recording as *wanted* features rather than available ones:
+`READOUT_SHAPING` ("higher slows readout to avoid dropped frames") is precisely the knob a 720p
+all-stream soak would want, and it is unavailable on this SKU at any firmware; depth AE mode needs
+5.17.3.20, which is not downloadable.
+
+**Decision: no flash.** Flashing is a double USB re-enumeration through DFU, and on GB10 a
+re-enumeration is the documented trigger surface for controller-death #2. Taking that risk to
+install the version already installed is strictly negative. The "power cycle the ports and restart"
+step therefore reduces to restarting the affected services, which the re-pin does anyway.
+
+### F3 — the envelope is documentation and script defaults, not a code guard
+
+`grep -rn envelope src/` finds no refusal path; the only runtime guard near it is
+`RS2_GB10_REFUSE_REACQUIRE` (`src/usb-tuning.h:199`), which is about re-acquiring a device, not
+stream count, and is advisory by default. The envelope lives in `docs/gb10/*`, `scripts/gb10/README.md`,
+and the `ros2-launch-depth-{only,minimal}.sh` profiles. Removing it is a documentation and
+launch-profile change, gated on the soak below — not a code change.
+
+### F4 — the two Sparks are not topologically equivalent, and the difference is the right control
+
+| | spark-3066 | spark-0060 |
+|---|---|---|
+| sysfs path | `6-1` | `2-1.1` |
+| upstream of the camera | root port directly | `2109:0211` VIA Labs "USB3.0 Hub", 1 downstream port |
+| xHCI controller | `NVDA8000:02` (bus 6) | `NVDA8000:00` (bus 2) |
+| root port rate | 20 Gbps (`20000M/x2`) | 20 Gbps (`20000M/x2`) |
+| negotiated device rate | 5 Gbps SuperSpeed | 5 Gbps SuperSpeed |
+
+The account owner states 0060's camera is "connected to the spark-bus", not behind a hub. The sysfs
+chain does show a VIA Labs VL2109 between the root port and the camera. Both readings are recorded
+here without adjudicating whether that hub is on the mainboard, in a captive cable, or in an
+adapter — it was not opened or traced physically. **The practically important facts are that both
+cameras negotiate the same 5 Gbps SuperSpeed link, so the bandwidth ceiling is identical, and that
+they hang off different xHCI controller instances** — which is the variable that matters for a
+controller-death defect and is what the two-host comparison actually controls for.
+
+Earlier notes calling 0060 "behind a hub, therefore unvalidated" over-weighted the hub and
+under-weighted the controller instance. Corrected here.
+
+---
+
+## Plan
+
+Ordered so that firmware/hardware state is settled before measurement, and the re-pin validates a
+**soaked** artifact rather than preceding the soak.
+
+| # | Item | Host | Gate to proceed |
+|---|---|---|---|
+| **B1** | Bus claims + stop-notice for the unit holding 0060's camera | — | posted, no objection |
+| **B2** | Firmware inventory and decision | both | **done — F2, no flash** |
+| **B3** | Add 720p entries to `rs-gb10-stress-matrix.py`; commit | repo | matrix runs headless |
+| **B4** | 720p30 D+C+IR1+IR2 short baseline | 3066 | streams start, fps ≥ 29 |
+| **B5** | **≥60 min soak** at 720p30 all-streams, kernel tripwire armed, in tmux | 3066 | 0 faults, 0 drops |
+| **B6** | Same ladder on 0060 after stopping the fleet unit | 0060 | 0 faults; compare to B5 |
+| **B7** | Consumer inventory by `ldd`, not grep — every binary linking `librealsense2.so.2.58` | both | list is complete |
+| **B8** | Rebuild consumers against 2.58.4 (`realsense2_camera` + `pyrealsense2`) | both | build clean |
+| **B9** | vigil-spark PR: bump `ops/build_gb10_realsense.sh` (2.58.3→2.58.4) and `ops/deploy_gb10_realsense.sh` (2.58.1→2.58.4) | vigil-spark | claimed, no objection |
+| **B10** | Flip `/usr/local/lib/librealsense2.so` to the 2.58.4 prefix | both | B5+B6+B8 pass |
+| **B11** | Restart the 0060 fleet unit with its recorded `ExecStart`; verify topics stream | 0060 | `ros2 topic hz` healthy |
+| **B12** | ROS 2-level soak on the rebuilt node | 3066 | 0 faults |
+| **B13** | Retire the envelope in docs + launch profiles | repo | B5+B6+B12 pass |
+| **B14** | Modes / ROS 2 / Cyclone / compiler research → measured recommendations | — | runs during B5/B6 |
+
+### Rollback
+
+Every prefix is side-by-side under `/opt/vigil/opt/`; the 2.58.1 prefix is untouched throughout, so
+B10 is reverted by pointing the symlink back. Firmware is not modified, so there is no firmware
+rollback to plan. The 0060 fleet unit's full `ExecStart` is recorded in the bus claim and in B11.
+
+### Explicitly out of scope
+
+- Any push, issue, or PR to upstream librealsense — permanently cancelled by direction.
+- Host reboots. If an xHCI controller wedges and a driver-level rebind does not recover it, that is
+  a stop-and-ask, not a reboot.
+- Any vigil-spark file other than the two `ops/` pin scripts.
