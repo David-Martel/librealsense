@@ -338,10 +338,19 @@ Default feature set:
 - Reboot once to apply the installed kernel command-line power settings, then
   repeat the visible and no-render profiler runs.
 - Keep CUDA architecture `121`; the GB10 configure/build path accepted it.
-- Keep `LRS_GB10_CXX_STANDARD=20` for GB10 experiments unless a downstream
-  wrapper shows an ABI or source-compatibility issue. If production stability is
-  prioritized over toolchain modernization, rebuild with
-  `LRS_GB10_CXX_STANDARD=14` and keep only `rs-gb10-profiler` on C++20.
+- ~~Keep `LRS_GB10_CXX_STANDARD=20` for GB10 experiments unless a downstream
+  wrapper shows an ABI or source-compatibility issue.~~ **RESOLVED 2026-09-10 — the
+  trigger this item anticipated has fired, and the default is now `14`.** Against
+  upstream 2.58.4, building the unpinned targets at C++20 produces an **exit-time
+  double free in every tool** (`rs-enumerate-devices --version` -> rc=134). Measured
+  on spark-3066, single variable, same commit/host/script/CUDA:
+  C++20 -> `.so` exports 158 json syms / exe carries 157 -> **crash**;
+  C++14 -> 159 / 62 -> **clean**. `rs-gb10-profiler` pins `CXX_STANDARD 20` on its own
+  target and self-tests 32/32 — so the outcome is exactly the fallback this item
+  described ("keep only `rs-gb10-profiler` on C++20"). This was **not** a
+  stability-over-modernization trade: C++20 had no measured win, and the cost was an
+  abort in every tool. Full evidence:
+  [`docs/gb10/UPGRADE-PLAN-2026-09-10.md`](docs/gb10/UPGRADE-PLAN-2026-09-10.md) §11.
 - Keep `LRS_GB10_WITH_IPO=OFF` for now. LTO should only be enabled after a clean
   A/B benchmark because pybind/CUDA builds are more sensitive to link-time
   optimization and no measured win has been shown yet.

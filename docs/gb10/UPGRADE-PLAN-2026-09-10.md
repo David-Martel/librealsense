@@ -49,7 +49,8 @@ files. The code splits into six coherent groups:
 **Build framework:** `scripts/build-dgx-spark-gb10.sh` (isolated prefix under `/opt/vigil/opt/`,
 never touching `/usr/local` directly), driven by a repo-root `justfile`. Defaults: RSUSB backend,
 `BUILD_WITH_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=121`, `-O3 -march=armv9.2-a+sve2+bf16+i8mm
--mtune=neoverse-v2`, NEON, OpenMP, sccache, DDS on, IPO off.
+-mtune=neoverse-v2`, NEON, OpenMP, DDS on, IPO off, **`CXX_STANDARD=14` (was 20 — changed in this
+work; see §11)**, and **host-only compile caching (`CUDA_LAUNCHER=none` — see §11 note on sccache)**.
 
 ---
 
@@ -102,10 +103,11 @@ Both Sparks, non-destructive probes only.
 | NVIDIA driver | 595.84 | 595.84 | 580.159.03 |
 | BIOS | `5.36_0ACUM018` (2025-08-06) | `5.36_0ACUM018` (2025-08-06) | **never recorded** |
 | CUDA toolkit | — | **13.2** (`/usr/local/cuda` → `cuda-13.2`) | doc says 13.0 |
-| D435 serial | `404543020690` | `344223022564` | `346522072418` |
+| D435 serial (USB descriptor) | `404543020690` | `344223022564` | `346522072418` |
 | Link speed | **5000 Mbps**, but **behind a hub** (`2-1.1`) | **5000 Mbps, native root port `6-1`** | USB 2.1 (PR #12) |
 | Camera state | **HELD** by PID 1139440 in live `vigil_c2` | **idle** (`Driver=[none]`) | — |
 | D435 firmware | — | **5.17.3.10** | 5.13.0.55 |
+| D435 serial (SDK-reported) | — | `347622075921` | — |
 | Controller deaths since boot | **0** (7d14h) | **0** (7d13h) | 3 reproductions in June |
 | USB disconnects since boot | 0 | 1 | — |
 
@@ -427,6 +429,13 @@ same commit, with the same script and the same CUDA. **The only variable was
 C++14 collapses the executable's local json symbols 157 → 62 — back to the 2.58.1/2.58.3 figure — and
 the crash disappears. **Hypothesis confirmed.**
 
+**State the causality precisely, because both halves are required.** Upstream's `--exclude-libs`
+change is the **necessary** condition — 2.58.3 at C++20 was clean, so C++20 alone never crashed. The
+fork's C++20 default is the **sufficient trigger on top of it** — 2.58.4 at C++14 is clean, so
+upstream's change alone does not crash either. Neither party's change is wrong by itself; the
+combination is. That is exactly why the upstream report (fix option 2) is worth filing *and* why
+changing our default is the correct immediate fix.
+
 **Fixed:** `scripts/build-dgx-spark-gb10.sh` now defaults `CXX_STANDARD` to **14**, with the
 measurement recorded inline so the next person does not re-litigate it. `rs-gb10-profiler` pins
 `CXX_STANDARD 20` on its own target and is unaffected — which is precisely the arrangement
@@ -437,8 +446,30 @@ The upstream-facing half of the problem still stands and is worth reporting: **a
 builds tools at a different `-std` than the library will hit this, because `--exclude-libs` makes the
 duplicate global object reachable. That is fix option 2 below and does not block the fleet.
 
-Until A0 is confirmed on a rebuilt canary, **do not re-pin any fleet consumer to 2.58.4.** Both
-Sparks' `/usr/local/lib/librealsense2.so*` still resolve to the 2.58.1 prefix and were not touched.
+### 11.2 A0 gate — met in full
+
+Run against the fixed prefix. **No rebuild was needed: `-cxx14-probe` *is* the fixed configuration.**
+
+| Check | Result |
+|---|---|
+| `rs-gb10-profiler --self-test` | **`checks=32 failures=0`, rc=0** |
+| `rs-enumerate-devices --version` | rc=0, clean |
+| `rs-fw-update`, `rs-dds-adapter`, `rs-dds-config` | rc=0, clean stderr — the fix is not per-binary |
+
+The profiler is the strongest evidence: it pins `CXX_STANDARD 20` on its own target and links the same
+library, yet is clean. So **per-target C++20 is fine; only the global default mattered.** Its
+provenance also confirms the build is the intended one: `BUILD_WITH_CUDA=1`,
+`FORCE_RSUSB_BACKEND=1`, `RS2_GB10_USB_TUNING=1`, `RS2_GB10_CONV_CACHE=1`, `RS2_GB10_PC_ZEROCOPY=0`.
+
+> ### Which prefix is which — read before deploying anything
+> Two 2.58.4 prefixes now exist on spark-3066 and **the names do not tell you which is good**:
+> - `librealsense-v2.58.4-dgx-spark-gb10-canary` — **BROKEN**, built at the old C++20 default. Delete
+>   it before someone mistakes the word "canary" for "candidate."
+> - `librealsense-v2.58.4-gb10-cxx14-probe` — **GOOD**, the fixed configuration. This is what A7 should
+>   point at, ideally rebuilt under a clean `-canary` name once the broken one is removed.
+
+Until A7 is deliberately performed, **no fleet consumer is re-pinned to 2.58.4.** Both Sparks'
+`/usr/local/lib/librealsense2.so*` still resolve to the 2.58.1 prefix and were not touched.
 
 ### Fix options, in order of preference
 
