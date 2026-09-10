@@ -108,7 +108,16 @@ BUILD_UNIT_TESTS="${LRS_GB10_BUILD_UNIT_TESTS:-OFF}"
 # To fall back to system OpenCV, point at a path that does not exist:
 #   LRS_GB10_OPENCV_DIR=/dev/null/no-opencv  scripts/build-dgx-spark-gb10.sh configure
 # (An empty string restores the default due to bash :- substitution semantics.)
-LRS_GB10_OPENCV_DIR="${LRS_GB10_OPENCV_DIR:-/opt/gb10-cuda/install/opencv}"
+# Default changed 2026-09-10 from /opt/gb10-cuda/install/opencv to the fleet's single
+# canonical OpenCV. The old prefix is a 10-module partial build, and -- the reason this
+# matters beyond module count -- it is compiled against DIFFERENT CUDA versions on the two
+# Sparks: 13.0 on spark-3066 and 13.2 on spark-0060. That inversion is what forced a
+# per-host CUDA_HOME pin, because wrappers/opencv/CMakeLists.txt:5 hard-fails when the SDK's
+# CUDA does not match the one OpenCV was built with. /opt/opencv-cuda-4.14.0 is now built
+# from one recipe against CUDA 13.2 on BOTH hosts (vigil-spark ops/build_opencv_cuda.sh),
+# with cuDNN, OpenGL, TBB and a working cudacodec, so the same CUDA_HOME works everywhere
+# and the per-host pin is retired.
+LRS_GB10_OPENCV_DIR="${LRS_GB10_OPENCV_DIR:-/opt/opencv-cuda-4.14.0}"
 MODE="all"
 
 usage() {
@@ -163,7 +172,7 @@ Useful environment:
                            build passes -DOpenCV_DIR to that directory so the CV
                            examples and wrappers (cv-helpers, depth-quality, KinFu)
                            link the CUDA OpenCV instead of the stock Ubuntu 4.6.0.
-                           Default: /opt/gb10-cuda/install/opencv (the GB10 CUDA
+                           Default: /opt/opencv-cuda-4.14.0 (the fleet's single CUDA
                            media stack built by the gb10-cuda Codex session).
                            To skip and fall back to whatever CMake finds on the
                            system, point at a non-existent path (bash :- means
