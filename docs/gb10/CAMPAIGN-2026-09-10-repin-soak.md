@@ -86,6 +86,40 @@ controller-death defect and is what the two-host comparison actually controls fo
 Earlier notes calling 0060 "behind a hub, therefore unvalidated" over-weighted the hub and
 under-weighted the controller instance. Corrected here.
 
+### F5 — the consumer surface is one matched pair, so the ABI gate was over-stated
+
+B7 was run as an `ldd` sweep rather than a source grep, over `~/dev/releases/**`, `/opt/vigil/**`,
+`/usr/local/lib` and the vigil-spark checkout on both Sparks. Results:
+
+- **No ROS 2 `realsense2_camera` node exists on either Spark.** vigil-spark drives the camera through
+  `pyrealsense2` directly (`realsensenode.py`), not through the official ROS wrapper. So there is no
+  separately-compiled C++ consumer to re-link.
+- **The only thing linking `librealsense2` is `pyrealsense2` — and the copy that actually loads lives
+  *inside the prefix itself*.** Confirmed against the live process on spark-0060 (`/proc/<pid>/maps`):
+  it has `…/librealsense-v2.58.1-dgx-spark-gb10/lib/librealsense2.so.2.58.1` and that same prefix's
+  `pyrealsense2…so.2.58.1` mapped, selected by `PYTHONPATH` + `LD_LIBRARY_PATH`.
+
+That last point is what shrinks A7. The mid-enum removal in 2.58.4 can only bite when two
+*separately compiled* modules disagree about an enum's integer value. Here the binding and the
+library are built together, shipped together in one prefix, and selected together by one pair of
+environment variables — they cannot disagree. Re-pinning swaps a **matched pair** for a matched pair.
+
+Two corollaries:
+
+- **The real pin is `/etc/profile.d/vigil-realsense-gb10.sh`**, written by vigil-spark's
+  `ops/deploy_gb10_realsense.sh` (`PREFIX_DEFAULT` at line 25), which sets `PYTHONPATH` and
+  `LD_LIBRARY_PATH`. `/usr/local/lib/librealsense2.so` is a secondary alias, not the mechanism the
+  running node uses. Earlier notes in this repo that framed the re-pin as "flip
+  `/usr/local/lib/librealsense2.so`" named the wrong lever; flipping only that would leave the node
+  on 2.58.1.
+- **`vigil-spark/qobi/pyrealsense2/` is dead weight and cannot load at all.** Its active symlinks
+  select 2.57.4 bindings whose `DT_NEEDED` is `librealsense2.so.2.57`, and no such library exists
+  anywhere on either Spark (`ldconfig -p` count 0, filesystem search empty) — `ldd` reports
+  `librealsense2.so.2.57 => not found`. Its own `PROVENANCE.md` already calls it "a temporary
+  compatibility bridge" and directs new work at a reproducible build from this fork. It is not on
+  the live worker's `PYTHONPATH`, so nothing is broken today; it is a trap for whoever adds it.
+  Flagged to the vigil-spark owner, not deleted from here.
+
 ---
 
 ## Plan
