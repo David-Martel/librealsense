@@ -19,6 +19,16 @@ So this tool is deliberately conservative:
   * it refuses to apply while co-tenants are running unless forced, because
     these settings are not scoped to the caller
   * every write is READ BACK and reported as applied / ignored / failed
+  * it disables only the `--idle-depth` DEEPEST idle states (default 1) and
+    never state0, instead of every state on every core
+  * it ARMS A HOST-SIDE DEADMAN before the first write and REFUSES to apply if
+    that fails, so recovery never depends on this session surviving
+
+The last two exist because the first version of this profile took spark-3066
+off the network inside two minutes and cost a physical power cycle: it disabled
+every idle state on every core at once while also raising the GPU clock floor,
+and its revert lived in a shell EXIT trap on the machine that stopped
+executing. docs/gb10/benchmarks.md 22 records the measurement.
 
 That last point is the important one. Several of these interfaces accept a
 write and silently do nothing -- and this fleet has already shipped one false
@@ -48,6 +58,7 @@ import glob
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -213,10 +224,53 @@ def detect_co_tenants() -> list[str]:
 # --------------------------------------------------------------------------
 
 
-def plan_determinism() -> list[tuple[str, str, str]]:
+def _cpuidle_states_by_cpu() -> dict[str, list[tuple[int, str]]]:
+    """Map cpu -> [(state_index, disable_file), ...] sorted shallow to deep.
+
+    cpuidle numbers states by increasing exit latency: state0 is the shallowest
+    (cheapest to leave, saves least power) and the highest index is the deepest.
+    Latency determinism is hurt by the DEEP states, so those are the ones worth
+    disabling -- and they are also the expensive ones to remove, because a core
+    that can no longer reach them burns significantly more power.
+    """
+    by_cpu: dict[str, list[tuple[int, str]]] = {}
+    pattern = "/sys/devices/system/cpu/cpu*/cpuidle/state*/disable"
+    for f in glob.glob(pattern):
+        m = re.match(r".*/(cpu\d+)/cpuidle/state(\d+)/disable$", f)
+        if not m:
+            continue
+        by_cpu.setdefault(m.group(1), []).append((int(m.group(2)), f))
+    for entries in by_cpu.values():
+        entries.sort()
+    return by_cpu
+
+
+def select_idle_targets(depth: int) -> list[str]:
+    """The `depth` DEEPEST idle states on every cpu. Never state0.
+
+    WHY THIS IS BOUNDED (2026-09-10): the first version of this profile
+    disabled EVERY idle state on EVERY core in one pass, and doing that while
+    also raising the GPU clock floor took spark-3066 off the network inside two
+    minutes; it needed a physical power cycle. Disabling all states means no
+    core can idle at all, which is a large uncommanded step in package power on
+    a platform with a shared budget. See docs/gb10/benchmarks.md 22.
+
+    state0 is excluded unconditionally. It is the shallowest state, so it
+    contributes least to the delivery tail while being the one whose removal
+    forces cores to spin. There is no configuration in which disabling it is
+    the right first move.
+    """
+    targets: list[str] = []
+    for entries in _cpuidle_states_by_cpu().values():
+        deep_first = [(i, f) for i, f in reversed(entries) if i > 0]
+        targets.extend(f for _i, f in deep_first[:depth])
+    return sorted(targets)
+
+
+def plan_determinism(*, idle_depth: int, lock_gpu: bool) -> list[tuple[str, str, str]]:
     """(description, kind, argument) triples. Nothing here executes."""
     actions: list[tuple[str, str, str]] = []
-    for f in sorted(glob.glob("/sys/devices/system/cpu/cpu*/cpuidle/state*/disable")):
+    for f in select_idle_targets(idle_depth):
         if _read(f) != "1":
             actions.append((f"disable idle state {f}", "sysfs", f))
     if _read("/proc/sys/kernel/timer_migration") != "0":
@@ -227,7 +281,10 @@ def plan_determinism() -> list[tuple[str, str, str]]:
                 "/proc/sys/kernel/timer_migration",
             )
         )
-    if shutil.which("nvidia-smi"):
+    # Raising the clock floor is a second power lever. Applying it in the SAME
+    # pass as idle-state removal is what made the 3066 failure hard to
+    # attribute, so it is now opt-in and off by default.
+    if lock_gpu and shutil.which("nvidia-smi"):
         actions.append(("lock GPU clocks to reported max", "gpu_lock", ""))
     _rc, out = _run(["systemctl", "is-active", "irqbalance"])
     if out == "active":
@@ -237,8 +294,54 @@ def plan_determinism() -> list[tuple[str, str, str]]:
     return actions
 
 
-def apply_determinism(*, do_apply: bool) -> int:
-    actions = plan_determinism()
+DEADMAN_UNIT = "gb10-runtime-profile-deadman"
+
+
+def arm_deadman(seconds: int, snapshot: pathlib.Path) -> tuple[bool, str]:
+    """Schedule an unconditional revert ON THE TARGET HOST.
+
+    The A/B driver that lost spark-3066 held its revert in a shell EXIT trap.
+    A trap fires when the SCRIPT exits, and that script's host had stopped
+    executing -- so the revert never ran and could never have run. Recovery
+    must not depend on the controlling session, the network, or this process
+    surviving, because the failure mode being guarded against is precisely the
+    host becoming unreachable.
+
+    systemd owns this timer, so it fires even if this process is killed, the
+    SSH connection drops, or the operator walks away.
+    """
+    script = str(pathlib.Path(__file__).resolve())
+    rc, out = _run(
+        [
+            "sudo", "-n", "systemd-run",
+            f"--on-active={seconds}",
+            f"--unit={DEADMAN_UNIT}",
+            "--collect",
+            sys.executable, script, "revert", "--apply", "--force",
+            "--snapshot", str(snapshot),
+        ]
+    )
+    if rc != 0:
+        return False, out or "systemd-run failed"
+    # Never trust the exit code alone: confirm the timer actually exists.
+    rc2, out2 = _run(["systemctl", "is-active", f"{DEADMAN_UNIT}.timer"])
+    if out2.strip() not in ("active", "activating"):
+        return False, f"systemd-run returned 0 but timer is {out2.strip() or '?'}"
+    return True, f"revert scheduled in {seconds}s as {DEADMAN_UNIT}.timer"
+
+
+def disarm_deadman() -> tuple[bool, str]:
+    rc, out = _run(["systemctl", "is-active", f"{DEADMAN_UNIT}.timer"])
+    if out.strip() not in ("active", "activating"):
+        return True, "no deadman armed"
+    rc, out = _run(["sudo", "-n", "systemctl", "stop", f"{DEADMAN_UNIT}.timer"])
+    return rc == 0, out or "deadman disarmed"
+
+
+def apply_determinism(
+    *, do_apply: bool, idle_depth: int, lock_gpu: bool
+) -> int:
+    actions = plan_determinism(idle_depth=idle_depth, lock_gpu=lock_gpu)
     if not actions:
         print("determinism profile: already fully applied, nothing to do")
         return 0
@@ -344,6 +447,36 @@ def main() -> int:
     sub.add_parser("show", help="print the current state of every lever")
     ap = sub.add_parser("apply", help="apply a named profile")
     ap.add_argument("profile", choices=["determinism"])
+    ap.add_argument(
+        "--idle-depth",
+        type=int,
+        default=1,
+        help="how many of the DEEPEST cpuidle states to disable per cpu "
+        "(default 1; state0 is never touched). Raise one step at a time and "
+        "re-measure -- disabling all of them took a host down, see "
+        "docs/gb10/benchmarks.md 22",
+    )
+    ap.add_argument(
+        "--lock-gpu",
+        action="store_true",
+        help="also raise the GPU clock floor. Off by default: applying two "
+        "power levers in one pass is what made the 3066 failure hard to "
+        "attribute",
+    )
+    ap.add_argument(
+        "--deadman-seconds",
+        type=int,
+        default=900,
+        help="schedule an unconditional revert on the TARGET HOST after N "
+        "seconds (default 900). Recovery must not depend on this session "
+        "surviving",
+    )
+    ap.add_argument(
+        "--no-deadman",
+        action="store_true",
+        help="do not arm the host-side revert timer. Only for a host you can "
+        "physically reach",
+    )
     rp = sub.add_parser("revert", help="restore the recorded snapshot")
     for p in (ap, rp):
         p.add_argument("--apply", dest="do_apply", action="store_true")
@@ -375,6 +508,9 @@ def main() -> int:
         return 3
 
     if args.command == "apply":
+        if args.idle_depth < 1:
+            print("--idle-depth must be at least 1")
+            return 2
         # Snapshot BEFORE the first write, so revert survives a dead session.
         if args.do_apply:
             args.snapshot.parent.mkdir(parents=True, exist_ok=True)
@@ -382,14 +518,37 @@ def main() -> int:
                 json.dumps(snapshot_state(), indent=2), encoding="utf-8"
             )
             print(f"snapshot written to {args.snapshot}")
-        return apply_determinism(do_apply=args.do_apply)
+
+            # Arm the deadman BEFORE the first write, and REFUSE to proceed if
+            # it could not be armed. A profile that can take the host off the
+            # network must not be applied with no way back: an unarmed run is
+            # exactly the shape that cost spark-3066 a physical power cycle.
+            if args.no_deadman:
+                print("WARNING: --no-deadman - no host-side revert is armed.")
+                print("If this host stops responding, recovery is physical.")
+            else:
+                ok, detail = arm_deadman(args.deadman_seconds, args.snapshot)
+                print(f"deadman: {detail}")
+                if not ok:
+                    print("\nREFUSING to apply: the host-side revert could not")
+                    print("be armed, so a failure here would not self-recover.")
+                    return 4
+        return apply_determinism(
+            do_apply=args.do_apply,
+            idle_depth=args.idle_depth,
+            lock_gpu=args.lock_gpu,
+        )
 
     if not args.snapshot.exists():
         print(f"no snapshot at {args.snapshot} - nothing to revert to")
         return 2
-    return revert(
+    rc = revert(
         json.loads(args.snapshot.read_text(encoding="utf-8")), do_apply=args.do_apply
     )
+    if args.do_apply and rc == 0:
+        ok, detail = disarm_deadman()
+        print(f"deadman: {detail}")
+    return rc
 
 
 if __name__ == "__main__":
