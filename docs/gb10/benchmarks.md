@@ -434,9 +434,21 @@ The discriminator is the **access pattern of the mapped buffer, not zero-copy it
 
 ### Correctness
 
-All four modes are **byte-identical**: a 164-frame `.db3` playback aligned under modes 0, 1 and 3
-produces the same SHA-256 over every aligned depth plane. Profiler self-test 32/0 and all 10 tools
-rc=0 ×3 on the zero-copy build.
+**Both** optimizations are byte-identical, checked independently — timing alone was not accepted as
+grounds for changing a default:
+
+- **align**: a 164-frame `.db3` playback under `RS2_ALIGN_ZC` modes 0, 1 and 3 produces the same
+  SHA-256 over every aligned depth plane.
+- **pointcloud**: the same playback with zero-copy **OFF** and **ON** produces the same SHA-256 over
+  every vertex buffer (164 frames, `2880dcd326d0…`). This matters more than it looks: mapped and
+  device-local memory could plausibly have taken different rounding paths, which would have made
+  −42% a silent output change rather than a win.
+
+**Reproduced on a clean artifact.** The numbers above were first measured on a build assembled
+incrementally, so they were re-taken on the canonical prefix built from merged master
+(`164f19674`, `v2.58.2-1474-g164f19674`): align p50 **0.308 ms**, pointcloud p50 **0.136 ms**,
+colorize 1.921 ms — matching to within run-to-run noise. Profiler self-test **32/0** reporting
+`BUILD_WITH_CUDA_ZEROCOPY=1`, all 10 tools rc=0 ×3, 0 duplicated globals exported.
 
 `LRS_GB10_CUDA_ZEROCOPY` now defaults **ON** in `scripts/build-dgx-spark-gb10.sh` on this evidence.
 
@@ -547,7 +559,10 @@ now measured rather than assumed. It is **not** sufficient to change fleet polic
 2. **~12 minutes is not a soak.** The June defect was intermittent, so absence over minutes is much
    weaker evidence than the original presence.
 3. Nothing here isolates *which* change fixed it — kernel, BIOS, and camera firmware all moved
-   together since June.
+   together since June. **And so did the SDK**: the June crash was 2.58.1, whereas this ramp ran
+   2.58.4 with zero-copy and the align patch. The GB10 USB mitigations (`RS2_GB10_USB_TUNING`) are
+   present in both, so the SDK is an unlikely cause — but it is a fourth uncontrolled variable and
+   should be named as one.
 
 **Recommendation: keep the single-high-rate-stream envelope until a long soak and an equivalent
 spark-0060 run agree.** What this result does justify is *scheduling* that work instead of treating
@@ -570,3 +585,62 @@ This is a near miss rather than a non-issue: a mid-enum removal silently changes
 anything compiled against 2.58.3 headers that then loads a 2.58.4 `.so`. **Any A7 re-pin must
 rebuild every consumer against the same headers**, not just repoint the `.so` — in particular
 `pyrealsense2` and any ROS 2 node binary, which are separately compiled artifacts.
+
+
+---
+
+## 14. Per-host build environment — the two Sparks are NOT interchangeable
+
+Discovered 2026-09-10 while staging the canonical 2.58.4 build on both hosts. **The correct
+`CUDA_HOME` differs per host, and the difference is inverted from what the hostnames suggest.**
+
+| Host | `/usr/local/cuda` → | Prebuilt CUDA OpenCV compiled against | **Pin `CUDA_HOME` to** |
+|---|---|---|---|
+| `spark-3066` | 13.2 | **13.0** | `/usr/local/cuda-13.0` |
+| `spark-0060` | 13.2 | **13.2** | `/usr/local/cuda-13.2` |
+
+Getting it wrong is a hard configure failure, not a silent one:
+
+```
+CMake Error at /opt/gb10-cuda/install/opencv/lib/cmake/opencv4/OpenCVConfig.cmake:111 (message):
+  OpenCV static library was compiled with CUDA 13.2 support.  Please, use the
+  same version or rebuild OpenCV with CUDA 13.0
+Call Stack (most recent call first):
+  wrappers/opencv/CMakeLists.txt:5 (find_package)
+```
+
+So **do not copy a working build invocation from one Spark to the other.** Read the host's own
+OpenCV before choosing the pin. Both hosts otherwise match: kernel `6.17.0-1029-nvidia`, BIOS
+`5.36_0ACUM018`, and both carry `/usr/local/cuda-13.0` and `-13.2` side by side.
+
+Also set `CUDACXX` explicitly on both: `nvcc` is **not** on a non-interactive SSH `PATH`, which
+surfaces as the misleading "No CMAKE_CUDA_COMPILER could be found".
+
+
+### 14.1 Both Sparks staged — 2026-09-10, neither re-pinned
+
+The canonical prefix `/opt/vigil/opt/librealsense-v2.58.4-dgx-spark-gb10` is built from merged
+master (`164f19674`, `v2.58.2-1474-g164f19674`) and gated on **both** hosts:
+
+| Gate | spark-3066 | spark-0060 |
+|---|---|---|
+| `CUDA_HOME` used | `/usr/local/cuda-13.0` | `/usr/local/cuda-13.2` |
+| `rs-gb10-profiler --self-test` | **32/0** | **32/0** |
+| `BUILD_WITH_CUDA_ZEROCOPY` in provenance | 1 | 1 |
+| 10 tools × 3 runs | rc=000 | rc=000 |
+| duplicated globals exported | 0 | 0 |
+| CUDA objects compiled | 5 | 5 |
+| `/usr/local/lib/librealsense2.so` | **unchanged, 2.58.1** | **unchanged, 2.58.1** |
+
+**Nothing is re-pinned.** A7 remains gated on rebuilding every consumer against the 2.58.4 headers
+(§13) and on the envelope question (§12).
+
+Two notes on spark-0060 specifically:
+
+- Its build log contains two `RS2_USB_STATUS_BUSY` errors from the script's `validate()` step. The
+  D435 **is** attached (`Bus 002 Device 003: ID 8086:0b07`) but is **held by another process** —
+  the live `vigil_c2` session. This is expected on 0060 and is not a build defect; the artifact
+  gates clean.
+- Staging 0060's *build* is **not** validating 0060's *envelope*. Its camera sits behind a hub
+  rather than on a native root port, and the multistream ramp (§12) has only ever run on 3066. That
+  remains the open item.
