@@ -55,6 +55,14 @@ WITH_OPENMP="${LRS_GB10_WITH_OPENMP:-ON}"
 WITH_IPO="${LRS_GB10_WITH_IPO:-OFF}"
 WITH_EXTERNAL_LZ4="${LRS_GB10_EXTERNAL_LZ4:-OFF}"
 FORCE_RSUSB="${LRS_GB10_FORCE_RSUSB:-ON}"
+# Upstream 2.58.4 zero-copy: cudaHostAlloc(...Mapped) frame buffers, gated at RUNTIME to
+# integrated GPUs (CU_DEVICE_ATTRIBUTE_INTEGRATED), which GB10 is. Default OFF matches upstream;
+# turn ON to build the leg that A2 measures against the NEON/CUDA baselines in docs/gb10.
+# NOT the same thing as LRS_GB10_PC_ZEROCOPY below, which is the fork's retired ladder.
+CUDA_ZEROCOPY="${LRS_GB10_CUDA_ZEROCOPY:-OFF}"
+# -ffp-contract= value. "off" is upstream's default and keeps filter output bit-identical across
+# hosts; "fast" lets aarch64 fuse multiply-add in every vector lane. A3 measures the difference.
+FP_CONTRACT="${LRS_GB10_FP_CONTRACT:-off}"
 # Enable GB10-specific USB mitigations (P2 URB pool depth + P4 watchdog rate-limit + stop settle).
 # Set LRS_GB10_USB_TUNING=0 to produce a vanilla build without the GB10 defaults baked in.
 GB10_USB_TUNING="${LRS_GB10_USB_TUNING:-1}"
@@ -103,6 +111,10 @@ Useful environment:
   LRS_GB10_FORCE_RSUSB     Force libusb/RSUSB backend, default ON.
                            Set OFF to validate the native Linux V4L2 backend.
   LRS_GB10_CXX_STANDARD    C++ standard for unpinned targets, default 20
+  LRS_GB10_CUDA_ZEROCOPY   Upstream mapped-host-memory frame buffers
+                           (BUILD_WITH_CUDA_ZEROCOPY), default OFF. Runtime-gated to
+                           integrated GPUs. Distinct from LRS_GB10_PC_ZEROCOPY.
+  LRS_GB10_FP_CONTRACT     -ffp-contract= value: off (default, bit-identical) | on | fast
   PYTHON_EXECUTABLE        Python ABI for pyrealsense2
   LRS_GB10_PYTHON_INSTALL_DIR
                            Python install dir, default under the GB10 prefix
@@ -295,6 +307,8 @@ configure() {
     -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
     -DFORCE_RSUSB_BACKEND="$FORCE_RSUSB" \
     -DBUILD_WITH_CUDA=ON \
+    -DBUILD_WITH_CUDA_ZEROCOPY="$CUDA_ZEROCOPY" \
+    -DRS2_FP_CONTRACT="$FP_CONTRACT" \
     -DBUILD_WITH_NEON=ON \
     -DBUILD_WITH_CPU_EXTENSIONS=ON \
     -DBUILD_WITH_OPENMP="$WITH_OPENMP" \

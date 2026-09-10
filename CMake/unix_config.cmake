@@ -20,8 +20,14 @@ macro(os_set_flags)
 
     # Default -ffp-contract=fast fuses a*b+c*d into an FMA wherever the ISA has one (x86-64-v3
     # on Ubuntu 26.04, always on aarch64), dropping a rounding and shifting filter output 1 LSB.
-    set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -ffp-contract=off")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ffp-contract=off")
+    # "off" is the default because bit-identical filter output across hosts is what the unit tests
+    # and the recorded-bag comparisons rely on. It is a cache variable rather than a hard-coded flag
+    # so the FMA cost can be MEASURED on a target where throughput matters more than bit-identity
+    # (aarch64 has an FMA in every vector lane); set -DRS2_FP_CONTRACT=fast to build that leg.
+    set(RS2_FP_CONTRACT "off" CACHE STRING "-ffp-contract= value: off (bit-identical) | on | fast")
+    set_property(CACHE RS2_FP_CONTRACT PROPERTY STRINGS off on fast)
+    set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -ffp-contract=${RS2_FP_CONTRACT}")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ffp-contract=${RS2_FP_CONTRACT}")
 
     execute_process(COMMAND ${CMAKE_C_COMPILER} -dumpmachine OUTPUT_VARIABLE MACHINE)
     if(${MACHINE} MATCHES "arm64-*" OR ${MACHINE} MATCHES "aarch64-*")
