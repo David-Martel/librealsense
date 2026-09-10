@@ -72,10 +72,34 @@ using json = nlohmann::basic_json< std::map,  // all template arguments are defa
 
 
 // We can't put these inside json, unfortunately...
-extern json const null_json;     // default json state
-extern json const missing_json;  // i.e., not there: exists() will be 'false'
-extern json const empty_json_string;
-extern json const empty_json_object;
+//
+// These four are defined in json.cpp, which lives in rsutils -- a STATIC library that is linked
+// PUBLIC into the shared realsense2 (see the top-level CMakeLists.txt). A static library linked
+// into both a shared object and the executables that load it produces TWO definitions of every
+// global it owns. With default (preemptible) visibility, ELF resolves both to the executable's
+// copy, so librealsense2.so's initializer constructs the executable's object and registers a
+// destructor for it -- and the executable does the same. The object is then constructed twice and
+// destroyed twice: an exit-time double free (SIGABRT) in every tool that links both.
+//
+// Hidden visibility makes each module's copy private and non-preemptible, so each is constructed
+// and destroyed exactly once. That is safe here because these are immutable sentinels compared by
+// VALUE, never by address: "missing" is detected as _j.is_discarded() in json_ref::exists(), not
+// as &_j == &missing_json.
+//
+// Without this, the crash is latent -- it only surfaces when the linker happens to pull json.cpp's
+// archive member into the executable, which depends on the language standard and on which other
+// rsutils members are referenced. It was observed at -std=c++20 against nlohmann 3.12 while
+// -std=c++14 silently avoided it. See docs/gb10/UPGRADE-PLAN-2026-09-10.md section 11.
+#if defined( _WIN32 )
+#define RSUTILS_SENTINEL  // exports are controlled by the .def file
+#else
+#define RSUTILS_SENTINEL __attribute__( ( visibility( "hidden" ) ) )
+#endif
+
+extern json const RSUTILS_SENTINEL null_json;     // default json state
+extern json const RSUTILS_SENTINEL missing_json;  // i.e., not there: exists() will be 'false'
+extern json const RSUTILS_SENTINEL empty_json_string;
+extern json const RSUTILS_SENTINEL empty_json_object;
 
 
 std::ostream & operator<<( std::ostream &, const json & );

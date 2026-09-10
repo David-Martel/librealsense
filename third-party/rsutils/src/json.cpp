@@ -11,10 +11,12 @@
 namespace rsutils {
 
 
-json const null_json = {};
-json const missing_json = json::value_t::discarded;
-json const empty_json_string = json::value_t::string;
-json const empty_json_object = json::object();
+// RSUTILS_SENTINEL (hidden visibility) must be repeated on the definitions, not just the
+// declarations in json-fwd.h, or GCC emits them with default visibility anyway.
+json const RSUTILS_SENTINEL null_json = {};
+json const RSUTILS_SENTINEL missing_json = json::value_t::discarded;
+json const RSUTILS_SENTINEL empty_json_string = json::value_t::string;
+json const RSUTILS_SENTINEL empty_json_object = json::object();
 
 
 // Recursively patches existing JSON with contents of 'overrides', which must be a JSON object.
