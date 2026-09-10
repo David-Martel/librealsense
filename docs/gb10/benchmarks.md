@@ -1275,11 +1275,44 @@ on the `f0np0` pair) terminate on ConnectX-7 ports that **do** have a PHC and ha
 transmit and receive timestamping at both ends. That half of the claim stands, and it
 is still the only path on this fleet where both endpoints can stamp in hardware.
 
-What no longer stands is "no switch to add uncorrected residence time". Whether that
-switch is a PTP transparent clock is **unknown and unmeasured** — it was not identified
-before this correction was written, and unlike the 10 GbE segment it cannot be
-characterised by LLDP from a single host while the fleet is down. Until it is, the
-achievable offset over this fabric is an open number, not a good one by assumption.
+What no longer stands is "no switch to add uncorrected residence time".
+
+**MEASURED with both hosts up (2026-09-10, later the same day).** An all-nodes
+multicast sweep on each live QSFP wire returns **all four link-local addresses on every
+wire** — spark-0060's `::62` and `::66`, and spark-3066's `::3068` and `::306c`:
+
+| Probing port | Responders on that wire |
+|---|---|
+| 0060 `enp1s0f1np1` (own `::62`) | `::62` `::66` `::3068` `::306c` |
+| 0060 `enP2p1s0f1np1` (own `::66`) | `::62` `::66` `::3068` `::306c` |
+| 3066 `enp1s0f1np1` (own `::3068`) | `::62` `::66` `::3068` `::306c` |
+| 3066 `enP2p1s0f1np1` (own `::306c`) | `::62` `::66` `::3068` `::306c` |
+
+A point-to-point cable cannot produce this. On a direct link between 0060's `f1np1` and
+3066's `f1np1`, only `::62` and `::3068` could answer — `::66` and `::306c` live on the
+*other* ConnectX-7 card in each chassis and cannot be electrically present on that wire.
+**All four live ports therefore sit in ONE shared L2 broadcast domain on a switch.**
+
+Note what this makes of the addressing: `10.55.154.0/24` and `10.55.155.0/24` are two IP
+subnets sharing a single broadcast domain. The `.152/.153/.154/.155` scheme with `.1` on
+one host and `.2` on the other *looks* like four point-to-point links and is not.
+
+This discriminator required no change to link state — no interface was downed and no
+host was perturbed — which matters because the alternative discriminator (admin-down one
+port and observe the far end) would invalidate any measurement running on the fleet.
+
+**Half the fabric is down.** `enp1s0f0np0` and `enP2p1s0f0np0` are `carrier=0` on **both**
+hosts, each with an FS transceiver present reading `Power set: Off` and
+`Transmitter technology: 0xa0 (Copper cable unequalized)`. Both ends dark on a passive
+copper DAC implicates the cable or the switch ports, not either host. spark-3066's
+`f0np0` held carrier earlier the same day and lost it across a power cycle. The two live
+links carry traffic normally (`0060 -> 10.55.154.2` and `-> 10.55.155.2` both reachable
+at 200000Mb/s).
+
+Whether that switch is a PTP transparent clock is still **unknown and unmeasured**, and
+it must be identified before any offset number from this fabric is trusted. What has
+changed is that its existence is now measured rather than inferred, so the question is
+well posed.
 
 A direct consequence worth stating: **`carrier` on a QSFP port is not evidence the far
 host is alive**, because the switch holds the link. That inference was made in this
