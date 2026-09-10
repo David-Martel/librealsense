@@ -681,3 +681,459 @@ It is not staged because `scripts/build-dgx-spark-gb10.sh` is GB10-specific (CUD
 2.58.4 build for asuspro13 needs its own recipe. Note the pin path differs from the Sparks'
 (`/opt/vigil/librealsense`, not `/opt/vigil/opt/librealsense-v2.58.1-…`), so any fleet-wide re-pin
 script that assumes one layout will miss this host. asuspro13 and dtm-p1gen7 remain future work.
+
+---
+
+## 15. 720p multistream — measured on BOTH Sparks, 2026-09-10
+
+Run under explicit direction to remove the single-high-rate-stream envelope and compare the two
+Sparks against each other. Harness: `scripts/gb10/rs-gb10-stress-matrix.py`, new 720p tier, kernel
+tripwire armed, headless, SDK = the canonical `librealsense-v2.58.4-dgx-spark-gb10` prefix.
+
+### 15.1 The hardware ceiling at 720p is 30 Hz
+
+A D435 advertises 1280×720 at **30/15/6 Hz only** — on depth, colour **and** infrared. There is no
+faster 720p mode on this SKU, so "720p at the highest frame rate possible" is 1280×720@30 and no
+host-side change can raise it. `960×540 @ 60 Hz` is the only >30 fps 16:9 colour mode; `848×480` gets
+60 Hz colour and 90 Hz depth/IR; `848×100` and `256×144` depth reach 300 Hz.
+
+What host-side work *can* do is sustain **all four streams** at 720p30 at once. That is a heavier
+wire load than `HEAVY_60fps_848x480_D+C+IR`, the configuration that killed the GB10 xHCI on
+2026-06-02, so it is the right thing to soak.
+
+### 15.2 Sweep result — 7/7 on both hosts
+
+20 s per entry. Every stream on every entry delivered 29.95–30.00 fps against a 30 fps request.
+
+| Entry | spark-3066 (`6-1`, `NVDA8000:02`) | spark-0060 (`2-1.1`, `NVDA8000:00`) |
+|---|---|---|
+| `30fps_1280x720_depth` | PASS 29.96, g=0 | PASS 29.95, g=1 |
+| `30fps_1280x720_color` (bgr8) | PASS 29.98, g=0 | PASS 29.98, g=0 |
+| `30fps_1280x720_color_yuyv` | PASS 29.95, g=0 | PASS 29.98, g=0 |
+| `30fps_1280x720_D+C` | PASS 29.98/29.98, g=0 | PASS 29.98/29.98, g=0 |
+| `30fps_1280x720_D+IR` | PASS 29.98/29.98, g=0 | PASS 29.98/29.98, g=0 † |
+| `30fps_1280x720_D+C+IR` | PASS ×3 @ 29.98, g=0 | PASS ×3 @ 29.97, g=0 † |
+| **`HEAVY_…D+C+IR1+IR2`** | **PASS ×4 @ 29.98, g=0** | **PASS ×4 @ 30.00, g=0** |
+
+Kernel danger signatures (`Host halt`, `HC died`, `not responding`, `Not enough bandwidth`,
+`controller not`, `over-current`) across every run on both hosts: **0**. The only USB lines emitted
+were the benign `981ae2 Region of Interest Auto Ctrls` UVC non-compliance notice, which the harness
+already excludes by name.
+
+† **These two entries first reported PASS with an empty stream list** — the pipeline started, nothing
+raised, and *no frame arrived*. That was a false green in the harness itself, not a camera result:
+`ok` was seeded as `(err == "")` and then only ever narrowed inside the per-stream loop, which never
+ran when no stream delivered. Fixed in `eb0120a05` (zero streams → FAIL; fewer streams than
+requested → FAIL, naming which arrived), and the two entries were re-run under the fixed harness to
+produce the numbers above. The cause of the original zeros was transient: it was the first camera
+open after an 8.5-hour `vigil_c2` session released the device. **Any earlier ramp result in this
+document that shows a passing entry should be re-read with that defect in mind** — the 2026-09-10
+R6 ramp (§12) rows were re-checked and all carry real frame counts, so none of them relied on it.
+
+### 15.3 Colour format: YUYV saves host work, not bandwidth
+
+The obvious reading — "request YUYV instead of RGB8/BGR8 and save a third of the USB bandwidth" — is
+**wrong on D400**, and the source settles it:
+
+- `src/ds/d400/d400-color.cpp:25-26` maps the UVC fourccs `YUY2`/`YUYV` to `RS2_FORMAT_YUYV`. That is
+  what the device advertises on the wire.
+- `src/ds/d400/d400-color.cpp:342` registers a **processing block**,
+  `create_pbf_vector<yuy2_converter>(RS2_FORMAT_YUYV, map_supported_color_formats(RS2_FORMAT_YUYV), …)`.
+- `src/device.cpp:255` defines those targets: `{ RGB8, RGBA8, BGR8, BGRA8 }`.
+
+So RGB8, BGR8, RGBA8 and BGRA8 at 1280×720 are **host-side conversions from YUYV**; the wire carries
+YUY2 at 2 bytes/pixel regardless of what the application asks for. Requesting `yuyv` therefore saves
+**zero USB bandwidth** and instead skips the `yuy2_converter` pass. That is still worth having when
+the consumer can take YUYV directly, but it must not be sold as a bandwidth saving.
+
+Measured cost of the conversion at 720p30, single colour stream: bgr8 29.98 fps vs yuyv 29.95 fps on
+3066 and 29.98 vs 29.98 on 0060 — i.e. **at 30 Hz the conversion is not the bottleneck and does not
+show up in delivered frame rate at all.**
+
+**And on this platform, asking for YUYV is a pessimisation rather than a saving.** The conversion
+being "skipped" runs on the **GPU**: `src/proc/color-formats-converter.cpp:63-69` wraps the YUY2
+unpack in `#ifdef RS2_USE_CUDA` and returns early into `rscuda::unpack_yuy2_cuda<FORMAT>` whenever
+`rs2_is_cuda_available()` — which also makes the NEON implementations at `:232-240` dead code in
+every CUDA-enabled GB10 build. Meanwhile vigil-spark's node, having negotiated `yuyv`, converts it
+with `cv2.cvtColor(image, cv2.COLOR_YUV2BGR_YUYV)` on a single Grace core
+(`realsensenode.py:859-861`). So the fallback trades a GPU conversion for a CPU one and saves nothing
+on the wire.
+
+Request `yuyv` only when a downstream **GPU** consumer takes YUYV directly. Otherwise `bgr8` is the
+right request on GB10, and a fallback to `yuyv` should be logged as a fault rather than accepted as
+a tuning outcome. Credit for catching this: it inverts the conclusion an earlier draft of this
+section reached from the wire-format fact alone, which was correct about the wire and wrong about
+the consequence because it never asked *where* the skipped conversion would have run.
+
+### 15.4 The two hosts are not topologically identical
+
+| | spark-3066 | spark-0060 |
+|---|---|---|
+| sysfs path | `6-1` | `2-1.1` |
+| upstream of the camera | root port directly | `2109:0211` VIA Labs "USB3.0 Hub", 1 downstream port |
+| xHCI controller | `NVDA8000:02` (bus 6) | `NVDA8000:00` (bus 2) |
+| root port / negotiated rate | 20 Gbps / **5 Gbps SuperSpeed** | 20 Gbps / **5 Gbps SuperSpeed** |
+| camera s/n, firmware | 347622075921, 5.17.3.10 | 327122076391, 5.17.3.10 |
+
+The account owner states 0060's camera is on the spark-bus rather than behind a hub; the sysfs chain
+does show a VL2109 between the root port and the camera. Both readings are recorded without
+adjudicating whether that hub sits on the mainboard, in a captive cable, or in an adapter — nothing
+was opened or traced physically. **What matters for these results is that both links negotiate the
+same 5 Gbps SuperSpeed rate, so the bandwidth ceiling is identical, and that the two cameras hang
+off different xHCI controller instances** — which is the variable a controller-death defect actually
+turns on, and the one this two-host comparison controls for.
+
+Earlier notes in this repo that treated 0060 as "behind a hub, therefore unvalidated" over-weighted
+the hub and under-weighted the controller instance.
+
+
+### 15.5 Soak result — the envelope is retired
+
+Both hosts, 4 concurrent 1280×720@30 streams (Z16 depth + colour + IR1 + IR2), each pass a fresh
+pipeline open/close so that start/stop cycling — which preceded **every** observed GB10 controller
+death — is exercised, not just steady streaming.
+
+| | spark-3066 | spark-0060 |
+|---|---|---|
+| passes × duration | **40 × 120 s** (~80 min streaming, 84 min wall) | 11 × 120 s (~22 min) |
+| pipeline open/close cycles | **40** | 11 |
+| frames delivered | **575,696** | 158,312 |
+| min frames per stream per pass | **3598** of 3600 | **3598** of 3600 |
+| **dropped frames (gaps), all streams, all passes** | **0** | **0** |
+| kernel USB danger signatures | **0** | **0** |
+| exit | `DONE_RC=0` | `DONE_RC=0` |
+
+**Combined: 734,008 frames, zero dropped, zero xHCI faults, across two different xHCI controller
+instances.**
+
+**Acceptance was by frame count, not by the harness's PASS flag** — deliberately. The spark-3066 run
+was started before `eb0120a05` landed, so it executed the harness *with* the false-green defect
+(§15.2 †), under which a zero-frame pass prints `[PASS]`. Every pass in both JSON results was
+therefore re-checked for four populated streams with ~3600 frames each. All 51 passes satisfy that.
+Quoting `summary.passed` from the 3066 run would not have been evidence of anything.
+
+#### Verdict: the single-high-rate-stream envelope is retired
+
+The three conditions this repository set for lifting it are met:
+
+1. **A real soak** — 80 minutes, not the ~12 that was previously called insufficient.
+2. **An equivalent run on spark-0060** — done, on a different xHCI controller instance.
+3. **Zero faults under a load heavier than the June killer** — 720p30 ×4 moves more bytes per second
+   than `HEAVY_60fps_848x480_D+C+IR`, the configuration that killed the controller on 2026-06-02.
+
+The June defect was real and is preserved in `docs/gb10/FINDINGS-2026-06-03.md` as history. What
+changed since is at minimum the kernel (6.17.0-1021 → 6.17.0-1029-nvidia), the camera firmware
+(5.13.0.55 → 5.17.3.10), the SDK, and the USB topology. This result does **not** identify which of
+those fixed it, and does not claim the silicon defect is gone — it establishes that the configuration
+the envelope forbade now runs clean for 80 minutes across 40 restarts on both hosts, which is the
+question the envelope was actually blocking.
+
+**What replaces it:** the kernel tripwire stays armed in every harness run, and
+`RS2_GB10_USB_TUNING` stays available. Guidance changes from "never run multistream" to "multistream
+at 720p30 is validated on both Sparks; run the tripwire on any new configuration before trusting it."
+
+---
+
+## 16. OpenCV unification and the retirement of the per-host CUDA pin — 2026-09-10
+
+§14 documented that the two Sparks need different `CUDA_HOME` values and called it a trap to be
+memorised. That was treating a symptom. This section records the cause and its removal.
+
+### 16.1 The cause
+
+`wrappers/opencv/CMakeLists.txt:5` hard-fails when the SDK's CUDA version does not match the CUDA
+that the OpenCV it links was built against. The OpenCV the GB10 build pointed at,
+`/opt/gb10-cuda/install/opencv`, was compiled against **CUDA 13.0 on spark-3066 and CUDA 13.2 on
+spark-0060**. Hence the inverted pin — it was never about the hosts, only about which toolkit
+happened to be used the day each OpenCV was built.
+
+That inversion was not the only one. Building a single OpenCV across both hosts surfaced three more
+asymmetries, none of which was visible from reading any script:
+
+| Asymmetry | spark-3066 | spark-0060 | Effect |
+|---|---|---|---|
+| Video Codec SDK headers (`nvcuvid.h`, `cuviddec.h`, `nvEncodeAPI.h`) | under `cuda-13.0` only | under `cuda-13.2` only | `cudacodec` builds on one host, not the other |
+| Qt | Qt5 only | Qt5 **and** a Qt6 missing `Core5Compat` | OpenCV prefers Qt6 → configure dies on 0060 |
+| `/opt/vigil-spark/.venv-ros-py312` CPython | **3.12.3** | **3.12.13** | `FindPythonLibs` needs an *exact* match vs system 3.12.3 → `cv2` built on one host, silently absent on the other |
+
+The headers were byte-identical across hosts (md5), so both CUDA trees on both hosts were
+cross-populated. Qt is now pinned to major version 5. The interpreter roles were split: `BUILD_PY`
+(system, matches libpython by construction) satisfies `FindPythonLibs`, while `VENV_PY` stays the
+runtime target supplying numpy 2 headers and the verification.
+
+### 16.2 What the OpenCV was missing
+
+Measured in the artifact, not read from the script. The build that had been in service:
+
+| Feature | Before | After | Hardware supports it? |
+|---|---|---|---|
+| CUDA | YES (13.2) | YES (13.2) | — |
+| **cuDNN** | absent | **9.25.0** | `libcudnn.so.9` installed |
+| **OpenGL** | absent | **YES** | `gl.pc` present |
+| **NVCUVID / NVCUVENC** | absent | **YES** | headers present |
+| **`cudacodec` H.264 encoder** | **throws from `cuda_stubs.hpp`** | **works** | NVENC present |
+| Parallel framework | pthreads | **TBB 2021.11** | `tbb.pc` present |
+| modules / CUDA modules | — | 70 / 11 | — |
+
+`hasattr(cv2, "cudacodec")` returns **True in both columns** — OpenCV compiles a stub when it cannot
+find the codec SDK. Only instantiating an encoder distinguishes them:
+
+```
+before:  createVideoWriter(H264) -> raises from core/private/cuda_stubs.hpp
+after :  createVideoWriter(H264) -> OK, writes frames
+```
+
+### 16.3 The pin is retired — the test that shows it
+
+Previously `CUDA_HOME=/usr/local/cuda-13.2` configured on 0060 and failed on 3066. With both hosts
+pointed at the single `/opt/opencv-cuda-4.14.0`, the identical command now succeeds on both:
+
+| | spark-3066 | spark-0060 |
+|---|---|---|
+| `CUDA_HOME` | `/usr/local/cuda-13.2` | `/usr/local/cuda-13.2` |
+| configure | **OK** | **OK** |
+| `OpenCV_DIR` | `/opt/opencv-cuda-4.14.0/lib/cmake/opencv4` | same |
+| `CMAKE_CXX_FLAGS_RELEASE` | `-O3 -DNDEBUG -march=armv9.2-a+sve2+bf16+i8mm -mtune=neoverse-v2 …` | same |
+
+**§14's per-host `CUDA_HOME` guidance is superseded.** Use `/usr/local/cuda-13.2` on both. The §14
+table stays as the record of why the inversion existed.
+
+### 16.4 Honest performance note
+
+The new OpenCV is **not measurably faster than the old one on ordinary CPU calls** — 720p `imencode`
+q80 is 1.767 ms vs 1.790 ms, which is noise. What changed is capability and the elimination of a
+silent fallback:
+
+| | `imencode` 720p q80 | CUDA | working `cudacodec` |
+|---|---|---|---|
+| new canonical build | 1.767 ms | yes | **yes** |
+| previous build | 1.790 ms | yes | no (stub) |
+| Ubuntu system 4.6.0 | **2.252 ms** (+27%) | **no** | no |
+
+The system 4.6.0 is what a bare `python3` on a Spark resolves, and it has no CUDA at all. That is the
+real gap this closes.
+
+---
+
+## 17. Armv9.2 codegen — real, byte-identical, and much smaller than expected
+
+§F6 of the campaign plan found that both the incumbent and replacement SDK were compiled at the
+**aarch64 baseline**, because GCC 13.3 does not know Cortex-X925 and `-mcpu=native` on an
+unrecognised part resolves to nothing at all. This section measures what fixing that is worth.
+
+### 17.1 The flags demonstrably take effect
+
+| Build | `CMAKE_CXX_FLAGS_RELEASE` | SVE instructions in `librealsense2.so` |
+|---|---|---|
+| baseline | `-O3 -DNDEBUG -mcpu=native …` | **0** |
+| Armv9.2 | `-O3 -DNDEBUG -march=armv9.2-a+sve2+bf16+i8mm -mtune=neoverse-v2 …` | **1739** |
+
+Counted with `objdump -d` over `ptrue`/`whilelt`/`ld1[bhwd]`/`st1[bhwd]`. This is the objective
+confirmation that the baseline really was shipping without SVE2 and that the new flags are not
+merely accepted but used.
+
+### 17.2 Correctness is unaffected
+
+- `rs-gb10-profiler --self-test`: **checks=32 failures=0**
+- `rs-enumerate-devices` / `rs-fw-update` / `rs-record` / `rs-benchmark`: all rc=0
+- **Byte-identity**: the 164-frame `.db3` aligned-depth SHA-256 is `2bf7df33fea0d19c…` under the
+  Armv9.2 build — **identical** to the baseline and to every configuration in §9. Different
+  instructions, same bits.
+
+### 17.3 The measurement — reproducible, and modest
+
+SDK CPU post-processing over the recorded `.db3`, best-of-5 per filter, three independent runs.
+Align, pointcloud, colorize and the YUY2 unpack are all **CUDA-gated on GB10**, so the CPU filter
+chain is the only place these flags can show up, and it is what is measured here.
+
+| Filter | baseline (ms/frame) | Armv9.2 (ms/frame) | change |
+|---|---:|---:|---:|
+| `spatial` | 8.8222 / 8.8272 / 8.8291 | 8.7745 / 8.7757 / 8.7786 | **−0.55%** |
+| `hole_filling` | 0.4223 / 0.4225 / 0.4214 | 0.3520 / 0.3516 / 0.3561 | **−16.6%** |
+| `decimation` | 0.4529 | 0.4547 | none |
+| `temporal` | 0.5017 | 0.5018 | none |
+| `disparity_transform` | 0.0091 | 0.0091 | none |
+
+Run-to-run spread is ~0.1%, far smaller than either delta, so both effects are real rather than
+sampling noise. But note which one is which: **`hole_filling` gains 16.6% while `spatial`, which
+dominates the chain at ~8.8 ms, gains 0.55%.** On a realistic chain the net is under 1%.
+
+### 17.4 Verdict — adopt, but for the right reason
+
+This is **not** the large acceleration the baseline-ISA finding suggested it might be. The reason is
+structural: on GB10 the SDK's heavy per-frame work (align, pointcloud, colorize, YUY2 unpack) already
+runs on the GPU, and the CPU filters that remain are mostly memory-bound rather than compute-bound,
+so wider vectors have little to bite on.
+
+Adopt it anyway, because the cost is zero and the alternative is worse than slow — it is *undefined*:
+
+- output is byte-identical, so nothing downstream can observe the change;
+- the self-test and every tool are clean;
+- the gains, though small, are real and reproducible;
+- and the status quo is a build whose ISA is whatever GCC silently fell back to, which is not a
+  decision anyone made. `scripts/build-dgx-spark-gb10.sh` now refuses that configuration outright
+  (`0e226644a`) rather than shipping it unnoticed.
+
+**Anyone hoping for a large win from arch flags on this SDK should read §17.3 first.** The lever that
+would actually matter is moving more work onto the GPU — the NVENC colour path in F10 — not
+recompiling the CPU paths.
+
+---
+
+## §18 Frame-delivery jitter — the tail, not the mean (2026-09-10)
+
+The optimisation target changed: operators perceive *randomly timed* visual and audio events far
+more readily than they perceive throughput. That invalidates the statistic every earlier section
+used. §9–§17 report p50 and, in places, best-of-N — both are throughput statistics. Nothing before
+this section measured how bad a *bad* frame is, which is the number a human actually notices.
+
+Measured with `scripts/gb10/rs-gb10-jitter.py` (new). It reports p50/p90/p99/p99.9/max/stddev for
+inter-arrival and frame age, and quotes **p99 − p50** as the jitter figure. Host receipt is
+`time.perf_counter()` at the instant `wait_for_frames()` returns — the moment a downstream consumer
+could first touch the data.
+
+All runs: spark-3066, D435 sn 347622075921 fw 5.17.3.10, deployed 2.58.4 build `a8977ca55`,
+1280×720@30 depth + colour, under the host's normal co-tenancy (vLLM `vigil-router` + CI runners
+resident). 180 s and 300 s windows.
+
+### §18.1 Steady-state cadence is excellent
+
+| leg | n | p50 | p99 | p99.9 | max | **jitter p99−p50** |
+|---|---:|---:|---:|---:|---:|---:|
+| queue 16 (SDK default) | 5389 | 33.354 | 34.748 | 35.491 | 268.458 | **1.394** |
+| queue 16 (repeat) | 5389 | 33.343 | 34.670 | 35.378 | 268.453 | **1.327** |
+| 300 s run | 8986 | 33.345 | 34.752 | 35.322 | 268.832 | **1.407** |
+
+Inter-arrival ms. Ideal is 33.333. **A p99 within 1.4 ms of p50 across ~20,000 frames is a tight,
+watchable stream** — the SDK is not the jitter problem. Depth/colour skew is p50 = p99 = **0.024 ms**:
+the two imagers are hardware-synchronised to ~24 µs, so anything fusing them is combining
+observations of the same instant.
+
+### §18.2 Two levers measured and REJECTED — record them so they are not re-run
+
+**`RS2_OPTION_FRAMES_QUEUE_SIZE=1` is not a win.** The reasoning for trying it was sound (default 16
+buffers under consumer stall, then delivers a burst). Measured, it is neutral-to-worse:
+
+| | p99 | p99.9 | depth/colour skew max |
+|---|---:|---:|---:|
+| queue 16 | 34.748 | 35.491 | 500.219 |
+| queue 1 | 34.719 | **37.300** | **4662.769** |
+
+No p99 improvement, a worse p99.9, and a pathological 4.66 s skew event that the default never
+produced. `min` inter-arrival also drops 31.095 → 15.658 ms, i.e. queue 1 introduces the very
+burstiness it was meant to remove. **Keep the default.**
+
+**`RS2_OPTION_GLOBAL_TIME_ENABLED=0` is not a win either.** The hypothesis was that the periodic
+device↔host clock re-fit issues a hardware-monitor command down the same USB control path and
+stalls the stream. It does not: max is 269.602 ms with global time off versus 268.453 ms with it on
+— unchanged. Global time costs nothing measurable here, and it is what makes cross-host camera
+stamps comparable, so **leave it on**.
+
+Both are negative results, and both are worth more than a positive would have been: they close two
+plausible-sounding rabbit holes that the next person would otherwise re-run.
+
+### §18.3 The one real artifact: a single ~268 ms stall per pipeline start
+
+Every run shows exactly one gap of 268.5 / 268.7 / 269.6 / 268.5 / 268.8 ms. The consistency
+initially read as a periodic event roughly every three minutes. **It is not periodic — it is
+once per pipeline start**, and the discriminator is the frame index: in the 300 s run
+(8986 samples) the single stall lands at **frame 24**, a few seconds after warm-up ends. Each
+earlier run showed one only because each run restarted the pipeline.
+
+It is frame **loss**, not buffering: `min` inter-arrival is 31.095 ms, so nothing was held back and
+released in a burst, and 5390 frames arrive of 5400 expected. ~268 ms ≈ 8 depth frames.
+
+Attributed, not guessed. `dmesg` during the run:
+
+```
+usb 6-1: Process 2435042 (python3) called USBDEVFS_CLEAR_HALT for active endpoint 0x82
+```
+
+`lsusb -v` puts endpoint **0x82 on the Depth interface**. So: the depth streaming endpoint halts
+shortly after streaming begins, the SDK clears the halt, and the eight frames in flight are lost.
+The SDK cannot prevent a device/xHCI endpoint halt — it can only recover from it, which it does.
+
+**Consequence for vigil-spark:** this is a known, bounded, once-per-start event, not an unknown.
+The mitigation is downstream, not in the SDK — a consumer should settle for ~6 s after pipeline
+start before treating cadence as reliable (the harness's own 3 s warm-up is not enough; the stall
+lands after it), and should hold the last good frame rather than publishing a gap.
+
+### §18.4 Depth resolution: only 1280×720 negotiates on this fleet
+
+Discovered while trying to test whether depth at 848×480@90 would cut the frame interval from
+33.3 ms to 11.1 ms — which would have been the single largest latency win available. It is not
+available:
+
+| depth z16 mode | advertised by `get_stream_profiles()` | actually opens |
+|---|:-:|:-:|
+| 1280×720@30 | yes | **yes** |
+| 848×480 @30/60/90 | yes | no |
+| 640×480 @30/90 | yes | no |
+| 640×360, 480×270, 424×240 | yes | no |
+
+`RS2_USB_STATUS_PIPE` — a probe-commit control-transfer stall at `uvc-device.cpp:873` — which the
+SDK surfaces as the misleading `Failed to resolve the request`. **The SDK advertises depth profiles
+it cannot open**, so any code that enumerates modes and picks one can pick an unopenable one.
+
+Eliminated as causes, each by test rather than by argument:
+
+- **not a 2.58.4 regression** — 2.58.1 fails identically, with the mapped `.so` verified via
+  `/proc/self/maps`, not merely the package path
+- **not host-specific** — reproduced on spark-3066 (native root port) and spark-0060 (spark-bus)
+- **not a wedged endpoint** — survives a USB port de-authorise/re-authorise power cycle
+- **not missing IR pairing** — depth+IR1+IR2 and depth+colour at 848×480 fail the same way
+- **not kernel driver contention** — no driver holds any interface of the device
+- **not fixable by the V4L2 backend** — a `FORCE_RSUSB_BACKEND=OFF` build was made and tested:
+  it enumerates **zero devices**, which vindicates the fork's `LRS_GB10_FORCE_RSUSB=ON` default
+
+This also **retracts a June result**: the stress-matrix entry `HEAVY_60fps_848x480_D+C+IR` was
+recorded as passing. It was a false green from the bug fixed in `eb0120a05` (zero frames delivered
+reported as PASS). 848×480 has not actually been streaming on this fleet.
+
+**Consequence:** 1280×720@30 is not a preference, it is the only depth mode that runs, and 30 Hz is
+therefore a hard floor on frame interval until the probe-commit stall is understood. Any plan that
+assumed a lower-resolution/higher-rate depth mode — including this campaign's own M1 — is void.
+
+### §18.5 Cross-host confirmation on the deployed binary
+
+Both Sparks, deployed 2.58.4 `a8977ca55`, 1280×720@30 D+C. **Co-tenancy stated inline, because
+every bad number either agent produced today was a measurement taken under one condition and
+reported as a property of the system:**
+
+| host | co-tenancy | USB path | n | p50 | p99 | p99.9 | **jitter p99−p50** | **tail-excess p99.9−p50** |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| spark-3066 | vLLM router + 3 CI runners | native xHCI root port | 8986 | 33.345 | 34.752 | 35.322 | **1.407** | **1.977** |
+| spark-0060 | vLLM router + SAM3 + voice sidecars, no CI | spark-bus | 7187 | 33.338 | 34.727 | 35.309 | **1.388** | **1.971** |
+
+Two hosts, two USB topologies, two co-tenancy mixes, agreeing to **~0.02 ms**. Depth/colour skew is
+p50 = p99 = 0.024 ms on both. This is the strongest available statement that the SDK-side
+contribution to operator-visible jitter is small and stable.
+
+The per-start stall is now **six observations across both hosts** — frame 24 (300 s), frame 20
+(0060, 240 s), frame 15 (12 s). The frame index is what settles "per start" against "periodic": a
+periodic event would drift with run duration, and it does not. The settle window therefore has to
+be re-armed on every pipeline restart, not only at node startup.
+
+**Deployment validation on the new binary:** 720p stress tier ×2 on spark-0060, `failed: 0`,
+`aborted: false`, 360 frames per stream per 12 s entry (= 30 fps exactly); the two entries reporting
+353 are the once-per-start stall costing ~7 frames, which is the expected signature rather than an
+anomaly. `SELF_TEST checks=32 failures=0` on both hosts.
+
+### §18.6 A pin that could not be verified from the other host
+
+Found while validating, and worth recording because the *shape* of the defect is the lesson. Both
+Sparks' `python3` was importing **2.58.1** bindings while `/usr/local/lib` and `profile.d` already
+pointed at 2.58.4 — so spark-3066 was running **2.58.1 bindings against a 2.58.4 `.so`**.
+
+The pin lived in a **different file on each host**:
+
+| host | file | was |
+|---|---|---|
+| spark-3066 | `~/.local/lib/python3.12/site-packages/realsense_gb10.pth` (user site) | 2.58.1 |
+| spark-0060 | `/usr/local/lib/python3.12/dist-packages/pyrealsense2-gb10.pth` (system) | 2.58.1 |
+
+So a fleet check that looked in one location would have returned a confident, wrong answer on the
+other host. **`import_ok devices=1` does not catch this** — it proves liveness, not version, and it
+was my own green light earlier in this campaign. Verify the package version *and* the mapped
+library via `/proc/self/maps`. Both hosts now resolve package and `.so` at 2.58.4; the previous
+files are kept as `*.pre-2584`.

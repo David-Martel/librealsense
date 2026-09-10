@@ -1,12 +1,24 @@
 #!/usr/bin/env bash
 # launch_depth_only.sh — SAFE depth-only RealSense launch for GB10 (DGX Spark)
 #
-# SAFETY CONSTRAINTS:
-#   - Single stream (depth only): conservative safe envelope for GB10 USB controller.
-#   - Multi-stream (default all-streams) is NOT safe on GB10 — it causes xHCI controller
-#     death under high-bandwidth conditions. Always use this script, never the default launch.
-#   - DO NOT add enable_color:=true, enable_gyro:=true, enable_accel:=true without first
-#     verifying USB controller stability on the GB10 bus that the camera is attached to.
+# SUPERSEDED 2026-09-10 — this script's central claim is no longer true.
+#
+#   "Multi-stream is NOT safe on GB10" held from June 2026 until it was re-measured. Four
+#   concurrent 1280x720@30 streams (depth + colour + IR1 + IR2) now run clean on BOTH Sparks:
+#   734,008 frames, 0 dropped, 0 xHCI danger signatures, an 80-minute soak on spark-3066
+#   across 40 pipeline restarts plus an equivalent run on spark-0060, on two different xHCI
+#   controller instances. See docs/gb10/benchmarks.md section 15.
+#
+#   The June controller deaths were real; what changed since is at minimum the kernel, the
+#   camera firmware, the SDK and the topology, and this result does not say which one fixed
+#   it. Depth-only remains a perfectly good minimal profile — it is simply no longer the
+#   only safe one, and multistream no longer needs the warning below.
+#
+# STILL TRUE:
+#   - Run the kernel tripwire (scripts/gb10/rs-gb10-stress-matrix.py, which aborts on the
+#     first danger signature) against any NEW configuration before trusting it.
+#   - One camera per process; hold a single rs2::context for the process lifetime rather
+#     than destroying and recreating it (see src/usb-tuning.h, controller-death #2).
 #
 # USAGE: run as a regular user (not root).  The parent process must not have the camera
 #        open in any other process — concurrent opens crash the GB10 USB controller.

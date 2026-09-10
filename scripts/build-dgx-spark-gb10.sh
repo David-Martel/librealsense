@@ -28,7 +28,15 @@ GENERATOR="${LRS_GB10_GENERATOR:-Ninja}"
 # GCC 13.3 silently degrades 'native' to an armv8-a baseline on Cortex-X925). Set LRS_GB10_REPRODUCIBLE=1
 # for an explicit GB10 ISA and a GCC-13-supported tuning target. GCC 13.3 rejects both
 # -mcpu=cortex-x925 and -mcpu=cortex-a725; both Spark core classes expose Armv9.2-A, SVE2, BF16, and I8MM.
-if [[ "${LRS_GB10_REPRODUCIBLE:-0}" == "1" ]]; then
+# Default flipped to the explicit Armv9.2 ISA on 2026-09-10, on measurement rather than
+# preference. -mcpu=native is not a faster alternative to this -- on GCC 13.3 + Cortex-X925 it
+# resolves to NOTHING and silently produces an aarch64 baseline binary with zero SVE
+# instructions (objdump: 1739 vs 0). The Armv9.2 build is byte-identical on the align
+# identity fixture, passes the profiler self-test 32/0, and is 16.6% faster on hole_filling
+# and 0.55% on spatial -- small, but real and reproducible across three runs, and free.
+# Set LRS_GB10_REPRODUCIBLE=0 to get the old host-specific behaviour back. See
+# docs/gb10/benchmarks.md section 17 before expecting a large win from this.
+if [[ "${LRS_GB10_REPRODUCIBLE:-1}" == "1" ]]; then
   ARCH_FLAG="${LRS_GB10_ARCH:--march=armv9.2-a+sve2+bf16+i8mm -mtune=neoverse-v2}"
 else
   ARCH_FLAG="${LRS_GB10_ARCH:--mcpu=native}"
@@ -38,6 +46,30 @@ CXX_COMPILER="${CXX:-c++}"
 if ! printf 'int main() { return 0; }\n' | "$CXX_COMPILER" "${ARCH_ARGS[@]}" -x c++ -c -o /dev/null -; then
   echo "ERROR: C++ compiler '$CXX_COMPILER' rejects LRS_GB10_ARCH='$ARCH_FLAG'" >&2
   exit 1
+fi
+# Acceptance is NOT effectiveness. GCC 13.3 does not know Cortex-X925: it rejects
+# -mcpu=cortex-x925 outright, but -mcpu=native on an unrecognised part resolves to
+# NOTHING and compiles happily at the aarch64 baseline. The check above passes, the
+# build succeeds, and the artifact silently loses SVE2, BF16, I8MM and the Armv9.2
+# baseline. That is how both the 2.58.1 prefix pinned on the fleet and its 2.58.4
+# replacement came to be baseline armv8-a builds (measured 2026-09-10).
+# So ask the compiler what the flags actually RESOLVED to, and refuse to build a
+# silently-degraded artifact unless that is explicitly what was asked for.
+ARCH_EFFECTIVE="$(
+  "$CXX_COMPILER" "${ARCH_ARGS[@]}" -Q --help=target 2>/dev/null \
+    | awk '$1 ~ /^-m(arch|cpu|tune)=$/ && NF > 1 { found = 1 } END { print found + 0 }'
+)"
+if [[ "$ARCH_EFFECTIVE" != "1" ]]; then
+  echo "WARNING: '$CXX_COMPILER' accepts ARCH_FLAG='$ARCH_FLAG' but resolves it to an" >&2
+  echo "         EMPTY -march/-mcpu/-mtune, i.e. it will build at the aarch64 baseline" >&2
+  echo "         with no SVE2/BF16/I8MM. This is the GCC-13-on-Cortex-X925 trap." >&2
+  echo "         Fix: LRS_GB10_REPRODUCIBLE=1 (explicit Armv9.2 ISA), or set" >&2
+  echo "         LRS_GB10_ARCH yourself. Set LRS_GB10_ALLOW_BASELINE_ARCH=1 to proceed." >&2
+  if [[ "${LRS_GB10_ALLOW_BASELINE_ARCH:-0}" != "1" ]]; then
+    echo "ERROR: refusing to build a silently baseline-ISA artifact." >&2
+    exit 1
+  fi
+  echo "         LRS_GB10_ALLOW_BASELINE_ARCH=1 set -- proceeding at baseline ISA." >&2
 fi
 NATIVE_FLAGS="${LRS_GB10_NATIVE_FLAGS:--O3 -DNDEBUG $ARCH_FLAG -ffunction-sections -fdata-sections}"
 LINK_FLAGS="${LRS_GB10_LINK_FLAGS:--Wl,--gc-sections}"
@@ -84,7 +116,16 @@ BUILD_UNIT_TESTS="${LRS_GB10_BUILD_UNIT_TESTS:-OFF}"
 # To fall back to system OpenCV, point at a path that does not exist:
 #   LRS_GB10_OPENCV_DIR=/dev/null/no-opencv  scripts/build-dgx-spark-gb10.sh configure
 # (An empty string restores the default due to bash :- substitution semantics.)
-LRS_GB10_OPENCV_DIR="${LRS_GB10_OPENCV_DIR:-/opt/gb10-cuda/install/opencv}"
+# Default changed 2026-09-10 from /opt/gb10-cuda/install/opencv to the fleet's single
+# canonical OpenCV. The old prefix is a 10-module partial build, and -- the reason this
+# matters beyond module count -- it is compiled against DIFFERENT CUDA versions on the two
+# Sparks: 13.0 on spark-3066 and 13.2 on spark-0060. That inversion is what forced a
+# per-host CUDA_HOME pin, because wrappers/opencv/CMakeLists.txt:5 hard-fails when the SDK's
+# CUDA does not match the one OpenCV was built with. /opt/opencv-cuda-4.14.0 is now built
+# from one recipe against CUDA 13.2 on BOTH hosts (vigil-spark ops/build_opencv_cuda.sh),
+# with cuDNN, OpenGL, TBB and a working cudacodec, so the same CUDA_HOME works everywhere
+# and the per-host pin is retired.
+LRS_GB10_OPENCV_DIR="${LRS_GB10_OPENCV_DIR:-/opt/opencv-cuda-4.14.0}"
 MODE="all"
 
 usage() {
@@ -139,7 +180,7 @@ Useful environment:
                            build passes -DOpenCV_DIR to that directory so the CV
                            examples and wrappers (cv-helpers, depth-quality, KinFu)
                            link the CUDA OpenCV instead of the stock Ubuntu 4.6.0.
-                           Default: /opt/gb10-cuda/install/opencv (the GB10 CUDA
+                           Default: /opt/opencv-cuda-4.14.0 (the fleet's single CUDA
                            media stack built by the gb10-cuda Codex session).
                            To skip and fall back to whatever CMake finds on the
                            system, point at a non-existent path (bash :- means
