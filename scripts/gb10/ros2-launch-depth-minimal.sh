@@ -23,7 +23,12 @@
 # USAGE (operator, manual, serial only):
 #   bash ~/dev/repos/librealsense/scripts/gb10/ros2-launch-depth-minimal.sh [extra ros2 launch args]
 #
-# PROFILE: 848x480x30 — proven-safe envelope from GB10 USB stability validation.
+# PROFILE: 848x480x30 — a deliberately minimal profile, no longer a safety envelope.
+#   Multistream at 1280x720x30 was validated on both Sparks 2026-09-10 (734,008 frames,
+#   0 dropped, 0 xHCI faults; docs/gb10/benchmarks.md section 15). 848x480 remains the
+#   D435's tuned DEPTH mode -- 720p depth is upsampled from the same 1280x800 imager --
+#   so this profile is still the right default for depth. It is a quality choice now,
+#   not a USB-stability constraint.
 
 set -eo pipefail  # NOT -u: ROS2 setup.bash references unbound vars (AMENT_TRACE_SETUP_FILES)
 

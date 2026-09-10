@@ -785,3 +785,49 @@ turns on, and the one this two-host comparison controls for.
 
 Earlier notes in this repo that treated 0060 as "behind a hub, therefore unvalidated" over-weighted
 the hub and under-weighted the controller instance.
+
+
+### 15.5 Soak result — the envelope is retired
+
+Both hosts, 4 concurrent 1280×720@30 streams (Z16 depth + colour + IR1 + IR2), each pass a fresh
+pipeline open/close so that start/stop cycling — which preceded **every** observed GB10 controller
+death — is exercised, not just steady streaming.
+
+| | spark-3066 | spark-0060 |
+|---|---|---|
+| passes × duration | **40 × 120 s** (~80 min streaming, 84 min wall) | 11 × 120 s (~22 min) |
+| pipeline open/close cycles | **40** | 11 |
+| frames delivered | **575,696** | 158,312 |
+| min frames per stream per pass | **3598** of 3600 | **3598** of 3600 |
+| **dropped frames (gaps), all streams, all passes** | **0** | **0** |
+| kernel USB danger signatures | **0** | **0** |
+| exit | `DONE_RC=0` | `DONE_RC=0` |
+
+**Combined: 734,008 frames, zero dropped, zero xHCI faults, across two different xHCI controller
+instances.**
+
+**Acceptance was by frame count, not by the harness's PASS flag** — deliberately. The spark-3066 run
+was started before `eb0120a05` landed, so it executed the harness *with* the false-green defect
+(§15.2 †), under which a zero-frame pass prints `[PASS]`. Every pass in both JSON results was
+therefore re-checked for four populated streams with ~3600 frames each. All 51 passes satisfy that.
+Quoting `summary.passed` from the 3066 run would not have been evidence of anything.
+
+#### Verdict: the single-high-rate-stream envelope is retired
+
+The three conditions this repository set for lifting it are met:
+
+1. **A real soak** — 80 minutes, not the ~12 that was previously called insufficient.
+2. **An equivalent run on spark-0060** — done, on a different xHCI controller instance.
+3. **Zero faults under a load heavier than the June killer** — 720p30 ×4 moves more bytes per second
+   than `HEAVY_60fps_848x480_D+C+IR`, the configuration that killed the controller on 2026-06-02.
+
+The June defect was real and is preserved in `docs/gb10/FINDINGS-2026-06-03.md` as history. What
+changed since is at minimum the kernel (6.17.0-1021 → 6.17.0-1029-nvidia), the camera firmware
+(5.13.0.55 → 5.17.3.10), the SDK, and the USB topology. This result does **not** identify which of
+those fixed it, and does not claim the silicon defect is gone — it establishes that the configuration
+the envelope forbade now runs clean for 80 minutes across 40 restarts on both hosts, which is the
+question the envelope was actually blocking.
+
+**What replaces it:** the kernel tripwire stays armed in every harness run, and
+`RS2_GB10_USB_TUNING` stays available. Guidance changes from "never run multistream" to "multistream
+at 720p30 is validated on both Sparks; run the tripwire on any new configuration before trusting it."

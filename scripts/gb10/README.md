@@ -84,11 +84,16 @@ check (`rs-fw-update -f` streams any signed image), but the **device** enforces 
 highest-ever-installed (throws "Device is locked for update… use firmware version higher than: …",
 `:242`). **Production D435s ship locked → downgrade is forward-only / blocked by the device;** only an
 unlocked/dev unit can be downgraded. Consequence: the 2×2 firmware-attribution test likely **cannot** put
-the current (locked) unit back on 5.13.0.55 — it needs the original old unit. **Current decision: HOLD on
-firmware (stay on 5.15.1.55); do not flash** while benchmarking/robustness/ROS2-integration work proceeds.
+the current (locked) unit back on 5.13.0.55 — it needs the original old unit. **Current decision (2026-09-10): both fleet cameras are on 5.17.3.10, which the vendor's own
+version database prescribes for a D435 — nothing to flash** while benchmarking/robustness/ROS2-integration work proceeds.
 
 ## Safety model (read before HIL)
-- **Single-stream** (depth or color alone) is the conservative-safe envelope for production-critical use.
+- **Multistream at 1280x720@30 is validated on BOTH Sparks** (2026-09-10): 4 concurrent streams
+  (depth + colour + IR1 + IR2), 734,008 frames, **0 dropped, 0 xHCI faults**, 80-minute soak on
+  spark-3066 across 40 pipeline restarts plus an equivalent run on spark-0060. The
+  single-high-rate-stream envelope is **retired** — see `docs/gb10/benchmarks.md` §15.
+- Run the kernel tripwire (`rs-gb10-stress-matrix.py`, which aborts on the first danger
+  signature) against any *new* configuration before trusting it. Validated ≠ unconditional.
 - **Multi-stream / churn / soak** are **eyes-open**: on the death-era camera/firmware/topology they killed
   the xHCI controller (reboot to recover). The current unit (FW 5.15.1.55, clean USB-3 bus) has survived
   them with zero `-110`, but that result is **confounded** (unit + firmware + topology + mitigations all
