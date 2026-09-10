@@ -348,135 +348,142 @@ clause exists to prevent.
 
 ---
 
-## 11. BLOCKER — 2.58.4 double-frees at exit on the GB10 build
+## 11. RESOLVED — 2.58.4 double-freed at exit; the cause was a librealsense linkage defect
 
-Found while executing A6 (the Spark build). This is the reason A6 is verification and not deployment:
-the x86_64 build was clean, and the defect only appears in the GB10 configuration.
+Found while executing A6 (the Spark build), diagnosed to a defect in `rsutils`' linkage model, and
+fixed in code. **C++20 is retained.** This section was rewritten on 2026-09-10 after the real root
+cause was found; an earlier revision blamed the fork's C++20 default and recorded C++14 as the fix.
+Both of those claims were wrong, and the corrected reasoning is below.
 
 ### Symptom
 
-Every tool built from 2.58.4 by `scripts/build-dgx-spark-gb10.sh` aborts at exit — including
-`rs-enumerate-devices --version`, which never touches a camera:
+Every tool built from 2.58.4 aborted at exit — including `rs-enumerate-devices --version`, which
+never touches a camera:
 
 ```
 /opt/vigil/opt/librealsense-v2.58.4-dgx-spark-gb10-canary/bin/rs-enumerate-devices  version: 2.58.4.0
 free(): double free detected in tcache 2      <- SIGABRT, core dumped
 ```
 
-Same host (spark-3066), same script, same fork:
-
-| Prefix | Result |
-|---|---|
-| `librealsense-v2.58.1-dgx-spark-gb10` | clean |
-| `librealsense-v2.58.3-dgx-spark-gb10-py312` | clean |
-| `librealsense-v2.58.4-dgx-spark-gb10-canary` | **aborts** |
-
-### Root cause (gdb, not inference)
+### Root cause (gdb + `readelf`, not inference)
 
 ```
 #8  ~basic_json<..., rsutils::json_base>()        at 0x0000aaaaaad65590   <- EXECUTABLE range
 #9  __cxa_finalize
 #10 __do_global_dtors_aux   from .../lib/librealsense2.so.2.58            <- LIBRARY range 0x0000ffff...
 #11 _dl_call_fini -> _dl_fini -> __run_exit_handlers -> exit
-#15 TCLAP::CmdLine::parse   (--version prints, then exit())
 ```
 
-The library's finalizer runs a destructor for a global `nlohmann::json` object that lives in the
-**executable**. Two copies of one global object exist; each is destroyed once; the second `free()`
-is a double free.
+The library's finalizer runs a destructor for a global `nlohmann::json` that lives in the
+**executable**. One object, two constructions, two destructions.
 
-### Why 2.58.4 and not 2.58.3 — measured symbol counts
+The structural cause is three lines of build configuration:
 
-`nm -DC --defined-only` on the `.so`, `nm -C` on the executable:
-
-| Build | `.so` exported `json_abi` | exe local `json_abi` | Result |
-|---|---:|---:|---|
-| 2.58.1 GB10 (aarch64) | 504 | 62 | clean |
-| 2.58.3 GB10 (aarch64) | 511 | 62 | clean |
-| **2.58.4 GB10 (aarch64)** | **158** | **157** | **double free** |
-| 2.58.4 plain (x86_64, asuspro13) | 158 | 62 | clean |
-
-Upstream `4bbc18032` added `-Wl,--exclude-libs` (`hide_bundled_archive_symbols` in
-`CMake/lrs_macros.cmake`) to keep bundled static-archive symbols out of the dynamic symbol table —
-its stated purpose is to stop ROS 2 FastDDS/FastCDR ABI interposition crashes. That drops exported
-json symbols 511 → 158. Previously the executable's json references bound to the library's exported
-copy; now they cannot, and the tools carry their own.
-
-### It is not purely upstream
-
-The x86_64 row is the control: **identical `.so` hiding (158), but the executable stays at 62 and
-does not crash.** The executable only balloons to 157 under the GB10 configuration. The most likely
-differentiator is `CMAKE_CXX_STANDARD=20`, which the GB10 script sets
-(`scripts/build-dgx-spark-gb10.sh:44`) while upstream core builds C++14 and tools C++11 — a different
-standard changes which template instantiations get emitted locally versus bound externally.
-
-`realsense.TODO.md` already anticipated this: *"Keep `LRS_GB10_CXX_STANDARD=20` … unless a downstream
-wrapper shows an ABI or source-compatibility issue."* **This is that issue.** It is also plausibly the
-same family as the fork's long-open *"RealDDS duplicate static/shared symbol"* item — upstream's
-change appears to have converted a latent duplicate-symbol condition into a hard crash.
-
-### 11.1 Confirmed — single-variable experiment, and fixed
-
-A C++14 probe build (`librealsense-v2.58.4-gb10-cxx14-probe`) was built on the same host, from the
-same commit, with the same script and the same CUDA. **The only variable was
-`LRS_GB10_CXX_STANDARD`:**
-
-| Build | `.so` exported `json_abi` | exe local `json_abi` | `rs-enumerate-devices --version` |
-|---|---:|---:|---|
-| C++20 (previous default) | 158 | **157** | `rc=134` — `free(): double free detected in tcache 2` |
-| **C++14 (new default)** | 159 | **62** | **`rc=0`, clean** |
-
-C++14 collapses the executable's local json symbols 157 → 62 — back to the 2.58.1/2.58.3 figure — and
-the crash disappears. **Hypothesis confirmed.**
-
-**State the causality precisely, because both halves are required.** Upstream's `--exclude-libs`
-change is the **necessary** condition — 2.58.3 at C++20 was clean, so C++20 alone never crashed. The
-fork's C++20 default is the **sufficient trigger on top of it** — 2.58.4 at C++14 is clean, so
-upstream's change alone does not crash either. Neither party's change is wrong by itself; the
-combination is. That is exactly why the upstream report (fix option 2) is worth filing *and* why
-changing our default is the correct immediate fix.
-
-**Fixed:** `scripts/build-dgx-spark-gb10.sh` now defaults `CXX_STANDARD` to **14**, with the
-measurement recorded inline so the next person does not re-litigate it. `rs-gb10-profiler` pins
-`CXX_STANDARD 20` on its own target and is unaffected — which is precisely the arrangement
-`realsense.TODO.md` described as the fallback ("rebuild with `LRS_GB10_CXX_STANDARD=14` and keep only
-`rs-gb10-profiler` on C++20"). The C++20 default never had a measured win to weigh against this.
-
-The upstream-facing half of the problem still stands and is worth reporting: **any** downstream that
-builds tools at a different `-std` than the library will hit this, because `--exclude-libs` makes the
-duplicate global object reachable. That is fix option 2 below and does not block the fleet.
-
-### 11.2 A0 gate — met in full
-
-Run against the fixed prefix. **No rebuild was needed: `-cxx14-probe` *is* the fixed configuration.**
-
-| Check | Result |
+| Where | What |
 |---|---|
-| `rs-gb10-profiler --self-test` | **`checks=32 failures=0`, rc=0** |
-| `rs-enumerate-devices --version` | rc=0, clean |
-| `rs-fw-update`, `rs-dds-adapter`, `rs-dds-config` | rc=0, clean stderr — the fix is not per-binary |
+| `third-party/rsutils/CMakeLists.txt:6` | `add_library( rsutils STATIC "" )` |
+| `CMakeLists.txt:64` | `target_link_libraries( ${LRS_TARGET} PUBLIC rsutils )` |
+| `CMakeLists.txt:108` | `hide_bundled_archive_symbols(...)` — **`rsutils` is not in the list** |
 
-The profiler is the strongest evidence: it pins `CXX_STANDARD 20` on its own target and links the same
-library, yet is clean. So **per-target C++20 is fine; only the global default mattered.** Its
-provenance also confirms the build is the intended one: `BUILD_WITH_CUDA=1`,
-`FORCE_RSUSB_BACKEND=1`, `RS2_GB10_USB_TUNING=1`, `RS2_GB10_CONV_CACHE=1`, `RS2_GB10_PC_ZEROCOPY=0`.
+`rsutils` is a **static** library linked **PUBLIC** into the **shared** `realsense2`. Every
+executable that links realsense2 therefore also links `librsutils.a` and gets its own definition of
+every global `rsutils` owns. With default (preemptible) visibility, ELF resolves both the library's
+and the executable's references to the **executable's** copy — so `librealsense2.so`'s initializer
+constructs the executable's object and registers a destructor for it, and the executable's
+initializer does the same.
 
-> ### Which prefix is which — read before deploying anything
-> Two 2.58.4 prefixes now exist on spark-3066 and **the names do not tell you which is good**:
-> - `librealsense-v2.58.4-dgx-spark-gb10-canary` — **BROKEN**, built at the old C++20 default. Delete
->   it before someone mistakes the word "canary" for "candidate."
-> - `librealsense-v2.58.4-gb10-cxx14-probe` — **GOOD**, the fixed configuration. This is what A7 should
->   point at, ideally rebuilt under a clean `-canary` name once the broken one is removed.
+An audit of `librsutils.a` finds exactly **five** global data objects, all affected:
 
-Until A7 is deliberately performed, **no fleet consumer is re-pinned to 2.58.4.** Both Sparks'
-`/usr/local/lib/librealsense2.so*` still resolve to the 2.58.1 prefix and were not touched.
+```
+rsutils::null_json  rsutils::missing_json  rsutils::empty_json_string
+rsutils::empty_json_object          <- the four json sentinels: the crash
+rsutils::g_librealsense_elpp_id     <- same defect, silent (see below)
+```
 
-### Fix options, in order of preference
+### Why it looked like a C++20 problem — and why that reading was wrong
 
-1. **`LRS_GB10_CXX_STANDARD=14`** — if §11.1 confirms it, this is a one-variable change the fork
-   already documented as the fallback. Costs the C++20 experiment, which has no measured win.
-2. **Link the tools against the library's json rather than their own copy** — the principled fix, and
-   the one to take upstream, since any downstream consumer building tools at a different `-std` hits
-   this.
-3. Do **not** simply revert `4bbc18032`: it fixes a real ROS 2 ABI crash, which matters more to this
-   fleet than the C++20 experiment does.
+Neither of the executable's own object files references `missing_json`. The archive drags
+`json.cpp.o` in *transitively*, and how much of `librsutils.a` gets pulled depends on which members
+are referenced:
+
+| `-std` | rsutils symbols pulled into the exe | sentinels among them | Result |
+|---|---:|---:|---|
+| `c++14` | 18 | 0 | clean |
+| `c++20` | 105 | 4 | double free |
+
+So the standard only changes **whether the linker extracts the defective archive member**. The
+defect is present at every standard; C++14 merely fails to reach it. Treating C++14 as the fix
+papered over a live bug and cost the C++20 optimizations for nothing.
+
+Two further corrections to the earlier reading:
+
+- **Upstream `4bbc18032` (`-Wl,--exclude-libs`) is not the cause.** It drops the `.so`'s exported
+  json symbols 511 → 158, so the executable's references can no longer bind to the library's copy.
+  That makes the bug *easier to reach*, not real. It fixes a genuine ROS 2 FastDDS ABI crash that
+  matters more to this fleet than any of this, and **must not be reverted**.
+- **It is not GB10-specific.** Reproduced on plain x86_64 (asuspro13) with a **stock** configure at
+  `-std=c++20` — no GB10 script, no CUDA, no RSUSB. The earlier "x86_64 is clean" control row was a
+  build at a *different standard*, so it compared two variables at once. This is a general
+  librealsense defect.
+
+### 11.1 The fix — hidden visibility on every duplicated global
+
+`fdb79b7c5` hid the four json sentinels; `16382ef5c` generalised the mechanism into
+`rsutils/visibility.h` (`RSUTILS_LOCAL`) and applied it to the fifth.
+
+Hidden visibility gives each module a private, non-preemptible copy, so each is constructed and
+destroyed exactly once. That is only correct for globals two modules never need to *agree* on, and
+both qualify — they are compared by **value**, never by address:
+
+- `json_ref::exists()` tests `_j.is_discarded()` (`json.h:54`), not `&_j == &missing_json`.
+- the elpp id is handed to `el::Loggers::getLogger()`, which looks up by string content.
+
+The attribute is repeated on each definition because GCC emits default visibility for a definition
+that does not carry it, even when the declaration did.
+
+**`g_librealsense_elpp_id` was the same bug, silently.** It is a `std::string const` with identical
+duplicate-and-preempt behaviour, and it did not abort only because `LIBREALSENSE_ELPP_ID` is
+`"librealsense"` — 12 characters, inside libstdc++'s 15-character short-string buffer — so the string
+holds no heap allocation and the second destruction frees nothing. Renaming the logger id to
+anything longer would have turned it into the same crash.
+
+On Windows the `#if defined(_WIN32)` branch expands to nothing: PE has no symbol interposition, and
+`src/realsense.def` (verified) does not list any of the five, so the DLL never exported them.
+
+### 11.2 Verification — C++20 restored, both architectures
+
+| Check | x86_64 asuspro13 | aarch64 spark-3066 (GB10, CUDA 13.0) |
+|---|---|---|
+| `-std=` actually used | c++20 | c++20 |
+| 5 globals: `.so` exports / exe dynsym | **0 / 0** (was 4 / 1) | 0 sentinels exported |
+| tools × 3 runs | 9/9 rc=0, clean stderr | 10/10 rc=0, clean stderr |
+| unfixed control build | still rc=134 | — |
+| `rs-gb10-profiler --self-test` | n/a (no CUDA/GL) | **checks=32 failures=0** |
+| CUDA objects compiled | n/a | **5** — first CUDA-clean build (see §11.3) |
+| unit tests | json-compat 6, config-file 13, hexarray 117 — pass | — |
+| python | `pyrealsense2 2.58.4`, pyrealdds, pyrsutils import | built + installed |
+| logging across the DSO boundary | `--debug` emits DEBUG lines | — |
+
+The last row matters: it is the positive control for hiding the elpp id. If the logger id were being
+matched by address rather than content, the hidden copies would fail to find the logger and the
+DEBUG lines would vanish.
+
+### 11.3 Why the CUDA surface had never been compile-verified
+
+Unrelated to the crash, found in the same build. `sccache` mangles the stub translation unit `nvcc`
+generates (`__cudaLaunch` macro arity, in `/tmp/sccache_nvcc*/x_0.cudafe1.stub.c`), which failed
+**every** `.cu` file. The build script applied a single auto-detected launcher to C, C++ and CUDA
+with no opt-out, so the CUDA path had never compiled in this configuration.
+
+Split into `LRS_GB10_LAUNCHER` (auto → sccache/ccache/none) and `LRS_GB10_CUDA_LAUNCHER` (default
+`none`). A stale `CMAKE_CUDA_COMPILER_LAUNCHER` survives in `CMakeCache.txt`, so a clean configure is
+required after changing it.
+
+### Upstream
+
+The fix is generic — it is not a GB10 workaround and carries no fork-specific conditionals — so it
+belongs upstream (A10). Any downstream that links `realsense2` is exposed; the executable simply has
+to reference enough of `rsutils` to drag `json.cpp.o` out of the archive. The alternative structural
+fix, adding `rsutils` to `hide_bundled_archive_symbols`, was not chosen: it would hide *all* rsutils
+symbols from the `.so`, which is a much larger ABI change than making five immutable globals
+module-local.

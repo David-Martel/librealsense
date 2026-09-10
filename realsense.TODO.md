@@ -338,25 +338,36 @@ Default feature set:
 - Reboot once to apply the installed kernel command-line power settings, then
   repeat the visible and no-render profiler runs.
 - Keep CUDA architecture `121`; the GB10 configure/build path accepted it.
-- ~~Keep `LRS_GB10_CXX_STANDARD=20` for GB10 experiments unless a downstream
-  wrapper shows an ABI or source-compatibility issue.~~ **RESOLVED 2026-09-10 — the
-  trigger this item anticipated has fired, and the default is now `14`.** Against
-  upstream 2.58.4, building the unpinned targets at C++20 produces an **exit-time
-  double free in every tool** (`rs-enumerate-devices --version` -> rc=134). Measured
-  on spark-3066, single variable, same commit/host/script/CUDA:
-  C++20 -> `.so` exports 158 json syms / exe carries 157 -> **crash**;
-  C++14 -> 159 / 62 -> **clean**. `rs-gb10-profiler` pins `CXX_STANDARD 20` on its own
-  target and self-tests 32/32 — so the outcome is exactly the fallback this item
-  described ("keep only `rs-gb10-profiler` on C++20"). This was **not** a
-  stability-over-modernization trade: C++20 had no measured win, and the cost was an
-  abort in every tool. Full evidence:
+- **Keep `LRS_GB10_CXX_STANDARD=20`.** This item previously read "unless a downstream wrapper
+  shows an ABI or source-compatibility issue", and on 2026-09-10 was briefly marked RESOLVED with
+  the default changed to `14`. **That resolution was wrong and has been reverted.** Against upstream
+  2.58.4 every tool did abort at exit (`rs-enumerate-devices --version` -> rc=134, `free(): double
+  free detected in tcache 2`), but C++20 was not the cause: `rsutils` is a STATIC library linked
+  PUBLIC into the shared `realsense2`, so each of the five globals it owns is defined twice, and
+  with default visibility both modules construct and destroy the executable's copy. The `-std` only
+  decides whether the linker drags `json.cpp.o` out of the archive (c++14 pulls 18 rsutils symbols
+  and no sentinels; c++20 pulls 105 including all four). The bug is standard-independent and
+  reproduces on plain x86_64 with a stock configure. Fixed in code by giving all five globals hidden
+  visibility (`fdb79b7c5`, `16382ef5c`); C++20 is restored and verified on both architectures.
+  Upstream `4bbc18032` (`--exclude-libs`) made it easier to reach but is not the cause and must not
+  be reverted. Full evidence:
   [`docs/gb10/UPGRADE-PLAN-2026-09-10.md`](docs/gb10/UPGRADE-PLAN-2026-09-10.md) §11.
 - Keep `LRS_GB10_WITH_IPO=OFF` for now. LTO should only be enabled after a clean
   A/B benchmark because pybind/CUDA builds are more sensitive to link-time
   optimization and no measured win has been shown yet.
-- Investigate the remaining RealDDS duplicate static/shared symbol issue before
-  relying on normal `rs-dds-adapter` shutdown in production. The `--help` and
-  `--version` paths are fixed and covered by validation.
+- ~~Investigate the remaining RealDDS duplicate static/shared symbol issue before
+  relying on normal `rs-dds-adapter` shutdown in production.~~ **RESOLVED 2026-09-10.**
+  It was the same defect as the json double free (§11): a bundled static archive whose
+  globals are duplicated between `librealsense2.so` and each executable, then collapsed
+  onto one copy by symbol preemption. Two changes close it. Upstream `4bbc18032` added
+  `hide_bundled_archive_symbols(...)` (`CMakeLists.txt:108`), which covers `realdds` and
+  six other archives, so the `.so` no longer exports their globals; `16382ef5c` covers
+  `rsutils`, which that list omits. Measured on the fixed build: across all eight bundled
+  archives (543 global data objects, 80 of them realdds'), **zero** are exported by the
+  `.so` *and* present in an executable's dynamic symbol table — the preemption that caused
+  the double construction is structurally gone. Normal shutdown now verified, not just
+  `--help`/`--version`: `rs-dds-adapter` started, allowed to reach "Start listening to RS
+  devices", and SIGINTed — **rc=0, 3/3 runs**, logging "Shutting down rs-dds-adapter".
 - Build or install CUDA-enabled OpenCV under `/opt/vigil/opt/opencv-cuda` before
   moving VIGIL preview processing onto `cv2.cuda`; the current system `cv2`
   install did not expose usable CUDA devices.
