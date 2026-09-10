@@ -271,3 +271,47 @@ Checked on the fleet rather than assumed:
 
 Sources for the DDS levers: [ROS 2 Jazzy DDS tuning](https://docs.ros.org/en/jazzy/How-To-Guides/DDS-tuning.html),
 [rmw_cyclonedds shared-memory support](https://github.com/ros2/rmw_cyclonedds/blob/rolling/shared_memory_support.md).
+
+### SDK options worth setting explicitly
+
+None of these are set by vigil-spark's node today; all are one call at startup. Source references are
+in this tree unless noted.
+
+| Option | Verdict | Why |
+|---|---|---|
+| `RS2_OPTION_FRAMES_QUEUE_SIZE` = **1** | **Adopt** | Drop-oldest instead of queueing. The cheapest latency win available, and it bounds the worst case rather than improving the average. |
+| `RS2_OPTION_GLOBAL_TIME_ENABLED` = **on** (`d400-device.cpp:603`, `d400-color.cpp:130`) | **Adopt** | Puts depth and colour stamps on one clock, which is what makes ROS-side synchronisation meaningful. |
+| **Auto-exposure limit** (`d400-options.cpp:378,400`) | **Adopt** | Caps exposure so AE cannot silently stretch past the frame period in a dim room. This is the usual cause of "I asked for 30 fps and got 15" and it would not show up in any of the well-lit measurements in this document. |
+| `RS2_OPTION_VISUAL_PRESET` (`advanced_mode.cpp:25`) | **Adopt** | `HIGH_ACCURACY` for metrology, `HIGH_DENSITY` for segmentation coverage. Firmware-side, costs no host time. |
+| **Decimation filter** (`proc/decimation-filter.cpp:248`) | **Adopt for pointcloud/clustering** | Magnitude 2 → 4× fewer downstream points. Host-side, so it does **not** reduce USB traffic — it reduces everything after. |
+| `RS2_OPTION_DEPTH_UNITS` (`d400-device.cpp:241,383`) | **Pin explicitly** | `realsensenode.py:2584` already asserts depth units are exactly 0.001 m for its `16UC1` encoding. That assertion currently depends on the device default happening to match; pinning it makes the assumption enforced rather than assumed. |
+| **Laser / emitter power** (`d400-device.cpp:1513,1519`) | **Adopt** | Max laser for depth quality; emitter off only if IR is being used as a texture source rather than for depth. |
+| **HDR merge** (`d400-device.cpp:905-921`) | **Skip** | Verified in source: `hdr_sequence_size_range = { 2.f, 2.f, 1.f, 2.f }` — min equals max equals 2, so HDR always interleaves two exposures and **halves effective depth frame rate**. Not worth it at 30 Hz. |
+
+### ROS 2 transport — the finding that actually constrains deployment
+
+720p colour BGR8 (82.9 MB/s once converted host-side) + Z16 depth (55.3 MB/s) ≈ **138 MB/s ≈ 1.1 Gbit/s
+of ROS traffic**. That **does not fit on the 1 GbE LAN**. It fits comfortably on the 200 GbE
+ConnectX-7 p2p fabric.
+
+So the resolution recommendation (M1) carries a topology condition: **raising the profile is free only
+while the subscriber is on the same host, or on the other Spark across the QSFP fabric.** Any
+subscriber reached over the 1 GbE lab LAN needs `image_transport` compression, and that changes the
+latency story. This is the constraint to check before M1 ships — not USB bandwidth, which has ~3×
+headroom.
+
+Two further points, both from the ROS side:
+
+- **`rclcpp` intra-process comms is the top lever**, not shared memory. `rmw_cyclonedds`'
+  `shared_memory_support.md` requires **fixed-size** types for true zero-copy; `sensor_msgs/Image` is
+  variable-size, so iceoryx serialises it into shared memory and (per that document) "incurs much
+  more overhead", plus RouDi must run continuously. Intra-process composition is the right answer
+  for same-host hops.
+- **Intra-process and compressed `image_transport` are mutually exclusive** — realsense-ros disables
+  the compressed topics under intra-process (and under `USE_LIFECYCLE_NODE=ON`). So the choice is
+  per hop: intra-process on-host, compression on the wire. `compressed_depth_image_transport`
+  supports **RVL**, which is lossless and fast and is the right depth codec for a slow link.
+- **Cyclone's `MaxMessageSize` (14720 B) and `FragmentSize` (1344 B) defaults are sized for a
+  1500-byte MTU.** On the jumbo-frame 200 GbE leg they should be raised. The fleet's
+  `qsfp_cyclone.xml` already pins the interface explicitly and disables multicast, which is correct —
+  a dual-homed Spark left on autodetermine can otherwise pick the 1 GbE NIC for Spark↔Spark traffic.
