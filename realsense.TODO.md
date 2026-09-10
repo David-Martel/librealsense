@@ -27,6 +27,28 @@ accelerated processing paths from an isolated prefix.
   release); actual CUDA Toolkit is **13.0** (not 13.2). Runtime "enumeration instability" was the primary defect,
   now root-caused to USB-2.0 dock topology + the GB10 xHCI fragility.
 
+## 2026-09-10 Update — re-measured platform; several notes above are now stale
+
+> Full detail: **[`docs/gb10/UPGRADE-PLAN-2026-09-10.md`](docs/gb10/UPGRADE-PLAN-2026-09-10.md)**.
+
+- **CUDA is 13.2, not 13.0.** `/usr/local/cuda` -> `/usr/local/cuda-13.2`, `nvcc` reports
+  `release 13.2, V13.2.86`. The June line above calling `/usr/local/cuda-13.2` "nonexistent" is
+  **inverted** — that path exists and is the live toolkit. `CUDA_HOME=/usr/local/cuda` remains correct
+  because the symlink now resolves there.
+- **Kernel `6.17.0-1029-nvidia`** (was `-1021`), **driver 595.84** (was 580.159.03).
+  `6.17.0-1032.32` is available and not yet installed.
+- **BIOS `5.36_0ACUM018` (2025-08-06) on BOTH Sparks.** No June document recorded a BIOS version, so
+  **platform firmware cannot be shown to have changed** in either direction.
+- **USB topology improved.** Both D435s now negotiate **5000 Mbps**; spark-3066's sits on a **native
+  xHCI root port** (`6-1`), which is the precondition PR #12 was blocked on. Cameras were physically
+  swapped — all serials differ from those recorded above.
+- **The single-stream envelope is UNCHANGED until the R6 ramp is re-run.** Zero controller deaths over
+  7+ days is *not* evidence of a fix: both hosts have only run inside the safe envelope.
+- **Upstream v2.58.4 is merged** on `claude/upstream-2.58.4-gb10-20260910` (`d976b8a08`, zero
+  conflicts). It brings `BUILD_WITH_CUDA_ZEROCOPY`, which self-gates to integrated GPUs and **does
+  open on GB10** (`CU_DEVICE_ATTRIBUTE_INTEGRATED = 1`, verified). See the plan doc before enabling —
+  its backend-borrow half is **V4L2-only** and does not apply under `FORCE_RSUSB_BACKEND=ON`.
+
 ## Local Findings
 
 - Current local SDK source is `v2.58.1` at commit

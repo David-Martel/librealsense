@@ -59,9 +59,27 @@ never touching `/usr/local` directly), driven by a repo-root `justfile`. Default
 |---|---|---|
 | Merge `upstream/master` (`e15c5d6bb`, v2.58.4) into PR #12 branch | **Zero conflicts** | `d976b8a08`, parents `078733da5` + `e15c5d6bb` |
 | Version bump | `RS2_API_PATCH_VERSION` 3 → **4** | `include/librealsense2/rs.h` |
-| Compile verification | **Exit 0, 100%, 0 errors**, 2 warnings (both pre-existing glibc header notes) | x86_64 Release, `FORCE_RSUSB_BACKEND=ON` |
 | Struct-rename compile risk | **Clear** | `1dd69b7c5` renames `uvc_device_info::{mipi,conn_spec}`; our surviving `.conn_spec` uses are on `usb_device_info`, which was *not* renamed |
 | Secret scan on merged content | **exit 0** | `~/.git-hooks/common/secret_scan.sh` |
+
+### 3.1 Compile verification — exactly what was and was not built
+
+Two x86_64 Release builds, `FORCE_RSUSB_BACKEND=ON`, both **exit 0, 0 errors** (2 warnings, both
+pre-existing glibc header notes):
+
+| Surface | Status |
+|---|---|
+| `realsense2` core (`src/uvc`, `src/libusb`, `src/proc`, `usb-tuning.h`) | ✅ built |
+| `rs-fw-update` (fork +129), `test-usb-tuning` (fork +168) | ✅ built |
+| `rs-dds-adapter`, `rs-dds-config` (fork CMake changes) | ✅ built, `BUILD_WITH_DDS=ON` |
+| `pyrealsense2` incl. `pyrs_gl.cpp` (fork +74) | ✅ built |
+| **All `.cu` files** — `cuda-conversion.cu`, `cuda-align.cu` (fork), `cuda-frame-memory.cu` (upstream zero-copy) | ❌ **NOT built** — no CUDA on asuspro13 |
+| **`rs-gb10-profiler`** (fork +1773, the largest single fork file) | ❌ **NOT built** — its CMakeLists requires `BUILD_GRAPHICAL_EXAMPLES`, which needs `OpenGL::GL`; absent on this host |
+| `examples/` incl. upstream's new `gpu-frame` | ❌ not built — same missing `OpenGL::GL` |
+
+**The two unbuilt surfaces are exactly where fork customisations and upstream's headline change
+overlap.** `CMake/cuda_config.cmake` was auto-merged (fork +4 vs zerocopy +8) and has **never been
+executed**. This is why the Spark build (A6) is a **P0 verification item, not a P2 deployment item.**
 
 > **Gate note (real, worth fixing).** The commit was blocked by git-guard's `qa_gate.sh` on
 > `shellcheck` and `ruff` errors located **entirely in upstream Intel files** imported by the merge
@@ -126,6 +144,35 @@ UnifiedAddressing        = 1
 ConcurrentManagedAccess  = 1     <- note: upstream's comment assumes Jetson's 0
 ```
 
+**The gate is verified, not inferred.** `probe_cuda_integrated()`
+(`third-party/rsutils/src/rsutilgpu.cpp:118`) `dlopen`s `libcuda.so.1` and reads
+`CU_DEVICE_ATTRIBUTE_INTEGRATED = 18` — *the same attribute this probe read as `1`*. It fails closed
+on any error. So the runtime gate opens on GB10.
+
+### 5.1 Zero-copy has two halves, and the GB10 fork only gets one of them
+
+This is the most consequential detail in the delta, and a clean merge hides it entirely.
+
+| Half | Mechanism | Applies to RSUSB (current GB10 default)? |
+|---|---|---|
+| **Allocator** | `frame_data_allocator` routes frame pixel buffers through `cudaHostAlloc(...Mapped)` | **Yes** — backend-independent |
+| **Backend buffer borrow** | `uvc_sensor` lets a frame point *directly at the backend's capture buffer* (`requires_memory=false`), capped at `ZC_MAX_INFLIGHT = 2` so the ring can't starve | **No** |
+
+`rs_v4l2_zc_register()` / `rs_v4l2_zc_unregister()` are called from **exactly one place**:
+`src/linux/backend-v4l2.cpp:349/390`. The borrow only happens on buffers a V4L2 backend registered.
+Under `FORCE_RSUSB_BACKEND=ON` — which the GB10 build script sets — no buffer is ever registered, so
+`do_zc` never engages and **only the allocator half applies.**
+
+**This converges with a conclusion the fork already reached independently.**
+[`analysis/86-v4l2-backend-assessment.md`](analysis/86-v4l2-backend-assessment.md) concluded V4L2 is
+"the correct production backend for this platform" and "strictly safer than RSUSB on the GB10" on
+*reliability* grounds. Upstream zero-copy now adds a *performance* reason pointing the same way.
+Both Sparks already carry `-v4l2` prefix variants, so the backend swap is a build-flag decision the
+fleet has already staged, not new work.
+
+**Consequence for the A/B in §7: it must be a 2×2, not a 1×2** — {RSUSB, V4L2} × {zero-copy ON, OFF}.
+Measuring zero-copy on RSUSB alone would test the weaker half and could wrongly retire the idea.
+
 ### Why this is the most valuable item in the whole delta
 
 June measured (`benchmarks.md`): **`rs.pointcloud` shipped CUDA ran at 0.57× of NEON — CUDA was
@@ -171,14 +218,25 @@ Requested on the agent-bus at 06:25Z, corrected with measurements at 06:27Z, tag
 
 Ordered by measured value. "Gate" = what must be true before the item is called done.
 
-### P0 — decides everything else
-- [ ] **A1 · Run the R6 guarded ramp on spark-3066** after a coordination window.
+> **Only A1 needs the reboot-risk window.** A2/A3/A6 are single-stream or offline measurements —
+> the same envelope the fleet runs in daily — and are *not* blocked on it. Do not bundle them.
+
+### P0 — verification and the measurements the plan turns on
+- [ ] **A6 · Build `d976b8a08` on spark-3066** into a **new** isolated prefix
+      (`LRS_GB10_PREFIX=...-v2.58.4-...-canary`; the script's default still says `v2.58.3` and would
+      collide with the PR #12 canary). Do **not** repoint `/usr/local/lib/librealsense2.so*`.
+      *Gate:* this is the **first compile of every `.cu` file and of `rs-gb10-profiler`** against the
+      2.58.4 API (§3.1) — it is verification, not deployment. Targets built, matching the PR #12
+      canary receipt convention.
+- [ ] **A2 · A/B zero-copy as a 2×2: {RSUSB, V4L2} × {`BUILD_WITH_CUDA_ZEROCOPY` ON, OFF}** (§5.1).
+      *Gate:* pointcloud 848×480 and align depth→color, p50/p95 over ≥3 runs, against the
+      `benchmarks.md` baselines (pointcloud CUDA 0.57× NEON; align 15–19× NEON), plus output
+      byte-identity. Report concurrent host load — spark-3066 carries vLLM and CI, so numbers are
+      noisy and must be stated as such. Adopt only on a measured win.
+- [ ] **A1 · Run the R6 guarded ramp on spark-3066.** **Blocked on a coordination window (§6)** —
+      this is the multistream provocation, the only item that can wedge the controller.
       *Gate:* ramp result recorded with kernel/driver/BIOS stamped; envelope decision written into
-      `realsense.TODO.md` either way. **Blocked on §6.**
-- [ ] **A2 · A/B `BUILD_WITH_CUDA_ZEROCOPY=ON` vs OFF on GB10.**
-      *Gate:* pointcloud 848×480 and align depth→color, p50/p95 ms, against the `benchmarks.md`
-      baselines (pointcloud CUDA 0.57× NEON; align 15–19× NEON). Must also confirm byte-identity of
-      output. Adopt only on a measured win.
+      `realsense.TODO.md` either way.
 
 ### P1 — build correctness the merge introduced
 - [ ] **A3 · A/B `-ffp-contract=off`.** Upstream `08b6d0031` added it to `CMake/unix_config.cmake`,
@@ -197,9 +255,6 @@ Ordered by measured value. "Gate" = what must be true before the item is called 
       `/usr/local/cuda-13.2` **exists** (the June note calls it nonexistent); kernel/driver per §4.
 
 ### P2 — deployment
-- [ ] **A6 · Build `d976b8a08` on spark-3066** into a *new* isolated canary prefix
-      (`librealsense-v2.58.4-...-canary`). Do **not** repoint `/usr/local/lib/librealsense2.so*`.
-      *Gate:* 1090/1090 targets, matching the PR #12 canary receipt convention.
 - [ ] **A7 · Re-pin fleet consumers only after A1+A2+A6.** Codex's 05:20Z bus finding already reports
       build skew (ASUS `b22` consumers vs `3b145` on both Sparks) — re-pinning into skew makes it worse.
 - [ ] **A8 · Hand `ops/build_gb10_realsense.sh` / `ops/deploy_gb10_realsense.sh` deltas to the
