@@ -23,6 +23,9 @@ add_boolean_build_provenance(FORCE_RSUSB_BACKEND RS2_GB10_PROFILER_FORCE_RSUSB)
 add_boolean_build_provenance(RS2_GB10_USB_TUNING RS2_GB10_PROFILER_USB_TUNING)
 add_boolean_build_provenance(RS2_GB10_CONV_CACHE RS2_GB10_PROFILER_CONV_CACHE)
 add_boolean_build_provenance(RS2_GB10_PC_ZEROCOPY RS2_GB10_PROFILER_PC_ZEROCOPY)
+# Upstream mapped-frame-memory zero-copy. Distinct from RS2_GB10_PC_ZEROCOPY above; without
+# this the two A/B legs are indistinguishable from the binary's own self-test output.
+add_boolean_build_provenance(BUILD_WITH_CUDA_ZEROCOPY RS2_GB10_PROFILER_CUDA_ZEROCOPY)
 target_link_libraries(${PROJECT_NAME} ${DEPENDENCIES} realsense2-gl)
 target_include_directories(${PROJECT_NAME} PRIVATE ../../examples ../../third-party/imgui)
 target_compile_definitions(${PROJECT_NAME} PRIVATE NO_ELPP_INIT)

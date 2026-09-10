@@ -541,6 +541,7 @@ static std::vector<std::pair<std::string, bool>> compiled_build_features()
         { "RS2_GB10_USB_TUNING", RS2_GB10_PROFILER_USB_TUNING != 0 },
         { "RS2_GB10_CONV_CACHE", RS2_GB10_PROFILER_CONV_CACHE != 0 },
         { "RS2_GB10_PC_ZEROCOPY", RS2_GB10_PROFILER_PC_ZEROCOPY != 0 },
+        { "BUILD_WITH_CUDA_ZEROCOPY", RS2_GB10_PROFILER_CUDA_ZEROCOPY != 0 },
     };
 }
 
