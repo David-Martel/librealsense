@@ -585,3 +585,33 @@ This is a near miss rather than a non-issue: a mid-enum removal silently changes
 anything compiled against 2.58.3 headers that then loads a 2.58.4 `.so`. **Any A7 re-pin must
 rebuild every consumer against the same headers**, not just repoint the `.so` — in particular
 `pyrealsense2` and any ROS 2 node binary, which are separately compiled artifacts.
+
+
+---
+
+## 14. Per-host build environment — the two Sparks are NOT interchangeable
+
+Discovered 2026-09-10 while staging the canonical 2.58.4 build on both hosts. **The correct
+`CUDA_HOME` differs per host, and the difference is inverted from what the hostnames suggest.**
+
+| Host | `/usr/local/cuda` → | Prebuilt CUDA OpenCV compiled against | **Pin `CUDA_HOME` to** |
+|---|---|---|---|
+| `spark-3066` | 13.2 | **13.0** | `/usr/local/cuda-13.0` |
+| `spark-0060` | 13.2 | **13.2** | `/usr/local/cuda-13.2` |
+
+Getting it wrong is a hard configure failure, not a silent one:
+
+```
+CMake Error at /opt/gb10-cuda/install/opencv/lib/cmake/opencv4/OpenCVConfig.cmake:111 (message):
+  OpenCV static library was compiled with CUDA 13.2 support.  Please, use the
+  same version or rebuild OpenCV with CUDA 13.0
+Call Stack (most recent call first):
+  wrappers/opencv/CMakeLists.txt:5 (find_package)
+```
+
+So **do not copy a working build invocation from one Spark to the other.** Read the host's own
+OpenCV before choosing the pin. Both hosts otherwise match: kernel `6.17.0-1029-nvidia`, BIOS
+`5.36_0ACUM018`, and both carry `/usr/local/cuda-13.0` and `-13.2` side by side.
+
+Also set `CUDACXX` explicitly on both: `nvcc` is **not** on a non-interactive SSH `PATH`, which
+surfaces as the misleading "No CMAKE_CUDA_COMPILER could be found".
