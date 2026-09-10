@@ -124,7 +124,35 @@ def _apply_options(profile, args: argparse.Namespace) -> dict | None:
     return applied
 
 
+def assert_device_present(serial: str | None) -> None:
+    """Fail fast and loudly when no camera is attached.
+
+    `pipeline.start()` BLOCKS INDEFINITELY when the device is absent rather than
+    raising, so a harness that goes straight to start() presents a hardware
+    failure as a benchmark that never finishes. That is exactly how the
+    spark-0060 xHCI controller death was first seen: a 120 s run still going
+    after seven minutes, with an empty output file and nothing to indicate the
+    camera had vanished. Checking the context first turns an indefinite hang
+    into a one-line diagnosis.
+    """
+    devices = rs.context().devices
+    if len(devices) == 0:
+        raise SystemExit(
+            "no RealSense device present. pipeline.start() would block forever "
+            "rather than raise, so this harness refuses to start.\n"
+            "If a capture recently died here, check `dmesg` for "
+            "'xHCI host controller not responding' - a dead host controller "
+            "needs a power cycle and cannot be rebound."
+        )
+    if serial and not any(
+        d.get_info(rs.camera_info.serial_number) == serial for d in devices
+    ):
+        found = ", ".join(d.get_info(rs.camera_info.serial_number) for d in devices)
+        raise SystemExit(f"serial {serial} not attached; present: {found}")
+
+
 def run(args: argparse.Namespace) -> dict:
+    assert_device_present(args.serial)
     pipeline = rs.pipeline()
     config = rs.config()
     if args.serial:
