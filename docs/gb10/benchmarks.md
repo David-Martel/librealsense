@@ -1137,3 +1137,68 @@ other host. **`import_ok devices=1` does not catch this** — it proves liveness
 was my own green light earlier in this campaign. Verify the package version *and* the mapped
 library via `/proc/self/maps`. Both hosts now resolve package and `.so` at 2.58.4; the previous
 files are kept as `*.pre-2584`.
+
+---
+
+## §19 The xHCI controller died on spark-0060 — this qualifies §15.5 (2026-09-10)
+
+**Reported against my own conclusion from earlier the same day.** §15.5 retired the single-stream
+USB envelope on 734,008 frames across both Sparks with zero dropped frames and zero xHCI danger
+signatures. Hours later, on spark-0060, during an ordinary 1280×720@30 depth+colour run started by
+`rs-gb10-jitter.py`, the host controller died:
+
+```
+11:06:52  usb 2-1.1: Process 140616 (python3) called USBDEVFS_CLEAR_HALT for active endpoint 0x84
+11:06:57  usb 2-1.1: Process 140644 (python3) called USBDEVFS_CLEAR_HALT for active endpoint 0x82
+11:07:07  xhci-hcd NVDA8000:00: xHCI host not responding to stop endpoint command
+11:07:08  xhci-hcd NVDA8000:00: Host halt failed, -110
+11:07:08  xhci-hcd NVDA8000:00: xHCI host controller not responding, assume dead
+11:07:08  xhci-hcd NVDA8000:00: HC died; cleaning up
+11:07:08  usb 2-1: USB disconnect, device number 2
+11:07:08  usb 2-1.1: USB disconnect, device number 3
+```
+
+`pyrealsense2` then reports `devices: 0`, and `pipeline.start()` **blocks indefinitely** rather than
+raising — which is how this first presented, as a 120 s benchmark still running after seven minutes.
+
+### Recovery attempted and failed
+
+Unbinding and rebinding `xhci-hcd` for `NVDA8000:00` does not revive it:
+
+```
+xhci-hcd NVDA8000:00: Host halt failed, -110
+xhci-hcd NVDA8000:00: can't setup: -110
+xhci-hcd NVDA8000:00: probe with driver xhci-hcd failed with error -110
+```
+
+The controller needs a genuine power cycle, which on this platform means a host reboot. **Blast
+radius is contained:** only bus 2 was lost (the hub at `2-1` and the camera at `2-1.1`). Eleven
+other USB devices remain enumerated and no other `NVDA8000:0x` controller reported an error.
+
+### What this does and does not mean
+
+It does **not** restore the envelope as written — the envelope was a *single-high-rate-stream* rule,
+and 734,008 frames of multi-stream 720p ran clean across two hosts and two controllers before this.
+One event does not overturn that.
+
+It does mean **§15.5 overstated the confidence**. "Zero xHCI danger signatures" was true of the
+soak window and was reported as though it were a property of the configuration. The June defect was
+always described as *intermittent*, and an intermittent fault that does not appear in 734,008 frames
+has not been shown to be absent — only to be rarer than that. I made exactly the error this
+document criticises elsewhere: a measurement taken under one window reported as a property of the
+system.
+
+### The most probable contributor, stated as a hypothesis
+
+This host had absorbed an unusual amount of USB abuse in the preceding two hours, all of it mine:
+dozens of `open()`/`close()` cycles, a de-authorise/re-authorise port power cycle, and — most
+relevantly — **many failed 848×480 probe-commit attempts, each of which stalls a streaming endpoint
+and provokes a `CLEAR_HALT`** (§18.4). The two `CLEAR_HALT` lines immediately preceding the death
+are consistent with that. So this is *not* evidence that a normal vigil-spark workload kills the
+controller; it is evidence that repeated probe-commit failure plus forced port cycling can. That
+distinction matters for policy, and it is a hypothesis rather than a demonstrated cause — the clean
+test would be to reproduce the failure with probe-commit churn alone on a host that has not been
+otherwise disturbed, which has not been done.
+
+**Operational status:** spark-0060's RealSense is unavailable until the host is power-cycled.
+spark-3066 is unaffected and still streaming.
