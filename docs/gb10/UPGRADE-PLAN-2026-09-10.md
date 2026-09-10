@@ -223,7 +223,9 @@ Ordered by measured value. "Gate" = what must be true before the item is called 
 
 ### P-1 — hard blocker found while executing A6. **2.58.4 must not ship until this is fixed.**
 
-- [ ] **A0 · Fix the exit-time double free in the GB10 2.58.4 build.** Full evidence in §11.
+- [x] **A0 · Fix the exit-time double free in the GB10 2.58.4 build.** Full evidence in §11;
+      root-caused, confirmed by single-variable experiment (§11.1), and fixed by defaulting the GB10
+      build to C++14. **Re-verify on a rebuilt canary before A7.**
       Every tool built from 2.58.4 with the GB10 script aborts at exit — including
       `rs-enumerate-devices --version`, which opens no camera. 2.58.1 and 2.58.3 on the same host and
       script are clean. *Gate:* `rs-enumerate-devices --version` exits 0 with no `free()` diagnostic,
@@ -405,10 +407,31 @@ wrapper shows an ABI or source-compatibility issue."* **This is that issue.** It
 same family as the fork's long-open *"RealDDS duplicate static/shared symbol"* item — upstream's
 change appears to have converted a latent duplicate-symbol condition into a hard crash.
 
-### Status
+### 11.1 Confirmed — single-variable experiment, and fixed
 
-A C++14 probe build (`librealsense-v2.58.4-gb10-cxx14-probe`) was run to test the hypothesis; its
-result is recorded in §11.1. Until A0 closes, **do not re-pin any fleet consumer to 2.58.4.** Both
+A C++14 probe build (`librealsense-v2.58.4-gb10-cxx14-probe`) was built on the same host, from the
+same commit, with the same script and the same CUDA. **The only variable was
+`LRS_GB10_CXX_STANDARD`:**
+
+| Build | `.so` exported `json_abi` | exe local `json_abi` | `rs-enumerate-devices --version` |
+|---|---:|---:|---|
+| C++20 (previous default) | 158 | **157** | `rc=134` — `free(): double free detected in tcache 2` |
+| **C++14 (new default)** | 159 | **62** | **`rc=0`, clean** |
+
+C++14 collapses the executable's local json symbols 157 → 62 — back to the 2.58.1/2.58.3 figure — and
+the crash disappears. **Hypothesis confirmed.**
+
+**Fixed:** `scripts/build-dgx-spark-gb10.sh` now defaults `CXX_STANDARD` to **14**, with the
+measurement recorded inline so the next person does not re-litigate it. `rs-gb10-profiler` pins
+`CXX_STANDARD 20` on its own target and is unaffected — which is precisely the arrangement
+`realsense.TODO.md` described as the fallback ("rebuild with `LRS_GB10_CXX_STANDARD=14` and keep only
+`rs-gb10-profiler` on C++20"). The C++20 default never had a measured win to weigh against this.
+
+The upstream-facing half of the problem still stands and is worth reporting: **any** downstream that
+builds tools at a different `-std` than the library will hit this, because `--exclude-libs` makes the
+duplicate global object reachable. That is fix option 2 below and does not block the fleet.
+
+Until A0 is confirmed on a rebuilt canary, **do not re-pin any fleet consumer to 2.58.4.** Both
 Sparks' `/usr/local/lib/librealsense2.so*` still resolve to the 2.58.1 prefix and were not touched.
 
 ### Fix options, in order of preference

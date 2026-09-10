@@ -41,7 +41,17 @@ if ! printf 'int main() { return 0; }\n' | "$CXX_COMPILER" "${ARCH_ARGS[@]}" -x 
 fi
 NATIVE_FLAGS="${LRS_GB10_NATIVE_FLAGS:--O3 -DNDEBUG $ARCH_FLAG -ffunction-sections -fdata-sections}"
 LINK_FLAGS="${LRS_GB10_LINK_FLAGS:--Wl,--gc-sections}"
-CXX_STANDARD="${LRS_GB10_CXX_STANDARD:-20}"
+# C++14 matches upstream's own core standard. It is NOT a conservatism default: building the
+# unpinned targets at C++20 against upstream 2.58.4 produces an exit-time DOUBLE FREE, because
+# upstream 4bbc18032 (-Wl,--exclude-libs) stopped librealsense2.so exporting its bundled
+# nlohmann_json symbols, and at -std=c++20 the tools then emit their own copy of the global json
+# object -- so both the library's and the executable's destructors run on it.
+# Measured on spark-3066, 2026-09-10, identical source/host/script, single variable:
+#   C++20 -> .so exports 158 json syms / exe carries 157 -> rs-enumerate-devices --version rc=134
+#            "free(): double free detected in tcache 2"
+#   C++14 -> .so exports 159 json syms / exe carries  62 -> rc=0, clean
+# rs-gb10-profiler pins CXX_STANDARD 20 on its own target and is unaffected.
+CXX_STANDARD="${LRS_GB10_CXX_STANDARD:-14}"
 WITH_DDS="${LRS_GB10_WITH_DDS:-ON}"
 WITH_OPENMP="${LRS_GB10_WITH_OPENMP:-ON}"
 WITH_IPO="${LRS_GB10_WITH_IPO:-OFF}"
@@ -94,7 +104,7 @@ Useful environment:
   LRS_GB10_EXTERNAL_LZ4    Use external LZ4 CMake package, default OFF
   LRS_GB10_FORCE_RSUSB     Force libusb/RSUSB backend, default ON.
                            Set OFF to validate the native Linux V4L2 backend.
-  LRS_GB10_CXX_STANDARD    C++ standard for unpinned targets, default 20
+  LRS_GB10_CXX_STANDARD    C++ standard for unpinned targets, default 14 (20 double-frees at exit)
   PYTHON_EXECUTABLE        Python ABI for pyrealsense2
   LRS_GB10_PYTHON_INSTALL_DIR
                            Python install dir, default under the GB10 prefix
