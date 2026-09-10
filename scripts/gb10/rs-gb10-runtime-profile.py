@@ -313,12 +313,19 @@ def arm_deadman(seconds: int, snapshot: pathlib.Path) -> tuple[bool, str]:
     script = str(pathlib.Path(__file__).resolve())
     rc, out = _run(
         [
-            "sudo", "-n", "systemd-run",
+            "sudo",
+            "-n",
+            "systemd-run",
             f"--on-active={seconds}",
             f"--unit={DEADMAN_UNIT}",
             "--collect",
-            sys.executable, script, "revert", "--apply", "--force",
-            "--snapshot", str(snapshot),
+            sys.executable,
+            script,
+            "revert",
+            "--apply",
+            "--force",
+            "--snapshot",
+            str(snapshot),
         ]
     )
     if rc != 0:
@@ -338,9 +345,7 @@ def disarm_deadman() -> tuple[bool, str]:
     return rc == 0, out or "deadman disarmed"
 
 
-def apply_determinism(
-    *, do_apply: bool, idle_depth: int, lock_gpu: bool
-) -> int:
+def apply_determinism(*, do_apply: bool, idle_depth: int, lock_gpu: bool) -> int:
     actions = plan_determinism(idle_depth=idle_depth, lock_gpu=lock_gpu)
     if not actions:
         print("determinism profile: already fully applied, nothing to do")
