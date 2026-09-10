@@ -39,6 +39,30 @@ if ! printf 'int main() { return 0; }\n' | "$CXX_COMPILER" "${ARCH_ARGS[@]}" -x 
   echo "ERROR: C++ compiler '$CXX_COMPILER' rejects LRS_GB10_ARCH='$ARCH_FLAG'" >&2
   exit 1
 fi
+# Acceptance is NOT effectiveness. GCC 13.3 does not know Cortex-X925: it rejects
+# -mcpu=cortex-x925 outright, but -mcpu=native on an unrecognised part resolves to
+# NOTHING and compiles happily at the aarch64 baseline. The check above passes, the
+# build succeeds, and the artifact silently loses SVE2, BF16, I8MM and the Armv9.2
+# baseline. That is how both the 2.58.1 prefix pinned on the fleet and its 2.58.4
+# replacement came to be baseline armv8-a builds (measured 2026-09-10).
+# So ask the compiler what the flags actually RESOLVED to, and refuse to build a
+# silently-degraded artifact unless that is explicitly what was asked for.
+ARCH_EFFECTIVE="$(
+  "$CXX_COMPILER" "${ARCH_ARGS[@]}" -Q --help=target 2>/dev/null \
+    | awk '$1 ~ /^-m(arch|cpu|tune)=$/ && NF > 1 { found = 1 } END { print found + 0 }'
+)"
+if [[ "$ARCH_EFFECTIVE" != "1" ]]; then
+  echo "WARNING: '$CXX_COMPILER' accepts ARCH_FLAG='$ARCH_FLAG' but resolves it to an" >&2
+  echo "         EMPTY -march/-mcpu/-mtune, i.e. it will build at the aarch64 baseline" >&2
+  echo "         with no SVE2/BF16/I8MM. This is the GCC-13-on-Cortex-X925 trap." >&2
+  echo "         Fix: LRS_GB10_REPRODUCIBLE=1 (explicit Armv9.2 ISA), or set" >&2
+  echo "         LRS_GB10_ARCH yourself. Set LRS_GB10_ALLOW_BASELINE_ARCH=1 to proceed." >&2
+  if [[ "${LRS_GB10_ALLOW_BASELINE_ARCH:-0}" != "1" ]]; then
+    echo "ERROR: refusing to build a silently baseline-ISA artifact." >&2
+    exit 1
+  fi
+  echo "         LRS_GB10_ALLOW_BASELINE_ARCH=1 set -- proceeding at baseline ISA." >&2
+fi
 NATIVE_FLAGS="${LRS_GB10_NATIVE_FLAGS:--O3 -DNDEBUG $ARCH_FLAG -ffunction-sections -fdata-sections}"
 LINK_FLAGS="${LRS_GB10_LINK_FLAGS:--Wl,--gc-sections}"
 # C++20 restored 2026-09-10 after the underlying defect was FIXED in code rather than worked
