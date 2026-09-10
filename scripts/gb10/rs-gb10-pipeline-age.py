@@ -38,6 +38,21 @@ JITTER question: the compositor presents on a fixed refresh cadence, so it adds
 a roughly constant latency and at most one refresh interval of spread. The
 variance lives upstream, which is what this measures.
 
+VALIDATED AGAINST A KNOWN ANSWER (spark-3066, 2026-09-10)
+---------------------------------------------------------
+A measurement tool that has never reported a known value correctly is an
+opinion with a p99 attached. Driven by a control publisher stamping frames
+exactly 250.0 ms in the past, at 30 Hz:
+
+    /control/aged        n=652   p50 250.83 ms   jitter 0.85 ms
+
+0.83 ms off truth, and that residual is real publish-to-receive latency rather
+than error. The two deliberate poison topics behaved as designed in the same
+run: 651 frames stamped 500 ms in the FUTURE were all reported as a negative-age
+defect rather than clamped or averaged in, and 651 frames with a zero stamp were
+counted as unstamped rather than treated as age 0. The run exited 1 because two
+topics yielded no valid samples -- it refuses to call that success.
+
 FAILURE MODES ARE EXPLICIT
 --------------------------
 A measurement tool that reports a confident number from a broken setup is worse
