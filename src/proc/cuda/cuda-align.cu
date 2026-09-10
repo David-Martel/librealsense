@@ -9,6 +9,14 @@
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
+#include <cstdlib>
+
+// Default align zero-copy mode; overridable at build time, and at runtime via RS2_ALIGN_ZC.
+// 1 = map inputs only. Chosen by measurement on GB10 (see the ladder below and
+// docs/gb10/benchmarks.md): mapping the inputs is -6.2% p50, mapping the output is +6.9x.
+#ifndef RS2_ALIGN_ZC_DEFAULT
+#define RS2_ALIGN_ZC_DEFAULT 1
+#endif
 
 #ifdef _MSC_VER 
 // Add library dependencies if using VS
@@ -25,6 +33,56 @@ namespace
 }
 
 template<int N> struct bytes { unsigned char b[N]; };
+
+namespace
+{
+    // Zero-copy participation for align, as a measured ladder rather than an assumption.
+    //
+    // Mapping a frame buffer removes a cudaMemcpy but moves the kernel's accesses onto host
+    // memory reached over the coherence fabric, which is far slower than device-local memory for
+    // scattered access -- and kernel_depth_to_other updates its output with atomic_min_uint16.
+    // Whether that trade wins is per-buffer and per-platform, so it is selectable:
+    //
+    //   RS2_ALIGN_ZC=0  staging only          (upstream behaviour, byte-for-byte)
+    //   RS2_ALIGN_ZC=1  map INPUTS only       (default: streaming reads, output device-local)
+    //   RS2_ALIGN_ZC=2  map OUTPUT only
+    //   RS2_ALIGN_ZC=3  map inputs and output
+    //
+    // Measured on spark-3066 (GB10, CUDA 13.0, D435 848x480@30 depth->color, 400 frames x 3
+    // alternating runs per leg, align.process + forced materialization):
+    //
+    //   mode 0  p50 0.321 ms   p95 0.367     <- upstream staging
+    //   mode 1  p50 0.301 ms   p95 0.334     <- -6.2% p50 and mean, better p95
+    //   mode 2  p50 2.237 ms                 <- +6.9x SLOWER
+    //   mode 3  p50 2.195 ms                 <- +6.8x SLOWER
+    //
+    // The asymmetry is the point: reads of the depth/color planes are streaming and coalesced, so
+    // serving them from mapped host memory costs little and saves a full-frame cudaMemcpy. The
+    // OUTPUT is different -- kernel_depth_to_other resolves occlusion with atomic_min_uint16, and
+    // atomics against host memory over the coherence fabric are dramatically slower than against
+    // device-local memory. Keeping the output in device memory and paying one D2H is far cheaper.
+    // All four modes are byte-identical (164-frame .db3 playback, same sha256).
+    int align_zc_mode()
+    {
+#ifdef RS2_USE_CUDA_ZEROCOPY
+        static int const mode = []
+        {
+            char const * e = std::getenv("RS2_ALIGN_ZC");
+            if (!e || !*e)
+                return RS2_ALIGN_ZC_DEFAULT;
+            int v = atoi(e);
+            return (v < 0 || v > 3) ? RS2_ALIGN_ZC_DEFAULT : v;
+        }();
+        return mode;
+#else
+        return 0;
+#endif
+    }
+
+    inline bool align_zc_inputs()  { return (align_zc_mode() & 1) != 0; }
+    inline bool align_zc_output()  { return (align_zc_mode() & 2) != 0; }
+}
+
 
 namespace
 {
@@ -235,14 +293,48 @@ void align_cuda_helper::align_other_to_depth(unsigned char* h_aligned_out, const
     refresh_device_copy(_d_other_intrinsics, h_other_intrin, "H2D other intrinsics");
     refresh_device_copy(_d_depth_other_extrinsics, h_depth_to_other, "H2D depth-to-other extrinsics");
 
-    ensure_dev_buffer(_d_depth_in, _depth_capacity, static_cast<size_t>(aligned_pixel_count));
-    cuda_or_throw(cudaMemcpy(_d_depth_in.get(), h_depth_in, depth_size, cudaMemcpyHostToDevice), "H2D depth");
+    // Zero-copy fast path -- see align_depth_to_other for the rationale. Three buffers can be
+    // mapped here (depth in, other in, aligned out); each is probed independently and any that
+    // is not mapped keeps its staging copy, so a partially-mapped frameset still works.
+    const uint16_t *      depth_dev = align_zc_inputs() ? try_device_ptr<const uint16_t>(h_depth_in)      : nullptr;
+    const unsigned char * other_dev = align_zc_inputs() ? try_device_ptr<const unsigned char>(h_other_in) : nullptr;
+    unsigned char *       out_dev   = align_zc_output() ? try_device_ptr<unsigned char>(h_aligned_out)   : nullptr;
 
-    ensure_dev_buffer(_d_other_in, _other_capacity, static_cast<size_t>(other_size));
-    cuda_or_throw(cudaMemcpy(_d_other_in.get(), h_other_in, other_size, cudaMemcpyHostToDevice), "H2D other");
+    const uint16_t * depth_ptr;
+    if (depth_dev)
+    {
+        depth_ptr = depth_dev;
+    }
+    else
+    {
+        ensure_dev_buffer(_d_depth_in, _depth_capacity, static_cast<size_t>(aligned_pixel_count));
+        cuda_or_throw(cudaMemcpy(_d_depth_in.get(), h_depth_in, depth_size, cudaMemcpyHostToDevice), "H2D depth");
+        depth_ptr = _d_depth_in.get();
+    }
 
-    ensure_dev_buffer(_d_aligned_out, _aligned_capacity, static_cast<size_t>(aligned_size));
-    cuda_or_throw(cudaMemset(_d_aligned_out.get(), 0, aligned_size), "clear aligned other-to-depth");
+    const unsigned char * other_ptr;
+    if (other_dev)
+    {
+        other_ptr = other_dev;
+    }
+    else
+    {
+        ensure_dev_buffer(_d_other_in, _other_capacity, static_cast<size_t>(other_size));
+        cuda_or_throw(cudaMemcpy(_d_other_in.get(), h_other_in, other_size, cudaMemcpyHostToDevice), "H2D other");
+        other_ptr = _d_other_in.get();
+    }
+
+    unsigned char * aligned_ptr;
+    if (out_dev)
+    {
+        aligned_ptr = out_dev;
+    }
+    else
+    {
+        ensure_dev_buffer(_d_aligned_out, _aligned_capacity, static_cast<size_t>(aligned_size));
+        aligned_ptr = _d_aligned_out.get();
+    }
+    cuda_or_throw(cudaMemset(aligned_ptr, 0, aligned_size), "clear aligned other-to-depth");
 
     ensure_dev_buffer(_d_pixel_map, _pixel_map_capacity, static_cast<size_t>(depth_pixel_count * 2));
     // Pre-fill the pixel map with the {-1,-1} invalid sentinel (see align_depth_to_other for rationale).
@@ -252,22 +344,24 @@ void align_cuda_helper::align_other_to_depth(unsigned char* h_aligned_out, const
     dim3 depth_blocks(calc_block_size(h_depth_intrin.width, block.x), calc_block_size(h_depth_intrin.height, block.y));
     dim3 mapping_blocks(depth_blocks.x, depth_blocks.y, 2);
 
-    kernel_map_depth_to_other <<<mapping_blocks,block>>> (_d_pixel_map.get(), _d_depth_in.get(), _d_depth_intrinsics.get(), _d_other_intrinsics.get(),
+    kernel_map_depth_to_other <<<mapping_blocks,block>>> (_d_pixel_map.get(), depth_ptr, _d_depth_intrinsics.get(), _d_other_intrinsics.get(),
         _d_depth_other_extrinsics.get(), depth_scale);
     cuda_or_throw(cudaGetLastError(), "map depth to other launch");
 
     switch (other_bytes_per_pixel)
     {
-    case 1: kernel_other_to_depth<1> <<<depth_blocks,block>>> (_d_aligned_out.get(), _d_other_in.get(), _d_pixel_map.get(), _d_depth_intrinsics.get(), _d_other_intrinsics.get()); break;
-    case 2: kernel_other_to_depth<2> <<<depth_blocks,block>>> (_d_aligned_out.get(), _d_other_in.get(), _d_pixel_map.get(), _d_depth_intrinsics.get(), _d_other_intrinsics.get()); break;
-    case 3: kernel_other_to_depth<3> <<<depth_blocks,block>>> (_d_aligned_out.get(), _d_other_in.get(), _d_pixel_map.get(), _d_depth_intrinsics.get(), _d_other_intrinsics.get()); break;
-    case 4: kernel_other_to_depth<4> <<<depth_blocks,block>>> (_d_aligned_out.get(), _d_other_in.get(), _d_pixel_map.get(), _d_depth_intrinsics.get(), _d_other_intrinsics.get()); break;
+    case 1: kernel_other_to_depth<1> <<<depth_blocks,block>>> (aligned_ptr, other_ptr, _d_pixel_map.get(), _d_depth_intrinsics.get(), _d_other_intrinsics.get()); break;
+    case 2: kernel_other_to_depth<2> <<<depth_blocks,block>>> (aligned_ptr, other_ptr, _d_pixel_map.get(), _d_depth_intrinsics.get(), _d_other_intrinsics.get()); break;
+    case 3: kernel_other_to_depth<3> <<<depth_blocks,block>>> (aligned_ptr, other_ptr, _d_pixel_map.get(), _d_depth_intrinsics.get(), _d_other_intrinsics.get()); break;
+    case 4: kernel_other_to_depth<4> <<<depth_blocks,block>>> (aligned_ptr, other_ptr, _d_pixel_map.get(), _d_depth_intrinsics.get(), _d_other_intrinsics.get()); break;
     }
     cuda_or_throw(cudaGetLastError(), "other to depth launch");
 
+    // Required in BOTH legs -- see align_depth_to_other.
     cuda_or_throw(cudaStreamSynchronize(0), "other to depth sync");
 
-    cuda_or_throw(cudaMemcpy(h_aligned_out, _d_aligned_out.get(), aligned_size, cudaMemcpyDeviceToHost), "D2H aligned other-to-depth");
+    if (!out_dev)
+        cuda_or_throw(cudaMemcpy(h_aligned_out, aligned_ptr, aligned_size, cudaMemcpyDeviceToHost), "D2H aligned other-to-depth");
 }
 
 void align_cuda_helper::align_depth_to_other(unsigned char* h_aligned_out, const uint16_t* h_depth_in,
@@ -286,11 +380,37 @@ void align_cuda_helper::align_depth_to_other(unsigned char* h_aligned_out, const
     refresh_device_copy(_d_other_intrinsics, h_other_intrin, "H2D other intrinsics");
     refresh_device_copy(_d_depth_other_extrinsics, h_depth_to_other, "H2D depth-to-other extrinsics");
 
-    ensure_dev_buffer(_d_depth_in, _depth_capacity, static_cast<size_t>(depth_pixel_count));
-    cuda_or_throw(cudaMemcpy(_d_depth_in.get(), h_depth_in, depth_byte_size, cudaMemcpyHostToDevice), "H2D depth");
+    // Zero-copy fast path: on an integrated GPU the frame buffers are CUDA pinned+mapped, so the
+    // kernels can read the depth frame and write the aligned frame in place. try_device_ptr returns
+    // nullptr for any pointer that is not mapped (plain malloc, discrete GPU, or a non-zero-copy
+    // build, where it compiles to `return nullptr`), and that leg keeps the staging path verbatim.
+    // GB10 pays this copy over what is physically the same RAM: measured cudaDevAttrIntegrated=1.
+    const uint16_t * depth_dev = align_zc_inputs() ? try_device_ptr<const uint16_t>(h_depth_in)   : nullptr;
+    uint16_t *       out_dev   = align_zc_output() ? try_device_ptr<uint16_t>(h_aligned_out)      : nullptr;
 
-    ensure_dev_buffer(_d_aligned_out, _aligned_capacity, static_cast<size_t>(aligned_byte_size));
-    cuda_or_throw(cudaMemset(_d_aligned_out.get(), 0xff, aligned_byte_size), "clear aligned depth-to-other");
+    const uint16_t * depth_ptr;
+    if (depth_dev)
+    {
+        depth_ptr = depth_dev;
+    }
+    else
+    {
+        ensure_dev_buffer(_d_depth_in, _depth_capacity, static_cast<size_t>(depth_pixel_count));
+        cuda_or_throw(cudaMemcpy(_d_depth_in.get(), h_depth_in, depth_byte_size, cudaMemcpyHostToDevice), "H2D depth");
+        depth_ptr = _d_depth_in.get();
+    }
+
+    uint16_t * aligned_ptr;
+    if (out_dev)
+    {
+        aligned_ptr = out_dev;
+    }
+    else
+    {
+        ensure_dev_buffer(_d_aligned_out, _aligned_capacity, static_cast<size_t>(aligned_byte_size));
+        aligned_ptr = reinterpret_cast<uint16_t*>(_d_aligned_out.get());
+    }
+    cuda_or_throw(cudaMemset(aligned_ptr, 0xff, aligned_byte_size), "clear aligned depth-to-other");
 
     ensure_dev_buffer(_d_pixel_map, _pixel_map_capacity, static_cast<size_t>(depth_pixel_count * 2));
     // Pre-fill the pixel map with the {-1,-1} invalid sentinel (0xff bytes -> int -1). Without this,
@@ -306,20 +426,23 @@ void align_cuda_helper::align_depth_to_other(unsigned char* h_aligned_out, const
     dim3 other_blocks(calc_block_size(h_other_intrin.width, block.x), calc_block_size(h_other_intrin.height, block.y));
     dim3 mapping_blocks(depth_blocks.x, depth_blocks.y, 2);
 
-    kernel_map_depth_to_other <<<mapping_blocks,block>>> (_d_pixel_map.get(), _d_depth_in.get(), _d_depth_intrinsics.get(),
+    kernel_map_depth_to_other <<<mapping_blocks,block>>> (_d_pixel_map.get(), depth_ptr, _d_depth_intrinsics.get(),
         _d_other_intrinsics.get(), _d_depth_other_extrinsics.get(), depth_scale);
     cuda_or_throw(cudaGetLastError(), "map depth to other launch");
 
-    kernel_depth_to_other <<<depth_blocks,block>>> ((uint16_t*)_d_aligned_out.get(), _d_depth_in.get(), _d_pixel_map.get(),
+    kernel_depth_to_other <<<depth_blocks,block>>> (aligned_ptr, depth_ptr, _d_pixel_map.get(),
         _d_depth_intrinsics.get(), _d_other_intrinsics.get());
     cuda_or_throw(cudaGetLastError(), "depth to other launch");
 
-    kernel_replace_to_zero <<<other_blocks,block>>> ((uint16_t*)_d_aligned_out.get(), _d_other_intrinsics.get());
+    kernel_replace_to_zero <<<other_blocks,block>>> (aligned_ptr, _d_other_intrinsics.get());
     cuda_or_throw(cudaGetLastError(), "replace invalid depth launch");
 
+    // Required in BOTH legs: the host reads the aligned plane straight after this returns, and
+    // under zero-copy there is no D2H copy left to impose the ordering.
     cuda_or_throw(cudaStreamSynchronize(0), "depth to other sync");
 
-    cuda_or_throw(cudaMemcpy(h_aligned_out, _d_aligned_out.get(), aligned_pixel_count * 2, cudaMemcpyDeviceToHost), "D2H aligned depth-to-other");
+    if (!out_dev)
+        cuda_or_throw(cudaMemcpy(h_aligned_out, aligned_ptr, aligned_pixel_count * 2, cudaMemcpyDeviceToHost), "D2H aligned depth-to-other");
 }
 
 #endif //RS2_USE_CUDA
