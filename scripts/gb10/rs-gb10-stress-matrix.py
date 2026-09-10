@@ -263,6 +263,27 @@ def run_entry(name, streams, duration, render):
                 "ok": stream_ok,
             }
         )
+    # An entry that started, raised nothing, and delivered NO frames used to be
+    # reported as PASS: `ok` began as (err == "") and the per-stream loop never
+    # ran, so nothing could falsify it. That is the worst failure mode for a
+    # tripwire -- "delivered nothing" and "delivered perfectly" were
+    # indistinguishable in the JSON and both read [PASS]. Observed 2026-09-10 on
+    # spark-0060, where two 720p entries reported PASS with "streams": [].
+    if not per_stream:
+        ok = False
+        err = err or (
+            "no frames delivered on any requested stream "
+            "(pipeline started, no exception raised)"
+        )
+    # Every requested stream must actually appear. A config that silently drops
+    # one stream and runs the rest at full rate is a FAIL, not a partial pass.
+    elif len(per_stream) < len(streams):
+        ok = False
+        got = ", ".join(x["stream"] for x in per_stream)
+        err = err or (
+            f"only {len(per_stream)} of {len(streams)} requested streams "
+            f"delivered frames (got: {got})"
+        )
     if aborted_on_fault:
         ok = False
     return {
