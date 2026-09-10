@@ -615,3 +615,32 @@ OpenCV before choosing the pin. Both hosts otherwise match: kernel `6.17.0-1029-
 
 Also set `CUDACXX` explicitly on both: `nvcc` is **not** on a non-interactive SSH `PATH`, which
 surfaces as the misleading "No CMAKE_CUDA_COMPILER could be found".
+
+
+### 14.1 Both Sparks staged — 2026-09-10, neither re-pinned
+
+The canonical prefix `/opt/vigil/opt/librealsense-v2.58.4-dgx-spark-gb10` is built from merged
+master (`164f19674`, `v2.58.2-1474-g164f19674`) and gated on **both** hosts:
+
+| Gate | spark-3066 | spark-0060 |
+|---|---|---|
+| `CUDA_HOME` used | `/usr/local/cuda-13.0` | `/usr/local/cuda-13.2` |
+| `rs-gb10-profiler --self-test` | **32/0** | **32/0** |
+| `BUILD_WITH_CUDA_ZEROCOPY` in provenance | 1 | 1 |
+| 10 tools × 3 runs | rc=000 | rc=000 |
+| duplicated globals exported | 0 | 0 |
+| CUDA objects compiled | 5 | 5 |
+| `/usr/local/lib/librealsense2.so` | **unchanged, 2.58.1** | **unchanged, 2.58.1** |
+
+**Nothing is re-pinned.** A7 remains gated on rebuilding every consumer against the 2.58.4 headers
+(§13) and on the envelope question (§12).
+
+Two notes on spark-0060 specifically:
+
+- Its build log contains two `RS2_USB_STATUS_BUSY` errors from the script's `validate()` step. The
+  D435 **is** attached (`Bus 002 Device 003: ID 8086:0b07`) but is **held by another process** —
+  the live `vigil_c2` session. This is expected on 0060 and is not a build defect; the artifact
+  gates clean.
+- Staging 0060's *build* is **not** validating 0060's *envelope*. Its camera sits behind a hub
+  rather than on a native root port, and the multistream ramp (§12) has only ever run on 3066. That
+  remains the open item.

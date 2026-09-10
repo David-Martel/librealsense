@@ -298,6 +298,9 @@ Ordered by measured value. "Gate" = what must be true before the item is called 
       `/usr/local/cuda-13.2` **exists** (the June note calls it nonexistent); kernel/driver per §4.
 
 ### P2 — deployment
+- [x] **A7a · Both Sparks STAGED 2026-09-10** — canonical 2.58.4 prefix built from merged master and
+      gated on both hosts (`benchmarks.md` §14.1). Note the two hosts need **different `CUDA_HOME`
+      pins** (3066 → 13.0, 0060 → 13.2; §14) — do not copy a build invocation across.
 - [ ] **A7 · Re-pin fleet consumers only after A1+A2+A6.** Codex's 05:20Z bus finding already reports
       build skew (ASUS `b22` consumers vs `3b145` on both Sparks) — re-pinning into skew makes it worse.
       **New hard requirement (`benchmarks.md` §13):** upstream 2.58.4 breaks ABI against 2.58.3
