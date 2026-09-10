@@ -1093,3 +1093,47 @@ reported as PASS). 848×480 has not actually been streaming on this fleet.
 **Consequence:** 1280×720@30 is not a preference, it is the only depth mode that runs, and 30 Hz is
 therefore a hard floor on frame interval until the probe-commit stall is understood. Any plan that
 assumed a lower-resolution/higher-rate depth mode — including this campaign's own M1 — is void.
+
+### §18.5 Cross-host confirmation on the deployed binary
+
+Both Sparks, deployed 2.58.4 `a8977ca55`, 1280×720@30 D+C. **Co-tenancy stated inline, because
+every bad number either agent produced today was a measurement taken under one condition and
+reported as a property of the system:**
+
+| host | co-tenancy | USB path | n | p50 | p99 | p99.9 | **jitter p99−p50** | **tail-excess p99.9−p50** |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| spark-3066 | vLLM router + 3 CI runners | native xHCI root port | 8986 | 33.345 | 34.752 | 35.322 | **1.407** | **1.977** |
+| spark-0060 | vLLM router + SAM3 + voice sidecars, no CI | spark-bus | 7187 | 33.338 | 34.727 | 35.309 | **1.388** | **1.971** |
+
+Two hosts, two USB topologies, two co-tenancy mixes, agreeing to **~0.02 ms**. Depth/colour skew is
+p50 = p99 = 0.024 ms on both. This is the strongest available statement that the SDK-side
+contribution to operator-visible jitter is small and stable.
+
+The per-start stall is now **six observations across both hosts** — frame 24 (300 s), frame 20
+(0060, 240 s), frame 15 (12 s). The frame index is what settles "per start" against "periodic": a
+periodic event would drift with run duration, and it does not. The settle window therefore has to
+be re-armed on every pipeline restart, not only at node startup.
+
+**Deployment validation on the new binary:** 720p stress tier ×2 on spark-0060, `failed: 0`,
+`aborted: false`, 360 frames per stream per 12 s entry (= 30 fps exactly); the two entries reporting
+353 are the once-per-start stall costing ~7 frames, which is the expected signature rather than an
+anomaly. `SELF_TEST checks=32 failures=0` on both hosts.
+
+### §18.6 A pin that could not be verified from the other host
+
+Found while validating, and worth recording because the *shape* of the defect is the lesson. Both
+Sparks' `python3` was importing **2.58.1** bindings while `/usr/local/lib` and `profile.d` already
+pointed at 2.58.4 — so spark-3066 was running **2.58.1 bindings against a 2.58.4 `.so`**.
+
+The pin lived in a **different file on each host**:
+
+| host | file | was |
+|---|---|---|
+| spark-3066 | `~/.local/lib/python3.12/site-packages/realsense_gb10.pth` (user site) | 2.58.1 |
+| spark-0060 | `/usr/local/lib/python3.12/dist-packages/pyrealsense2-gb10.pth` (system) | 2.58.1 |
+
+So a fleet check that looked in one location would have returned a confident, wrong answer on the
+other host. **`import_ok devices=1` does not catch this** — it proves liveness, not version, and it
+was my own green light earlier in this campaign. Verify the package version *and* the mapped
+library via `/proc/self/maps`. Both hosts now resolve package and `.so` at 2.58.4; the previous
+files are kept as `*.pre-2584`.
