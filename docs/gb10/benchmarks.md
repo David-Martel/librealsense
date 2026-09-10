@@ -912,3 +912,68 @@ silent fallback:
 
 The system 4.6.0 is what a bare `python3` on a Spark resolves, and it has no CUDA at all. That is the
 real gap this closes.
+
+---
+
+## 17. Armv9.2 codegen — real, byte-identical, and much smaller than expected
+
+§F6 of the campaign plan found that both the incumbent and replacement SDK were compiled at the
+**aarch64 baseline**, because GCC 13.3 does not know Cortex-X925 and `-mcpu=native` on an
+unrecognised part resolves to nothing at all. This section measures what fixing that is worth.
+
+### 17.1 The flags demonstrably take effect
+
+| Build | `CMAKE_CXX_FLAGS_RELEASE` | SVE instructions in `librealsense2.so` |
+|---|---|---|
+| baseline | `-O3 -DNDEBUG -mcpu=native …` | **0** |
+| Armv9.2 | `-O3 -DNDEBUG -march=armv9.2-a+sve2+bf16+i8mm -mtune=neoverse-v2 …` | **1739** |
+
+Counted with `objdump -d` over `ptrue`/`whilelt`/`ld1[bhwd]`/`st1[bhwd]`. This is the objective
+confirmation that the baseline really was shipping without SVE2 and that the new flags are not
+merely accepted but used.
+
+### 17.2 Correctness is unaffected
+
+- `rs-gb10-profiler --self-test`: **checks=32 failures=0**
+- `rs-enumerate-devices` / `rs-fw-update` / `rs-record` / `rs-benchmark`: all rc=0
+- **Byte-identity**: the 164-frame `.db3` aligned-depth SHA-256 is `2bf7df33fea0d19c…` under the
+  Armv9.2 build — **identical** to the baseline and to every configuration in §9. Different
+  instructions, same bits.
+
+### 17.3 The measurement — reproducible, and modest
+
+SDK CPU post-processing over the recorded `.db3`, best-of-5 per filter, three independent runs.
+Align, pointcloud, colorize and the YUY2 unpack are all **CUDA-gated on GB10**, so the CPU filter
+chain is the only place these flags can show up, and it is what is measured here.
+
+| Filter | baseline (ms/frame) | Armv9.2 (ms/frame) | change |
+|---|---:|---:|---:|
+| `spatial` | 8.8222 / 8.8272 / 8.8291 | 8.7745 / 8.7757 / 8.7786 | **−0.55%** |
+| `hole_filling` | 0.4223 / 0.4225 / 0.4214 | 0.3520 / 0.3516 / 0.3561 | **−16.6%** |
+| `decimation` | 0.4529 | 0.4547 | none |
+| `temporal` | 0.5017 | 0.5018 | none |
+| `disparity_transform` | 0.0091 | 0.0091 | none |
+
+Run-to-run spread is ~0.1%, far smaller than either delta, so both effects are real rather than
+sampling noise. But note which one is which: **`hole_filling` gains 16.6% while `spatial`, which
+dominates the chain at ~8.8 ms, gains 0.55%.** On a realistic chain the net is under 1%.
+
+### 17.4 Verdict — adopt, but for the right reason
+
+This is **not** the large acceleration the baseline-ISA finding suggested it might be. The reason is
+structural: on GB10 the SDK's heavy per-frame work (align, pointcloud, colorize, YUY2 unpack) already
+runs on the GPU, and the CPU filters that remain are mostly memory-bound rather than compute-bound,
+so wider vectors have little to bite on.
+
+Adopt it anyway, because the cost is zero and the alternative is worse than slow — it is *undefined*:
+
+- output is byte-identical, so nothing downstream can observe the change;
+- the self-test and every tool are clean;
+- the gains, though small, are real and reproducible;
+- and the status quo is a build whose ISA is whatever GCC silently fell back to, which is not a
+  decision anyone made. `scripts/build-dgx-spark-gb10.sh` now refuses that configuration outright
+  (`0e226644a`) rather than shipping it unnoticed.
+
+**Anyone hoping for a large win from arch flags on this SDK should read §17.3 first.** The lever that
+would actually matter is moving more work onto the GPU — the NVENC colour path in F10 — not
+recompiling the CPU paths.

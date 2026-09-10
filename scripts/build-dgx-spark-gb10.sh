@@ -28,7 +28,15 @@ GENERATOR="${LRS_GB10_GENERATOR:-Ninja}"
 # GCC 13.3 silently degrades 'native' to an armv8-a baseline on Cortex-X925). Set LRS_GB10_REPRODUCIBLE=1
 # for an explicit GB10 ISA and a GCC-13-supported tuning target. GCC 13.3 rejects both
 # -mcpu=cortex-x925 and -mcpu=cortex-a725; both Spark core classes expose Armv9.2-A, SVE2, BF16, and I8MM.
-if [[ "${LRS_GB10_REPRODUCIBLE:-0}" == "1" ]]; then
+# Default flipped to the explicit Armv9.2 ISA on 2026-09-10, on measurement rather than
+# preference. -mcpu=native is not a faster alternative to this -- on GCC 13.3 + Cortex-X925 it
+# resolves to NOTHING and silently produces an aarch64 baseline binary with zero SVE
+# instructions (objdump: 1739 vs 0). The Armv9.2 build is byte-identical on the align
+# identity fixture, passes the profiler self-test 32/0, and is 16.6% faster on hole_filling
+# and 0.55% on spatial -- small, but real and reproducible across three runs, and free.
+# Set LRS_GB10_REPRODUCIBLE=0 to get the old host-specific behaviour back. See
+# docs/gb10/benchmarks.md section 17 before expecting a large win from this.
+if [[ "${LRS_GB10_REPRODUCIBLE:-1}" == "1" ]]; then
   ARCH_FLAG="${LRS_GB10_ARCH:--march=armv9.2-a+sve2+bf16+i8mm -mtune=neoverse-v2}"
 else
   ARCH_FLAG="${LRS_GB10_ARCH:--mcpu=native}"
