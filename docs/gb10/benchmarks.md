@@ -831,3 +831,84 @@ question the envelope was actually blocking.
 **What replaces it:** the kernel tripwire stays armed in every harness run, and
 `RS2_GB10_USB_TUNING` stays available. Guidance changes from "never run multistream" to "multistream
 at 720p30 is validated on both Sparks; run the tripwire on any new configuration before trusting it."
+
+---
+
+## 16. OpenCV unification and the retirement of the per-host CUDA pin — 2026-09-10
+
+§14 documented that the two Sparks need different `CUDA_HOME` values and called it a trap to be
+memorised. That was treating a symptom. This section records the cause and its removal.
+
+### 16.1 The cause
+
+`wrappers/opencv/CMakeLists.txt:5` hard-fails when the SDK's CUDA version does not match the CUDA
+that the OpenCV it links was built against. The OpenCV the GB10 build pointed at,
+`/opt/gb10-cuda/install/opencv`, was compiled against **CUDA 13.0 on spark-3066 and CUDA 13.2 on
+spark-0060**. Hence the inverted pin — it was never about the hosts, only about which toolkit
+happened to be used the day each OpenCV was built.
+
+That inversion was not the only one. Building a single OpenCV across both hosts surfaced three more
+asymmetries, none of which was visible from reading any script:
+
+| Asymmetry | spark-3066 | spark-0060 | Effect |
+|---|---|---|---|
+| Video Codec SDK headers (`nvcuvid.h`, `cuviddec.h`, `nvEncodeAPI.h`) | under `cuda-13.0` only | under `cuda-13.2` only | `cudacodec` builds on one host, not the other |
+| Qt | Qt5 only | Qt5 **and** a Qt6 missing `Core5Compat` | OpenCV prefers Qt6 → configure dies on 0060 |
+| `/opt/vigil-spark/.venv-ros-py312` CPython | **3.12.3** | **3.12.13** | `FindPythonLibs` needs an *exact* match vs system 3.12.3 → `cv2` built on one host, silently absent on the other |
+
+The headers were byte-identical across hosts (md5), so both CUDA trees on both hosts were
+cross-populated. Qt is now pinned to major version 5. The interpreter roles were split: `BUILD_PY`
+(system, matches libpython by construction) satisfies `FindPythonLibs`, while `VENV_PY` stays the
+runtime target supplying numpy 2 headers and the verification.
+
+### 16.2 What the OpenCV was missing
+
+Measured in the artifact, not read from the script. The build that had been in service:
+
+| Feature | Before | After | Hardware supports it? |
+|---|---|---|---|
+| CUDA | YES (13.2) | YES (13.2) | — |
+| **cuDNN** | absent | **9.25.0** | `libcudnn.so.9` installed |
+| **OpenGL** | absent | **YES** | `gl.pc` present |
+| **NVCUVID / NVCUVENC** | absent | **YES** | headers present |
+| **`cudacodec` H.264 encoder** | **throws from `cuda_stubs.hpp`** | **works** | NVENC present |
+| Parallel framework | pthreads | **TBB 2021.11** | `tbb.pc` present |
+| modules / CUDA modules | — | 70 / 11 | — |
+
+`hasattr(cv2, "cudacodec")` returns **True in both columns** — OpenCV compiles a stub when it cannot
+find the codec SDK. Only instantiating an encoder distinguishes them:
+
+```
+before:  createVideoWriter(H264) -> raises from core/private/cuda_stubs.hpp
+after :  createVideoWriter(H264) -> OK, writes frames
+```
+
+### 16.3 The pin is retired — the test that shows it
+
+Previously `CUDA_HOME=/usr/local/cuda-13.2` configured on 0060 and failed on 3066. With both hosts
+pointed at the single `/opt/opencv-cuda-4.14.0`, the identical command now succeeds on both:
+
+| | spark-3066 | spark-0060 |
+|---|---|---|
+| `CUDA_HOME` | `/usr/local/cuda-13.2` | `/usr/local/cuda-13.2` |
+| configure | **OK** | **OK** |
+| `OpenCV_DIR` | `/opt/opencv-cuda-4.14.0/lib/cmake/opencv4` | same |
+| `CMAKE_CXX_FLAGS_RELEASE` | `-O3 -DNDEBUG -march=armv9.2-a+sve2+bf16+i8mm -mtune=neoverse-v2 …` | same |
+
+**§14's per-host `CUDA_HOME` guidance is superseded.** Use `/usr/local/cuda-13.2` on both. The §14
+table stays as the record of why the inversion existed.
+
+### 16.4 Honest performance note
+
+The new OpenCV is **not measurably faster than the old one on ordinary CPU calls** — 720p `imencode`
+q80 is 1.767 ms vs 1.790 ms, which is noise. What changed is capability and the elimination of a
+silent fallback:
+
+| | `imencode` 720p q80 | CUDA | working `cudacodec` |
+|---|---|---|---|
+| new canonical build | 1.767 ms | yes | **yes** |
+| previous build | 1.790 ms | yes | no (stub) |
+| Ubuntu system 4.6.0 | **2.252 ms** (+27%) | **no** | no |
+
+The system 4.6.0 is what a bare `python3` on a Spark resolves, and it has no CUDA at all. That is the
+real gap this closes.
