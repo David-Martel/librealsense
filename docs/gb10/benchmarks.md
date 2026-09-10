@@ -1257,14 +1257,37 @@ support PTP?" — is not the binding constraint. Even a switch with full 1588 su
 would not help here, because §20.2 means neither endpoint on that segment can stamp a
 packet in hardware.
 
-### 20.4 Where PTP *can* work: the ConnectX-7 fabric, which has no switch in it
+### 20.4 Where PTP can *best* work: the ConnectX-7 fabric (CORRECTED — it has a switch)
 
-The four `10.55.15{2,3,4,5}.0/24` links are **direct Spark-to-Spark** QSFP connections
-(`.1` = spark-0060, `.2` = spark-3066), MTU 9000 on the `f0np0` pair. Both ends are
-ConnectX-7 ports with a PHC and hardware transmit and receive timestamping, and there
-is no switch between them to add uncorrected residence time.
+> **CORRECTION (same day, before this was relied on).** The first version of this
+> section asserted these links were direct point-to-point with no switch. That was
+> inferred from the addressing — four `/24`s with `.1` on spark-0060 and `.2` on
+> spark-3066 — and it is **wrong**. Two measurements taken while spark-0060 was
+> powered off disprove it: spark-3066 held `carrier=1` at **200000Mb/s on all four
+> QSFP ports** with its supposed link partner unpowered, and an all-nodes multicast
+> sweep on those wires enumerated **spark-3066's own two cards answering each other**.
+> A direct cable to a dead host cannot hold carrier, and a host cannot see both of its
+> own ports on one wire. **There is a switch in the QSFP fabric.** Point-to-point
+> addressing is not evidence of point-to-point cabling.
 
-That is the one path on this fleet where PTP has both prerequisites. The measurement
+The four `10.55.15{2,3,4,5}.0/24` links (`.1` = spark-0060, `.2` = spark-3066, MTU 9000
+on the `f0np0` pair) terminate on ConnectX-7 ports that **do** have a PHC and hardware
+transmit and receive timestamping at both ends. That half of the claim stands, and it
+is still the only path on this fleet where both endpoints can stamp in hardware.
+
+What no longer stands is "no switch to add uncorrected residence time". Whether that
+switch is a PTP transparent clock is **unknown and unmeasured** — it was not identified
+before this correction was written, and unlike the 10 GbE segment it cannot be
+characterised by LLDP from a single host while the fleet is down. Until it is, the
+achievable offset over this fabric is an open number, not a good one by assumption.
+
+A direct consequence worth stating: **`carrier` on a QSFP port is not evidence the far
+host is alive**, because the switch holds the link. That inference was made in this
+campaign and was wrong — spark-0060's four ports came back at `carrier=0` after its
+power cycle, which is a fault between 0060 and the switch and will *not* resolve when
+spark-3066 returns. Its transceiver reads `Power set: Off` with
+`High Power Class (> 3.5 W) not enabled` (FS QSFP28), and `ip link set ... up` does not
+raise carrier. The measurement
 to run — deliberately **non-disruptive**, so it can be done on a production host — is
 `ptp4l` master on one Spark and slave on the other, **PHC-only**: no `phc2sys`, chrony
 untouched, system clock untouched. Read `master offset` from `ptp4l -m` and report
@@ -1320,3 +1343,67 @@ access. spark-3066's reboot was held for exactly this reason and remains held un
 0060 returns — which inverts the original "sequential reboot" plan's ordering
 assumption. Sequential means *verify, then proceed*, and a host that never returns is
 not a verification that permits proceeding.
+
+## §22 The determinism profile took spark-3066 down — a negative result (2026-09-10)
+
+`scripts/gb10/rs-gb10-runtime-profile.py apply determinism` was run on spark-3066 as
+the B leg of an A/B against the §18 baseline. **The host died within about two minutes
+of the profile being applied** and did not return; it required a physical power cycle.
+This is recorded as a measured negative so the profile is not re-run in this form.
+
+### 22.1 What it writes, and which lever is the suspect
+
+| Lever | Write |
+|---|---|
+| CPU idle states | `/sys/devices/system/cpu/cpu*/cpuidle/state*/disable` — **every state, every core** |
+| Timer migration | `/proc/sys/kernel/timer_migration` -> `0` |
+| GPU clock floor | `nvidia-smi -lgc` |
+| IRQ placement | `systemctl stop irqbalance` |
+
+The first is the suspect. Disabling every idle state on every GB10 core pins all cores
+at full power simultaneously, and the profile does that **while** raising the GPU clock
+floor, on a host that was concurrently running two vLLM processes and an active CI job.
+That is a large uncommanded step in package power on a platform with a shared budget.
+A power or thermal event fits the observed failure better than a software hang: the
+host died with **no kernel networking at all** — silent to `arping`, absent from an
+all-nodes multicast sweep — rather than staying up enough to answer ARP.
+
+This is not proof of mechanism. The host was lost before anything could be read off it,
+so no thermal or power telemetry from the event survives. What is established is the
+correlation and the blast radius.
+
+### 22.2 The design defect: a revert that lives on the host you might lose
+
+The A/B driver held its revert in a shell `EXIT` trap. That is useless against this
+failure mode, because **a trap fires when the script exits, and the script's host
+stopped executing.** It is the identical mistake as sending a host a warm reboot with
+no way to power it back on (§21): a safety mechanism that runs on the machine you might
+lose is not a safety mechanism.
+
+Two changes are required before this profile is applied to a host again:
+
+- **Step idle states incrementally**, deepest-first, rather than disabling all states on
+  all cores in one pass. The tail benefit of the shallowest states is small and the
+  power cost of removing all of them at once is what appears to have been fatal.
+- **Arm a host-side deadman first** — `systemd-run --on-active=N` scheduling an
+  unconditional `revert --apply` on the target itself — so recovery does not depend on
+  the controlling session, the network, or the driver script surviving.
+
+### 22.3 The one mitigating property: nothing it writes persists
+
+`cpuidle/*/disable`, `timer_migration`, `nvidia-smi -lgc` and a `systemctl stop` are all
+**runtime state**. A power cycle returns the host to defaults with no file to repair and
+nothing to undo. That is a deliberate property of the tool and it held: the recovery was
+a power cycle and nothing else.
+
+It is also the reason the profile cannot be evaluated by "check the levers after a
+reboot" — a reboot reverts them by construction, so **the determinism profile is not
+persistent**, and any A/B must be run fresh in one session against a baseline taken in
+that same session.
+
+### 22.4 Status of the jitter A/B
+
+**Unresolved.** Leg A (baseline, 120 s) completed; leg B did not, and its host was lost.
+The §18 steady-state figures remain the only measured jitter numbers on this fleet.
+Whether disabling idle states improves the delivery tail is still an open question, and
+answering it now requires the §22.2 changes plus a host that is not the only live one.
