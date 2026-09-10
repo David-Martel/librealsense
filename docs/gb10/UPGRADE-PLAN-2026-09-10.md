@@ -318,10 +318,30 @@ Ordered by measured value. "Gate" = what must be true before the item is called 
 - [ ] **A9 · git-guard needs a merge-commit mode** (§3 note). A vendor merge cannot pass a gate that
       lints imported third-party code. Suggest: skip `qa_gate` lint when `MERGE_HEAD` exists and the
       merge parent is a known upstream remote, keeping the secret scan mandatory.
-- [ ] **A10 · Upstream the genuinely generic fixes** — the four fw-update safety PRs (#8–#11), the
-      CUDA-align `{-1,-1}` sentinel, the `@CMAKE_INSTALL_LIBDIR@` pkgconfig fix, and the OpenNI2
-      Linux include repair. Each is an upstream bug, not GB10-specific; carrying them forever is
-      merge debt.
+- [ ] **A10 · Upstream the genuinely generic fixes.** **Drafted 2026-09-10, NOT filed** —
+      [`UPSTREAM-REPORT-DRAFT-2026-09-10.md`](UPSTREAM-REPORT-DRAFT-2026-09-10.md). Filing on a
+      public tracker under the account owner's identity is outward-facing and unauthorised; the
+      drafts are ready to submit on request. Two are new and are the high-value ones:
+      (a) the **rsutils duplicate-global double free** — generic, reproduces on stock x86_64, bug
+      report with the fix attached; (b) the **align zero-copy regression** — upstream wired
+      pointcloud's output for zero-copy but never align's, and wiring it naively is 6.9× slower
+      because of `atomic_min_uint16` on mapped memory. That is precisely what a maintainer would
+      want on record *before* someone else wires it. Plus the pre-existing set: the fw-update safety
+      PRs (#8–#11), the CUDA-align `{-1,-1}` sentinel, the `@CMAKE_INSTALL_LIBDIR@` pkgconfig fix
+      and the OpenNI2 include repair.
+
+- **Upstream issues relevant to the deployed hardware** (tracked, not owned by this lane):
+  - [#15617](https://github.com/IntelRealSense/librealsense/issues/15617) — 2.58.4 breaks ABI vs
+    2.58.3. Blast radius checked against this fleet in `benchmarks.md` §13; it gates A7.
+  - [#15424](https://github.com/IntelRealSense/librealsense/issues/15424) — D435i `pipeline.start()`
+    alternately fails with "Frame didn't arrive within 5000" after `pipeline.stop()` on Ubuntu 24.04
+    / kernel 6.14, recovered by `hardware_reset()`. **Same territory as this fork's P7 re-acquire
+    guard**, which measured 0/5 false fires. Worth comparing notes — the fork may already have the
+    mitigation upstream lacks.
+  - [#15546](https://github.com/IntelRealSense/librealsense/issues/15546) — `videodev` module blocks
+    installation on Jetson AGX Orin. aarch64-relevant; the GB10 build sidesteps it by using RSUSB,
+    which is worth saying on the issue.
+
 - [ ] **A11 · Move PR #12 out of draft** — its blocker is resolved (§4.1); or supersede it with this
       2.58.4 branch. Owner decision.
 
