@@ -393,7 +393,6 @@ namespace librealsense
     }
 
     ds_timestamp_reader::ds_timestamp_reader()
-        : counter(pins)
     {
         reset();
     }
@@ -401,10 +400,7 @@ namespace librealsense
     void ds_timestamp_reader::reset()
     {
         std::lock_guard<std::recursive_mutex> lock(_mtx);
-        for (auto i = 0; i < pins; ++i)
-        {
-            counter[i] = 0;
-        }
+        counter.clear();
     }
 
     rs2_time_t ds_timestamp_reader::get_frame_timestamp(const std::shared_ptr<frame_interface>& frame)
@@ -415,11 +411,8 @@ namespace librealsense
     unsigned long long ds_timestamp_reader::get_frame_counter(const std::shared_ptr<frame_interface>& frame) const
     {
         std::lock_guard<std::recursive_mutex> lock(_mtx);
-        auto pin_index = 0;
-        if (frame->get_stream()->get_format() == RS2_FORMAT_Z16)
-            pin_index = 1;
-
-        return ++counter[pin_index];
+        auto key = frame->get_stream()->get_unique_id();
+        return ++counter[key];
     }
 
     rs2_timestamp_domain ds_timestamp_reader::get_frame_timestamp_domain(const std::shared_ptr<frame_interface>& frame) const

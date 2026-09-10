@@ -94,6 +94,22 @@ namespace rs2
         }
 
         /**
+        * Add perception stream to software sensor
+        *
+        * \param[in] perception_stream   all the parameters that required to define a perception stream
+        */
+        stream_profile add_perception_stream(rs2_perception_stream perception_stream, bool is_default=false)
+        {
+            rs2_error* e = nullptr;
+
+            auto profile = rs2_software_sensor_add_perception_stream_ex(_sensor.get(), perception_stream, is_default, &e);
+            error::handle(e);
+
+            stream_profile stream(profile);
+            return stream;
+        }
+
+        /**
         * Inject video frame into the sensor
         *
         * \param[in] frame   all the parameters that required to define video frame

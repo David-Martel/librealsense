@@ -6,6 +6,11 @@
 
 option(ENABLE_CCACHE "Build with ccache." ON)
 option(BUILD_WITH_CUDA "Enable CUDA" OFF)
+# Zero-copy GPU memory path (Jetson / integrated-GPU only). Requires BUILD_WITH_CUDA.
+# Eliminates the per-frame CPU->frame copy (capture) and the GPU host<->device round-trips.
+# Activates at runtime only on integrated GPUs; discrete GPUs keep the copy path. Default OFF
+# so a plain CUDA build is byte-for-byte identical to today.
+option(BUILD_WITH_CUDA_ZEROCOPY "Enable zero-copy GPU memory path (Jetson/integrated GPU only, requires BUILD_WITH_CUDA)" OFF)
 option(BUILD_GLSL_EXTENSIONS "Build GLSL extensions API" ON)
 option(BUILD_WITH_OPENMP "Use OpenMP" OFF)
 option(BUILD_EASYLOGGINGPP "Build EasyLogging++ as a part of the build" ON)
@@ -46,6 +51,7 @@ option(BUILD_WITH_CPU_EXTENSIONS "Enable compiler optimizations using CPU extens
 # Enable NEON option only on 64-bit ARM platforms (ARM64/AArch64)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|ARM64|aarch64|AARCH64)")
     option(BUILD_WITH_NEON "Enable ARM64 NEON optimizations" ON)
+    option(BUILD_WITH_CLOSE_RANGE_DEPTH "Enable Improved Close Range Depth (Jetson only, requires enhanced-depth library)" OFF)
 endif()
 set(UNIT_TESTS_ARGS "" CACHE STRING "Command-line arguments to pass to unit-tests-config.py, e.g. '-t <tag> -r <regex>'")
 #Performance improvement with Ubuntu 18/20
@@ -59,6 +65,7 @@ option(BUILD_WITH_DDS "Access camera devices through DDS topics (requires CMake 
 option(BUILD_RS2_ALL "Build realsense2-all static bundle containing all realsense libraries (with BUILD_SHARED_LIBS=OFF)" ON)
 option(ENABLE_SECURITY_FLAGS "Enable additional compiler security flags to enhance the build's security" OFF)
 option(USE_EXTERNAL_LZ4 "Use externally build LZ4 library instead of building and using the in this repo provided version" OFF)
+option(USE_EXTERNAL_NLOHMANN_JSON "Use an externally built nlohmann-json development package instead of downloading it as part of this build" OFF)
 option(BUILD_ASAN "Enable AddressSanitizer" OFF)
 option(BUILD_ROSBAG2 "Build and use rosbag2 recording system" ON) # temporary flag, should be removed when deprecated ROSBAG1 recording system is removed
 mark_as_advanced(BUILD_ASAN)

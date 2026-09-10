@@ -2,6 +2,8 @@
 // Copyright(c) 2021-4 RealSense, Inc. All Rights Reserved.
 #pragma once
 
+#include <rsutils/visibility.h>
+
 // When including this file outside LibRealSense you also need to:
 // 1. Compile the easylogging++.cc file
 // 2. With static linkage, ELPP is initialized by librealsense, so doing it here will
@@ -49,13 +51,26 @@
 #else //__ANDROID__  
 
 // Direct log to ELPP, without conversion to string first; use this as an optimization, if you have simple string output
-// 
+//
 // We've seen cases where this fails in U22, causing weird effects with custom overloads/types (e.g., json)
+//
+namespace rsutils {
+// log_to_console() et al. reconfigure the logger (replacing TypedConfigurations) under its lock, from any thread, at
+// any time; check enabled() under that same lock too, or risk dereferencing a TypedConfigurations mid-delete.
+inline bool elpp_enabled( el::Logger * logger__, el::Level level )
+{
+    if( ! logger__ )
+        return false;
+    el::base::threading::ScopedLock lock__( logger__->lock() );
+    return logger__->typedConfigurations() && logger__->enabled( level );
+}
+}  // namespace rsutils
+
 #define LIBRS_LOG_STR_( LEVEL, STR )                                                                                   \
     do                                                                                                                 \
     {                                                                                                                  \
         auto logger__ = el::Loggers::getLogger( rsutils::g_librealsense_elpp_id );                                     \
-        if( logger__ && logger__->enabled( el::Level::LEVEL ) )                                                        \
+        if( rsutils::elpp_enabled( logger__, el::Level::LEVEL ) )                                                      \
         {                                                                                                              \
             el::base::Writer( el::Level::LEVEL, __FILE__, __LINE__, ELPP_FUNC, el::base::DispatchAction::NormalLog )   \
                     .construct( logger__ )                                                                             \
@@ -69,7 +84,7 @@
     do                                                                                                                 \
     {                                                                                                                  \
         auto logger__ = el::Loggers::getLogger( rsutils::g_librealsense_elpp_id );                                     \
-        if( logger__ && logger__->typedConfigurations() &&  logger__->enabled( el::Level::LEVEL ) )                    \
+        if( rsutils::elpp_enabled( logger__, el::Level::LEVEL ) )                                                      \
         {                                                                                                              \
             std::ostringstream os__;                                                                                   \
             os__ << __VA_ARGS__;                                                                                       \
@@ -95,8 +110,10 @@
 namespace rsutils {
 
 
-// This is a caching of LIBREALSENSE_ELPP_ID in a string, as a performance optimization
-extern std::string const g_librealsense_elpp_id;
+// This is a caching of LIBREALSENSE_ELPP_ID in a string, as a performance optimization.
+// RSUTILS_LOCAL: rsutils is static and linked into both librealsense2 and its executables, so
+// without it this std::string is constructed and destroyed twice (see rsutils/visibility.h).
+extern std::string const RSUTILS_LOCAL g_librealsense_elpp_id;
 
 
 // Configure the same logger as librealsense (by default), to disable/enable debug output

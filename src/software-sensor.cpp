@@ -141,6 +141,26 @@ std::shared_ptr< stream_profile_interface > software_sensor::add_pose_stream( rs
 }
 
 
+std::shared_ptr< stream_profile_interface > software_sensor::add_perception_stream( rs2_perception_stream perception_stream, bool is_default, std::string name )
+{
+    auto profile = std::make_shared< perception_stream_profile >();
+    if( ! profile )
+        throw librealsense::invalid_value_exception( "null pointer passed for argument \"profile\"." );
+
+    profile->set_format( perception_stream.fmt );
+    profile->set_framerate( perception_stream.fps );
+    profile->set_stream_index( perception_stream.index );
+    profile->set_stream_type( perception_stream.type );
+    profile->set_unique_id( perception_stream.uid );
+    profile->set_name( name );
+    if( is_default )
+        profile->tag_profile( profile_tag::PROFILE_TAG_DEFAULT );
+    _sw_profiles.push_back( profile );
+
+    return std::move( profile );
+}
+
+
 bool software_sensor::extend_to( rs2_extension extension_type, void ** ptr )
 {
     if( extension_type == RS2_EXTENSION_DEPTH_SENSOR )

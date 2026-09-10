@@ -14,7 +14,7 @@ import pytest
 import pyrealsense2 as rs
 
 from rspy import devices
-
+from rspy.pytest.device_helpers import is_jetson_platform
 
 # How long the parent waits for the child to complete. 20 iterations typically
 # take a few minutes; this is generous slack for slow USB reconnects. A real
@@ -25,7 +25,8 @@ CHILD_TIMEOUT_S = 300
 
 
 pytestmark = [
-    pytest.mark.device( "D455" ), # The HWM injection is a D400 FW mechanism. Since this is a SW bug it's enough testing the flow on one device type only.
+    pytest.mark.device_each( "D455" ), # The HWM injection is a D400 FW mechanism. Since this is a SW bug it's enough testing the flow on one device type only.
+    pytest.mark.skipif( is_jetson_platform(), reason="No D455 connected to Jetson in CI" ),
     pytest.mark.context( "weekly" ),
     # Override the conftest default (200s) so our proc.wait(CHILD_TIMEOUT_S)
     # fires first on a hang. pytest-timeout's "thread" method on Windows kills

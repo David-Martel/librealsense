@@ -30,8 +30,6 @@ namespace rs2
         RS2_FWU_STATE_FAILED = 3,
     };
 
-    const char * fw_download_url() { return recommended_fw_url; }
-
     bool is_upgradeable(const std::string& curr, const std::string& available)
     {
         if (curr == "" || available == "") return false;
@@ -355,6 +353,8 @@ namespace rs2
                 log("Requesting to switch to recovery mode");
 
                 switch_device_to_recovery_mode(upd, serial, dfu, cleanup);
+                if (failed())
+                    return; // do not fall through to the unsigned update path
             }
         }
         else

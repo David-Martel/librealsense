@@ -11,6 +11,7 @@ import pyrealsense2 as rs
 from itertools import combinations
 import fps_helper
 import logging
+from rspy.snippets import is_dds_dev
 log = logging.getLogger(__name__)
 
 VGA_RESOLUTION = (640, 360)
@@ -19,7 +20,9 @@ HD_RESOLUTION = (1280, 720)
 pytestmark = [
     pytest.mark.device_each("D400*"),
     pytest.mark.device_each("D555"),
+    pytest.mark.device_each("D585"),
     pytest.mark.device_exclude("D401"),
+    pytest.mark.device_exclude("D585S"),
     pytest.mark.context("nightly"),
 ]
 
@@ -60,10 +63,7 @@ def get_sensors_and_profiles(dev):
                 sensor.set_option(rs.option.auto_exposure_priority, 0)
             profile = fps_helper.get_profile(sensor, rs.stream.color, HD_RESOLUTION)
         elif sensor.is_motion_sensor():
-            connection_type = "USB"
-            if dev.supports(rs.camera_info.connection_type):
-                connection_type = dev.get_info(rs.camera_info.connection_type)
-            if connection_type == "DDS":
+            if is_dds_dev(dev):
                 sensor_profiles_arr.append((sensor, fps_helper.get_profile(sensor, rs.stream.motion)))
             else:
                 sensor_profiles_arr.append((sensor, fps_helper.get_profile(sensor, rs.stream.accel)))

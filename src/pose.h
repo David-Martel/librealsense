@@ -26,8 +26,9 @@ inline pose operator*( const pose & a, const pose & b ) { return{ a.orientation 
 
 inline pose inverse( const pose & a )
 {
+    // inverse of {R, t} is { R^T, R^T * (-t) }
     auto inv = transpose( a.orientation );
-    return { inv, inv * a.position * -1 };
+    return { inv, inv * (a.position * -1) };
 }
 
 inline pose to_pose( const rs2_extrinsics & a )

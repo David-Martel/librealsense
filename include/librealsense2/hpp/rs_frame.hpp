@@ -341,6 +341,21 @@ namespace rs2
         }
     };
 
+    class perception_stream_profile : public stream_profile
+    {
+    public:
+        explicit perception_stream_profile(const stream_profile& sp)
+            : stream_profile(sp)
+        {
+            rs2_error* e = nullptr;
+            if (!sp || (rs2_stream_profile_is(sp.get(), RS2_EXTENSION_PERCEPTION_PROFILE, &e) == 0 && !e))
+            {
+                _profile = nullptr;
+            }
+            error::handle(e);
+        }
+    };
+
     /**
     Interface for frame filtering functionality
     */
@@ -558,6 +573,25 @@ namespace rs2
             rs2_error* e = nullptr;
             auto r = rs2_get_frame_data(frame_ref, &e);
             error::handle(e);
+            return r;
+        }
+
+        /**
+        * Retrieve a GPU device pointer for the frame, uploading it if necessary. Always returns
+        * a usable device pointer on a CUDA build (zero-copy when the frame is GPU-mapped, else an
+        * SDK-managed host->device copy); returns nullptr on non-CUDA builds. If `copied` is
+        * non-null it is set to true when the SDK had to upload, false when it was zero-copy.
+        * Valid only while this frame is held.
+        * \param[out] copied  set to true if the SDK uploaded (a copy), false if zero-copy
+        * \return             GPU device pointer for the frame, or nullptr on non-CUDA builds
+        */
+        const void* get_gpu_data_or_upload( bool* copied = nullptr ) const
+        {
+            rs2_error* e = nullptr;
+            int c = 0;
+            auto r = rs2_get_frame_gpu_data_or_upload(frame_ref, &c, &e);
+            error::handle(e);
+            if( copied ) *copied = ( c != 0 );
             return r;
         }
 
@@ -994,6 +1028,50 @@ namespace rs2
         }
     };
 
+    /**
+    * GPU-Frame extension: present when the frame's pixels reside in GPU-accessible (zero-copy)
+    * memory. Reach it with frame::as<gpu_frame>() — the cast is null unless the SDK was built with
+    * BUILD_WITH_CUDA_ZEROCOPY and the frame is GPU-resident (integrated GPU / Jetson). This mirrors
+    * rs2::gl::gpu_frame: get_data() on the base frame keeps returning the HOST pointer (the viewer,
+    * recording, pyrealsense2/OpenCV and any CPU code still use it); the GPU device pointer is a
+    * SEPARATE accessor on this extension. Typical use:
+    *
+    *     auto color = frames.get_color_frame();
+    *     const void * host = color.get_data();              // host pointer, always valid
+    *     if( auto gf = color.as<rs2::gpu_frame>() )          // true only when GPU-resident
+    *         feed_cuda( gf.get_gpu_data() );                 // device pointer, no host->device copy
+    *     else
+    *         feed_cuda( color.get_gpu_data_or_upload() );    // not zero-copy: upload (a copy)
+    */
+    class gpu_frame : public frame
+    {
+    public:
+        gpu_frame(const frame& f)
+            : frame(f)
+        {
+            rs2_error* e = nullptr;
+            if (!f || (rs2_is_frame_extendable_to(f.get(), RS2_EXTENSION_GPU_FRAME, &e) == 0 && !e))
+            {
+                reset();
+            }
+            error::handle(e);
+        }
+
+        /**
+        * Retrieve the CUDA device pointer aliasing the frame data for zero-copy GPU consumption
+        * (e.g. binding the frame directly as a CUDA / TensorRT / NPP input with no host->device
+        * copy). The frame must stay alive (hold it) until the GPU work completes.
+        * \return  GPU device pointer aliasing the frame data
+        */
+        const void* get_gpu_data() const
+        {
+            rs2_error* e = nullptr;
+            auto r = rs2_get_frame_gpu_data(get(), &e);
+            error::handle(e);
+            return r;
+        }
+    };
+
     class motion_frame : public frame
     {
     public:
@@ -1060,6 +1138,81 @@ namespace rs2
             rs2_pose_frame_get_pose_data(get(), &pose_data, &e);
             error::handle(e);
             return pose_data;
+        }
+    };
+
+    class perception_frame : public frame
+    {
+    public:
+        /**
+         * Extends the frame class with attributes inferred from the frame content, such as object detection results.
+         */
+        perception_frame() : frame()
+        {
+        }
+
+        /**
+         * Extends the frame class with attributes inferred from the frame content, such as object detection results.
+         * \param[in] frame - existing frame instance
+         */
+        perception_frame( const frame & f ) : frame( f )
+        {
+            rs2_error * e = nullptr;
+            if( ! f || ( rs2_is_frame_extendable_to( f.get(), RS2_EXTENSION_PERCEPTION_FRAME, &e ) == 0 && ! e ) )
+            {
+                reset();
+            }
+            error::handle( e );
+        }
+    };
+
+    class object_detection_frame : public perception_frame
+    {
+    public:
+        /**
+        * Extends perception_frame class with additional object detection related attributes and functions
+        */
+        object_detection_frame() : perception_frame() {}
+
+        /**
+        * Extends perception_frame class with additional object detection related attributes and functions
+        * \param[in] frame - existing frame instance
+        */
+        object_detection_frame(const frame& f)
+            : perception_frame(f)
+        {
+            rs2_error* e = nullptr;
+            if (!f || (rs2_is_frame_extendable_to(f.get(), RS2_EXTENSION_OBJECT_DETECTION_FRAME, &e) == 0 && !e))
+            {
+                reset();
+            }
+            error::handle(e);
+        }
+
+        /**
+        * Get the number of detected objects in this frame
+        * \return unsigned int - number of detections
+        */
+        unsigned int get_detection_count() const
+        {
+            rs2_error* e = nullptr;
+            auto r = rs2_get_frame_object_detection_count(get(), &e);
+            error::handle(e);
+            return r;
+        }
+
+        /**
+        * Get a specific detection by index
+        * \param[in] index - zero-based index of the detection
+        * \return rs2_object_detection - the detection at the specified index
+        */
+        rs2_object_detection get_detection(unsigned int index) const
+        {
+            rs2_object_detection detection;
+            rs2_error* e = nullptr;
+            rs2_get_frame_object_detection(get(), index, &detection, &e);
+            error::handle(e);
+            return detection;
         }
     };
 
@@ -1230,6 +1383,28 @@ namespace rs2
                 });
             }
             return f.as<pose_frame>();
+        }
+
+        /**
+        * Retrieve the object detection frame
+        * \param[in] size_t index
+        * \return object_detection_frame - the detected objects data
+        */
+        object_detection_frame get_object_detection_frame(const size_t index = 0) const
+        {
+            frame f;
+            if (!index)
+            {
+                f = first_or_default(RS2_STREAM_OBJECT_DETECTION);
+            }
+            else
+            {
+                foreach_rs([&f, index](const frame& frm) {
+                    if (frm.get_profile().stream_type() == RS2_STREAM_OBJECT_DETECTION &&
+                        frm.get_profile().stream_index() == index) f = frm;
+                });
+            }
+            return f.as<object_detection_frame>();
         }
 
         /**

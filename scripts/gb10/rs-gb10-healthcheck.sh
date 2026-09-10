@@ -187,11 +187,13 @@ else
 fi
 
 # profiler stream failures + fps ratio (sustained profiles only)
-declare -A FPS_TARGET=( [vga30]=30 [vga60]=60 [depth90-ir]=90 [hd15]=15 )
+# Pipeline framesets synchronize to the slowest requested stream. vga60 pairs
+# depth@60 with color@30, so healthy composite delivery is 30 framesets/s.
+declare -A FPS_TARGET=( [vga30]=30 [vga60]=30 [depth90-ir]=90 [hd15]=15 )
 TOTAL_FAIL=0
 for p in "${RAN[@]}"; do
   log="${OUT}/profiler-${p}.log"
-  f=$(grep -hoE 'failures=[0-9]+' "$log" 2>/dev/null | awk -F= '{s+=$2} END{print s+0}')
+  f=$(grep -hoE '(^|[[:space:]])failures=[0-9]+' "$log" 2>/dev/null | awk -F= '{s+=$2} END{print s+0}')
   u3=$(grep -cE 'usb3=yes' "$log" 2>/dev/null)
   fps=$(grep -hoE 'fps=[0-9.]+' "$log" 2>/dev/null | tail -1 | awk -F= '{print $2}')
   TOTAL_FAIL=$((TOTAL_FAIL + ${f:-0}))
@@ -272,7 +274,15 @@ EPOCH="$(date +%s)"
 # SHA-256 manifest for independent verification.
 # Exclude run.log: it is the live progress log and is still appended to after this point,
 # so hashing it here would self-invalidate. Everything scored is in result.json/report.md/artifacts.
-( cd "$OUT" && sha256sum -- *.txt profiler-*.log result.json report.md $(find . -type f \( -iname '*.png' -o -iname '*.ppm' -o -iname '*.bmp' -o -iname '*.jpg' \) 2>/dev/null) 2>/dev/null > SHA256SUMS )
+(
+  cd "$OUT" || exit 1
+  find . -type f \
+    \( -iname '*.txt' -o -iname 'profiler-*.log' -o -name result.json -o -name report.md \
+       -o -iname '*.png' -o -iname '*.ppm' -o -iname '*.bmp' -o -iname '*.jpg' \) \
+    -print0 \
+    | sort -z \
+    | xargs -0 -r sha256sum -- > SHA256SUMS
+)
 
 note "=== VERDICT: ${VERDICT} (${PASS} pass / ${FAIL} fail) ==="
 note "report: $REPORT"

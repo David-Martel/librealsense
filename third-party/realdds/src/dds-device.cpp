@@ -128,12 +128,14 @@ void dds_device::on_discovery_restored( topics::device_info const & new_info )
 {
     // Called when the device-watcher has re-connected with a device that was lost before
     // Only devices that are discovered by the device-watcher get called with this!
+    // Name and serial are informational only but are expected to stay constant between restarts,
+    // however, there are cases where they may change (e.g. recovery mode).
     if( new_info.name() != device_info().name() )
-        DDS_THROW( runtime_error, "device name cannot change" );
-    if( new_info.topic_root() != device_info().topic_root() )
-        DDS_THROW( runtime_error, "device topic root cannot change" );
+        LOG_WARNING( "[" << debug_name() << "] device name changed: '" << device_info().name() << "' -> '"
+                         << new_info.name() << "'" );
     if( new_info.serial_number() != device_info().serial_number() )
-        DDS_THROW( runtime_error, "device serial number cannot change" );
+        LOG_ERROR( "[" << debug_name() << "] device serial number changed: '" << device_info().serial_number()
+                       << "' -> '" << new_info.serial_number() << "'" );
 
     _impl->_info = new_info;
     _impl->set_state( impl::state_t::INITIALIZING );

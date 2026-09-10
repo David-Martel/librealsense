@@ -124,37 +124,69 @@ namespace librealsense
         };
 
         static const std::map<std::uint16_t, std::string> rs400_sku_names = {
-            { RS400_PID,            "Intel RealSense D400"},
-            { RS410_PID,            "Intel RealSense D410"},
-            { RS415_PID,            "Intel RealSense D415"},
-            { RS430_PID,            "Intel RealSense D430"},
-            { RS430_MM_PID,         "Intel RealSense D430 with Tracking Module"},
-            { RS_USB2_PID,          "Intel RealSense USB2" },
-            { RS_D400_RECOVERY_PID,      "Intel RealSense D4XX Recovery"},
-            { RS_D400_USB2_RECOVERY_PID, "Intel RealSense D4XX USB2 Recovery"},
-            { RS400_IMU_PID,        "Intel RealSense IMU" },
-            { RS420_PID,            "Intel RealSense D420"},
-            { RS421_PID,            "Intel RealSense D421"},
-            { RS420_MM_PID,         "Intel RealSense D420 with Tracking Module"},
-            { RS410_MM_PID,         "Intel RealSense D410 with Tracking Module"},
-            { RS400_MM_PID,         "Intel RealSense D400 with Tracking Module"},
-            { RS430_MM_RGB_PID,     "Intel RealSense D430 with Tracking and RGB Modules"},
-            { RS460_PID,            "Intel RealSense D460" },
-            { RS435_RGB_PID,        "Intel RealSense D435"},
-            { RS436_PID,            "Intel RealSense D436"},
-            { RS405U_PID,           "Intel RealSense DS5U" },
-            { RS435I_PID,           "Intel RealSense D435I" },
-            { RS416_PID,            "Intel RealSense F416"},
-            { RS430I_PID,           "Intel RealSense D430I"},
-            { RS416_RGB_PID,        "Intel RealSense F416 with RGB Module"},
-            { RS405_PID,            "Intel RealSense D405" },
-            { RS455_PID,            "Intel RealSense D455" },
-            { RS457_PID,            "Intel RealSense D457" },
-            { RS400_MIPI_RECOVERY_PID,   "Intel RealSense D4XX MIPI Recovery"},
-            { RS430_GMSL_PID,       "Intel RealSense D430" },
-            { RS415_GMSL_PID,       "Intel RealSense D415" },
-            { RS401_GMSL_PID,       "Intel RealSense D401" },
+            { RS400_PID,            "RealSense D400"},
+            { RS410_PID,            "RealSense D410"},
+            { RS415_PID,            "RealSense D415"},
+            { RS430_PID,            "RealSense D430"},
+            { RS430_MM_PID,         "RealSense D430 with Tracking Module"},
+            { RS_USB2_PID,          "RealSense USB2" },
+            { RS_D400_RECOVERY_PID,      "RealSense D4XX Recovery"},
+            { RS_D400_USB2_RECOVERY_PID, "RealSense D4XX USB2 Recovery"},
+            { RS400_IMU_PID,        "RealSense IMU" },
+            { RS420_PID,            "RealSense D420"},
+            { RS421_PID,            "RealSense D421"},
+            { RS420_MM_PID,         "RealSense D420 with Tracking Module"},
+            { RS410_MM_PID,         "RealSense D410 with Tracking Module"},
+            { RS400_MM_PID,         "RealSense D400 with Tracking Module"},
+            { RS430_MM_RGB_PID,     "RealSense D430 with Tracking and RGB Modules"},
+            { RS460_PID,            "RealSense D460" },
+            { RS435_RGB_PID,        "RealSense D435"},
+            { RS436_PID,            "RealSense D436"},
+            { RS405U_PID,           "RealSense DS5U" },
+            { RS435I_PID,           "RealSense D435I" },
+            { RS416_PID,            "RealSense F416"},
+            { RS430I_PID,           "RealSense D430I"},
+            { RS416_RGB_PID,        "RealSense F416 with RGB Module"},
+            { RS405_PID,            "RealSense D405" },
+            { RS455_PID,            "RealSense D455" },
+            { RS457_PID,            "RealSense D457" },
+            { RS400_MIPI_RECOVERY_PID,   "RealSense D4XX MIPI Recovery"},
+            { RS430_GMSL_PID,       "RealSense D430" },
+            { RS415_GMSL_PID,       "RealSense D415" },
+            { RS401_GMSL_PID,       "RealSense D401" },
         };
+
+        // D400-only HWM opcodes. Shared opcodes are in ds::fw_cmd (ds/ds-private.h).
+        enum d400_fw_cmd : uint8_t
+        {
+            GLD                = 0x0f, // Legacy get FW logs command
+            GETINTCAL          = 0x15, // Read calibration table
+            SETINTCAL          = 0x16, // Set Internal sub calibration table
+            CALIBRECALC        = 0x51, // Calibration recalc and update on the fly
+            SETINTCALNEW       = 0x62, // Set Internal sub calibration table (new format)
+            ASIC_TEMP_MIPI     = 0x7A, // get ASIC temperature - with mipi device
+            GETAELIMITS        = 0x89, // Auto Exp/Gain Limit command FW version >= 5.13.0.200
+            SETAELIMITS        = 0x8A, // Auto Exp/Gain Limit command FW version >= 5.13.0.200
+            AE_ACCEL_PARAMS    = 0x95, // Get/Set Accelerated AE tuning parameters, FW >= 5.17.3.20
+        };
+
+        inline std::string d400_fw_cmd2str(const d400_fw_cmd state)
+        {
+            switch (state)
+            {
+                ENUM2STR(GLD);
+                ENUM2STR(GETINTCAL);
+                ENUM2STR(SETINTCAL);
+                ENUM2STR(CALIBRECALC);
+                ENUM2STR(SETINTCALNEW);
+                ENUM2STR(ASIC_TEMP_MIPI);
+                ENUM2STR(GETAELIMITS);
+                ENUM2STR(SETAELIMITS);
+                ENUM2STR(AE_ACCEL_PARAMS);
+            default:
+                return ( rsutils::string::from() << "Unrecognized D400 FW command " << state );
+            }
+        }
 
         static std::map<uint16_t, std::string> d400_device_to_fw_min_version = {
             {RS400_PID, "5.8.15.0"},

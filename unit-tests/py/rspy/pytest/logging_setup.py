@@ -12,6 +12,23 @@ from rspy import repo, log as rspy_log
 
 log = logging.getLogger('librealsense')
 
+# Shared format for both the per-test FileHandler and the -s live CLI handler.
+# Leading timestamp is local wall-clock HH:MM:SS.mmm — date is implicit (one log
+# per test run). %03.0f rounds msecs; %03d would truncate (999.9 → 999, not 1000).
+# If cross-timezone correlation is ever needed, set Formatter.converter = time.gmtime.
+_LOG_FORMAT = '%(asctime)s.%(msecs)03.0f -%(levelname).1s- %(message)s'
+_LOG_DATEFMT = '%H:%M:%S'
+
+
+class _NestedFormatter( logging.Formatter ):
+    """Prepend a logger's `nested` tag (e.g. '[C  ] ') to each line, mirroring the legacy
+    rspy.log line prefix (rspy/log.py). A module sets `log.nested = 'C  '` on its own
+    logger to tag its (client) lines; read here per-record so it stays per-module."""
+    def format( self, record ):
+        line = super().format( record )
+        tag = getattr( logging.getLogger( record.name ), 'nested', None )
+        return f'[{tag}] {line}' if tag else line
+
 # unit-tests/ directory — used as fallback for log output
 _unit_tests_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Walk two levels up from rspy/pytest/ to get unit-tests/py/, then one more for unit-tests/
@@ -20,9 +37,60 @@ _unit_tests_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), '..',
 # Live-logging state: set to True when -s is passed (stdout not captured)
 live_logging = False
 
-# Per-module+device log handler tracking
-_current_log_key = None       # (fspath, device_id) tuple
-_current_file_handler = None
+# Per-(module, camera) log paths already opened this session. The first open truncates
+# (clears any stale file from a previous run); reopens append, so pytest-retry attempts and
+# --repeat/--count passes all accumulate in one file instead of overwriting each other.
+_opened_logs = set()
+
+# Keep a reference to the installed LibRS log callback so it isn't garbage-collected.
+_rs_log_callback = None
+
+
+def install_rs_log_bridge(rs):
+    """Route LibRS (C++) logs into a dedicated ``librealsense.rs`` Python logger so they land
+    in the per-test log files (and pytest's captured-log reports) for every test -- including
+    each ``--repeat``/``--count`` pass.
+
+    Uses ``log_to_callback`` rather than ``log_to_console``: the latter writes at the fd
+    level, which pytest's default ``fd`` capture swallows, so only the pre-test device
+    enumeration (emitted before per-test capture starts) ever reached the console. Routing
+    through Python logging is capture-method agnostic and, with ``-s``, still streams live
+    to the console via the log_cli handler.
+
+    A DEDICATED child logger (not the shared ``librealsense`` logger) is set to DEBUG so
+    --rslog surfaces LibRS debug lines regardless of --debug -- matching the legacy
+    run-unit-tests.py behavior, where --rslog and --debug were independent -- WITHOUT lowering
+    the shared logger and leaking every other test's DEBUG output. Its records still propagate
+    up to the root FileHandler (propagation is gated only by the originating logger's level)."""
+    global _rs_log_callback
+    if _rs_log_callback is not None:
+        return
+    level_map = {
+        rs.log_severity.debug: logging.DEBUG,
+        rs.log_severity.info: logging.INFO,
+        rs.log_severity.warn: logging.WARNING,
+        rs.log_severity.error: logging.ERROR,
+        rs.log_severity.fatal: logging.CRITICAL,
+    }
+    rs_log = logging.getLogger('librealsense.rs')
+
+    def _callback(severity, message):
+        try:
+            # Older pyrealsense2 builds may hand the callback a plain str instead of a
+            # log-message object; fall back to str() so the message still gets through.
+            text = message.raw() if hasattr(message, 'raw') else str(message)
+            rs_log.log(level_map.get(severity, logging.DEBUG), text)
+        except Exception:
+            pass  # never let a logging callback break a test
+
+    rs_log.setLevel(logging.DEBUG)
+    _rs_log_callback = _callback
+    try:
+        # Async: the emitting LibRS thread never takes the GIL, so a LOG under an internal
+        # mutex cannot deadlock against the main thread; messages arrive as plain str
+        rs.log_to_callback(rs.log_severity.debug, _callback, asynchronous=True)
+    except TypeError:  # older pyrealsense2 build without the flag
+        rs.log_to_callback(rs.log_severity.debug, _callback)
 
 
 def bridge_rspy_log():
@@ -63,10 +131,16 @@ def _find_build_dir():
 
 
 def setup_test_logging(config):
-    """Set up per-test log directory and JUnit XML output path (<build_dir>/<config>/unit-tests/)."""
-    build_dir = _find_build_dir()
+    """Set up per-test log directory and JUnit XML output path (<build_dir>/<config>/unit-tests/).
 
-    if build_dir:
+    RS_TEST_LOGDIR overrides the location — used by the infra E2E harness for a deterministic,
+    isolated log dir regardless of whether a build tree is present."""
+    env_logdir = os.environ.get('RS_TEST_LOGDIR')
+    build_dir = None if env_logdir else _find_build_dir()
+
+    if env_logdir:
+        logdir = env_logdir
+    elif build_dir:
         cmake_cache_path = os.path.join(build_dir, 'CMakeCache.txt')
         configuration = None
 
@@ -100,6 +174,32 @@ def setup_test_logging(config):
     config._test_logdir = logdir
 
 
+def configure_junit_logging(config):
+    """Embed every test's captured log into its JUnit <system-out> so the Jenkins Test
+    Result page shows the log inline (for passing tests too), without the JUnit
+    Attachments plugin.
+
+    Must run after the junitxml plugin has created its LogXML (we set xmlpath in
+    setup_test_logging, which runs earlier in pytest_configure), so call from
+    pytest_sessionstart.
+    """
+    if not getattr(config.option, 'xmlpath', None):
+        return
+    try:
+        from _pytest.junitxml import LogXML
+    except ImportError as e:
+        log.debug(f'Could not import LogXML to configure JUnit logging: {e}')
+        return
+    for plugin in config.pluginmanager.get_plugins():
+        if isinstance(plugin, LogXML):
+            plugin.logging = 'all'           # capture stdout/stderr + log records into the XML
+            plugin.log_passing_tests = True  # ...for every test, including passing ones
+            log.debug('JUnit: tests will embed their log in <system-out>')
+            return
+    log.warning('JUnit: xmlpath is set but no LogXML plugin instance was found -- '
+                'test logs will NOT be embedded in the XML.')
+
+
 def configure_logging(config, debug_requested):
     """Configure root logger level, live logging, and suppress noisy loggers.
 
@@ -118,8 +218,8 @@ def configure_logging(config, debug_requested):
     if capture == 'no':  # -s passed: stream logs to console
         live_logging = True
         config.option.log_cli_level = log_level_name
-        config.option.log_cli_format = '-%(levelname).1s- %(message)s'
-        config.option.log_cli_date_format = ''
+        config.option.log_cli_format = _LOG_FORMAT
+        config.option.log_cli_date_format = _LOG_DATEFMT
     if debug_requested:
         logging.getLogger('paramiko').setLevel(logging.WARNING)
 
@@ -135,64 +235,6 @@ def _log_key(item):
     return (str(item.fspath), device_id)
 
 
-def start_test_log(item):
-    """Open a per-module+device FileHandler. Reuses the existing handler when the key
-    (file + device param) hasn't changed, so all tests for the same module+device
-    share a single .log file.
-
-    Returns the FileHandler (to pass to stop_test_log), or None if logging is
-    not applicable (e.g. -s mode or no log directory configured).
-    """
-    global _current_log_key, _current_file_handler
-
-    logdir = getattr(item.config, '_test_logdir', None)
-    capture = item.config.getoption('capture', default='fd')
-
-    if not logdir or capture == 'no':
-        return None
-
-    key = _log_key(item)
-    if key == _current_log_key and _current_file_handler is not None:
-        return None  # reuse existing handler
-
-    # Key changed — close previous handler if any
-    if _current_file_handler is not None:
-        logging.getLogger().removeHandler(_current_file_handler)
-        _current_file_handler.close()
-        _current_file_handler = None
-        _current_log_key = None
-
-    log_name = test_log_name(item)
-    log_path = os.path.join(logdir, log_name)
-    try:
-        file_handler = logging.FileHandler(log_path, mode='w')
-        file_handler.setFormatter(logging.Formatter('-%(levelname).1s- %(message)s'))
-        file_handler.setLevel(logging.DEBUG)
-        logging.getLogger().addHandler(file_handler)
-        _current_log_key = key
-        _current_file_handler = file_handler
-        return file_handler
-    except Exception as e:
-        log.warning(f"Could not create test log file {log_path}: {e}")
-        return None
-
-
-def stop_test_log(handler, nextitem):
-    """Close the per-module+device FileHandler only when the next test has a different
-    key (different file or device) or when the session is ending (nextitem is None)."""
-    global _current_log_key, _current_file_handler
-
-    if _current_file_handler is None:
-        return
-
-    next_key = _log_key(nextitem)
-    if next_key == _current_log_key:
-        return  # next test shares the same log file
-
-    logging.getLogger().removeHandler(_current_file_handler)
-    _current_file_handler.close()
-    _current_file_handler = None
-    _current_log_key = None
 
 
 def print_terminal_summary(terminalreporter):
@@ -238,22 +280,87 @@ def ensure_newline():
         sys.stdout.flush()
 
 
-def test_log_name(item):
-    """Derive log filename from file basename + device param (from brackets in item.name).
+def _compose_log_name(file_path, device_id):
+    """Build the log filename from a module file path + optional device param id.
+
+    Mirrors the legacy run-unit-tests.py naming: directory components (relative to
+    unit-tests/) are joined with '-' and prepended to the file's short name.
 
     Examples:
-      'live/frames/pytest-t2ff-pipeline.py::test_x[D455-104623060005]' -> 'pytest-t2ff-pipeline_D455-104623060005.log'
-      'live/frames/pytest-t2ff-pipeline.py::test_x'                   -> 'pytest-t2ff-pipeline.log'
+      ('live/frames/pytest-t2ff-pipeline.py', 'D455-104623060005') -> 'pytest-live-frames-t2ff-pipeline_D455-104623060005.log'
+      ('live/frames/pytest-t2ff-pipeline.py', None)                -> 'pytest-live-frames-t2ff-pipeline.log'
+      ('pytest-standalone.py', None)                                -> 'pytest-standalone.log'
     """
-    file_path = item.fspath
-    basename = os.path.splitext(os.path.basename(str(file_path)))[0]
-
-    match = re.search(r'\[(.+)\]', item.name)
-    if match:
-        device_id = match.group(1)
-        log_name = f"{basename}_{device_id}"
+    # Resolve relative path within the unit-tests tree
+    normalized = file_path.replace(os.sep, '/')
+    marker = 'unit-tests/'
+    idx = normalized.rfind(marker)
+    if idx >= 0:
+        rel_path = normalized[idx + len(marker):]
+    elif os.path.isabs(file_path) or normalized.startswith('/'):
+        # Absolute path outside the unit-tests tree — use basename only to avoid
+        # embedding host filesystem paths in the log filename.
+        rel_path = os.path.basename(normalized)
     else:
-        log_name = basename
+        # Relative path with no unit-tests/ marker — only hit by infra test
+        # mocks that pass paths like "live/frames/pytest-depth.py" directly.
+        rel_path = normalized
 
+    dirname = os.path.dirname(rel_path)
+    basename = os.path.splitext(os.path.basename(rel_path))[0]
+
+    if dirname:
+        # conftest sets python_files=pytest-*.py, so basename always starts with 'pytest-'.
+        # Strip the prefix, then rebuild as 'pytest-{dirs}-{short_name}'.
+        dir_parts = dirname.replace('/', '-')
+        basename = f"pytest-{dir_parts}-{basename[len('pytest-'):]}"
+
+    log_name = f"{basename}_{device_id}" if device_id else basename
     log_name = re.sub(r'[<>:"/\\|?*]', '_', log_name)
     return log_name + ".log"
+
+
+def test_log_name(item):
+    """Derive log filename from a test item (directory path + file basename + device param)."""
+    match = re.search(r'\[(.+)\]', item.name)
+    device_id = match.group(1) if match else None
+    return _compose_log_name(str(item.fspath), device_id)
+
+
+def open_log(file_path, device_id, config):
+    """Open a per-(module, device) FileHandler on the root logger and return it (or None when
+    logging is off -- ``-s`` capture mode or no log dir configured).
+
+    The caller is the module-scoped log fixture, which closes this via ``close_log`` at module
+    teardown. Because the handler is owned by the module+device fixture lifecycle (not the per-test
+    protocol hook), the *whole* module+camera run -- device enable at setup, every test, device
+    disable at teardown -- lands in one file. This is what keeps a parametrized module fixture's
+    deferred teardown (pytest runs the previous param's teardown during the next param's protocol)
+    from leaking the disable into the next camera's log file.
+    """
+    logdir = getattr(config, '_test_logdir', None)
+    capture = config.getoption('capture', default='fd')
+    if not logdir or capture == 'no':
+        return None
+    log_path = os.path.join(logdir, _compose_log_name(file_path, device_id))
+    try:
+        # First open truncates any stale file from a previous run; subsequent opens append so
+        # pytest-retry attempts and --repeat/--count passes accumulate in one file.
+        mode = 'a' if log_path in _opened_logs else 'w'
+        handler = logging.FileHandler(log_path, mode=mode)
+        handler.setFormatter(_NestedFormatter(_LOG_FORMAT, datefmt=_LOG_DATEFMT))
+        handler.setLevel(logging.DEBUG)
+        logging.getLogger().addHandler(handler)
+        _opened_logs.add(log_path)
+        return handler
+    except Exception as e:
+        log.warning(f"Could not create test log file {log_path}: {e}")
+        return None
+
+
+def close_log(handler):
+    """Detach and close a handler returned by open_log (no-op if None)."""
+    if handler is None:
+        return
+    logging.getLogger().removeHandler(handler)
+    handler.close()

@@ -62,6 +62,7 @@ const char * get_string( rs2_stream value )
     CASE( SAFETY )
     CASE( OCCUPANCY )
     CASE( LABELED_POINT_CLOUD )
+    CASE( OBJECT_DETECTION )
     default:
         assert( ! is_valid( value ) );
         return UNKNOWN_VALUE;
@@ -87,6 +88,7 @@ char const * get_abbr_string( rs2_stream value)
     case RS2_STREAM_SAFETY: return "S";
     case RS2_STREAM_OCCUPANCY: return "O";
     case RS2_STREAM_LABELED_POINT_CLOUD: return "LPC";
+    case RS2_STREAM_OBJECT_DETECTION: return "OD";
     default:
         assert( !is_valid( value ) );
         return "?";
@@ -320,6 +322,7 @@ const char* get_string(rs2_embedded_filter_type embedded_filter_type)
     {
         CASE(DECIMATION)
         CASE(TEMPORAL)
+        case RS2_EMBEDDED_FILTER_TYPE_CLOSE_RANGE: return "Improved Close Range Depth";
     default:
         assert(!is_valid(embedded_filter_type));
         return UNKNOWN_VALUE;
@@ -413,6 +416,12 @@ const char * get_string( rs2_extension value )
     CASE( SUPPORTED_EMBEDDED_FILTERS )
     CASE( DECIMATION_EMBEDDED_FILTER )
     CASE( TEMPORAL_EMBEDDED_FILTER )
+    CASE( CLOSE_RANGE_EMBEDDED_FILTER )
+    CASE( PERCEPTION_FRAME )
+    CASE( OBJECT_DETECTION_FRAME )
+    CASE( PERCEPTION_SENSOR )
+    CASE( PERCEPTION_PROFILE )
+    CASE( GPU_FRAME )
     default:
         assert( ! is_valid( value ) );
         return UNKNOWN_VALUE;
@@ -567,6 +576,12 @@ std::string const & get_string_( rs2_option value )
         CASE( SAFETY_MCU_TEMPERATURE )
         CASE( LEFT_IR_TEMPERATURE )
         CASE( EMBEDDED_FILTER_ENABLED )
+        CASE( DISPARITY_SHIFT )
+        CASE( THRESHOLD )
+        CASE( DOWNSCALE_RATIO )
+        CASE( READOUT_SHAPING )
+        CASE( DETECTION_DISTANCE )
+        CASE( SENSORS_CONFIG_MODE )
 #undef CASE
         return arr;
     }();
@@ -669,6 +684,7 @@ const char * get_string( rs2_format value )
     CASE( Y411 )
     CASE( Y16I )
     CASE( M420 )
+    CASE( NV12 )
     default:
         assert( ! is_valid( value ) );
         return UNKNOWN_VALUE;

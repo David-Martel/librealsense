@@ -37,8 +37,8 @@ namespace librealsense
         std::wstring instance_id_from_device_path( LPCWSTR path );
         bool parse_usb_path_multiple_interface(uint16_t & vid, uint16_t & pid, uint16_t & mi, std::string & unique_id, const std::string & path, std::string & device_guid);
         bool parse_usb_path_single_interface(uint16_t & vid, uint16_t & pid, std::string & serial, const std::string & path);
-        bool get_usb_descriptors(uint16_t device_vid, uint16_t device_pid, const std::string& device_uid, std::string& location, usb_spec& spec, std::string& serial);
-        bool get_usb_device_descriptors( DEVINST devinst, uint16_t device_vid, uint16_t device_pid, const std::string& device_uid, std::string& location, usb_spec& spec, std::string& serial, std::string& composite_uid );
+        bool get_usb_descriptors(uint16_t device_vid, uint16_t device_pid, const std::string& device_uid, std::string& location, usb_spec& spec, std::string& serial, std::vector<uint8_t>* out_config_descriptor = nullptr);
+        bool get_usb_device_descriptors( DEVINST devinst, uint16_t device_vid, uint16_t device_pid, const std::string& device_uid, std::string& location, usb_spec& spec, std::string& serial, std::string& composite_uid, std::vector<uint8_t>* out_config_descriptor = nullptr );
 
         /*
             Configuration Management (CM) tree node.

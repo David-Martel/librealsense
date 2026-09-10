@@ -39,6 +39,15 @@ void init_internal(py::module &m) {
         .def_readwrite("fps", &rs2_pose_stream::fps)
         .def_readwrite("fmt", &rs2_pose_stream::fmt);
 
+    py::class_<rs2_perception_stream> perception_stream(m, "perception_stream", "All the parameters"
+        " required to define a perception stream.");
+    perception_stream.def(py::init<>())
+        .def_readwrite("type",  &rs2_perception_stream::type)
+        .def_readwrite("index", &rs2_perception_stream::index)
+        .def_readwrite("uid",   &rs2_perception_stream::uid)
+        .def_readwrite("fps",   &rs2_perception_stream::fps)
+        .def_readwrite("fmt",   &rs2_perception_stream::fmt);
+
     py::class_< rs2_software_video_frame >( m,
                                             "software_video_frame",
                                             "All the parameters required to define a video frame" )
@@ -188,6 +197,8 @@ void init_internal(py::module &m) {
             "motion_stream"_a, "is_default"_a = false)
         .def("add_pose_stream", &rs2::software_sensor::add_pose_stream, "Add pose stream to software sensor",
             "pose_stream"_a, "is_default"_a = false)
+        .def("add_perception_stream", &rs2::software_sensor::add_perception_stream, "Add perception stream to software sensor",
+            "perception_stream"_a, "is_default"_a = false)
         .def("on_video_frame", &rs2::software_sensor::on_video_frame, "Inject video frame into the sensor", "frame"_a)
         .def("on_motion_frame", &rs2::software_sensor::on_motion_frame, "Inject motion frame into the sensor", "frame"_a)
         .def("on_pose_frame", &rs2::software_sensor::on_pose_frame, "Inject pose frame into the sensor", "frame"_a)

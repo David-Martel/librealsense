@@ -18,6 +18,9 @@
 #include <unordered_map>
 #include <fstream>
 #include <future>
+#include <thread>
+#include <condition_variable>
+#include <functional>
 
 #include "objects-in-frame.h"
 #include "processing-block-model.h"
@@ -28,7 +31,9 @@
 #include "updates-model.h"
 #include "calibration-model.h"
 #include <rsutils/time/periodic-timer.h>
+#include <rsutils/time/stopwatch.h>
 #include <rsutils/number/stabilized-value.h>
+#include <rsutils/concurrency/concurrency.h>
 #include "option-model.h"
 
 namespace rs2
@@ -159,6 +164,7 @@ namespace rs2
         std::shared_ptr< atomic_objects_in_frame > detected_objects;
 
         std::map< rs2_option, option_model > options_metadata;
+        std::string options_filter;  // live search text filtering the Controls option list by name
         std::vector<std::string> resolutions;
         std::map<int, std::vector<std::string>> fpses_per_stream;
         std::vector<std::string> shared_fpses;
@@ -182,6 +188,11 @@ namespace rs2
         std::mutex _queue_lock;
         bool _options_invalidated = false;
         int next_option = 0;
+        // Reset by option_model::set_option_async on every user-initiated option write.
+        // While this stopwatch is fresh, subdevice_model::update() skips its per-frame
+        // sync get_option_value() polling so the UI thread doesn't serialize on the
+        // per-device USB bus behind an in-flight worker write or options_watcher poll.
+        rsutils::time::stopwatch last_user_set_stopwatch;
         std::vector<rs2_option> supported_options;
         bool streaming = false;
         std::map<rs2_stream, bool> streaming_map; // used for depth and ir mixed resolutions
@@ -209,6 +220,7 @@ namespace rs2
         std::shared_ptr<rs2::colorizer> depth_colorizer;
         std::shared_ptr<rs2::yuy_decoder> yuy2rgb;
         std::shared_ptr<rs2::m420_decoder> m420_to_rgb;
+        std::shared_ptr<rs2::nv12_decoder> nv12_to_rgb;
         std::shared_ptr<rs2::y411_decoder> y411;
 
         std::vector<std::shared_ptr<processing_block_model>> post_processing;
@@ -222,7 +234,24 @@ namespace rs2
         device_model* dev_model;
         std::string _opt_base_label;
 
+        // Single per-subdevice worker that serializes every FW option write on this
+        // sensor. Replaces the per-option threads from earlier in this PR:
+        //   - Cross-option ordering is now FIFO (no races on the per-device USB bus).
+        //   - The dispatcher action runs try_sleep(200ms) after each set_option, which
+        //     enforces the protective FW-write floor uniformly (slider drag, checkbox,
+        //     calibration — all paths).
+        //   - on_chip_calib routes through this same dispatcher via invoke_and_wait so
+        //     calibration writes can't interleave with concurrent UI writes.
+        // shared_ptr so option_model copies (the map[id] = create_option_model(...)
+        // insertion) hold the same instance. Declared after options_metadata so it is
+        // destroyed first; ~dispatcher stops/joins the worker before option_models go
+        // away, keeping in-flight actions UAF-safe.
+        std::shared_ptr< dispatcher > _set_dispatcher;
+
+        std::shared_ptr< dispatcher > set_dispatcher() const { return _set_dispatcher; }
+
     private:
+        std::vector<int> get_common_fps() const;
         bool draw_resolutions(std::string& error_message, std::string& label, std::function<void()> streaming_tooltip, float col0, float col1);
         bool draw_fps(std::string& error_message, std::string& label, std::function<void()> streaming_tooltip, float col0, float col1);
         bool draw_streams_and_formats(std::string& error_message, std::string& label, std::function<void()> streaming_tooltip, float col0, float col1);
@@ -232,14 +261,41 @@ namespace rs2
         bool draw_formats_combo_box_multiple_resolutions(std::string& error_message, std::string& label, std::function<void()> streaming_tooltip, float col0, float col1,
             rs2_stream stream_type);
         bool is_multiple_resolutions_supported() const;
+        void refresh_multiple_resolutions_state();
+        void apply_decimation_resolution_defaults();
         int get_res_id_in_resolutions_array(const std::vector<const char*>& res_chars, const std::pair<int, int>& res) const;
         std::pair<int, int> get_resolution_from_res_chars_id(const std::vector<const char*>& res_chars, int id_in_res_chars) const;
         std::pair<int, int> get_max_resolution(rs2_stream stream) const;
         void sort_resolutions(std::vector<std::pair<int, int>>& resolutions) const;
         bool is_ir_calibration_profile() const;
+        // True when this subdevice exposes the dual-RGB configuration (two color streams alongside
+        // the stereo IR streams). On the D401 GMSL the two imagers each stream mono IR (Y8) OR Bayer
+        // color (BA81) - not both - so color and infrared are mutually exclusive on the imager nodes;
+        // depth is a separate node and coexists with either group.
+        bool is_dual_color_subdevice() const;
+        // The D401 GMSL streams in exactly ONE mode at a time, selected by the color format:
+        //   RAW / dual-RGB : a color stream in RS2_FORMAT_RGB8 (BA81 -> rggb). Both imagers are
+        //                    Bayer, so mono IR is unavailable and the raw-only 2nd color pin (Color 1)
+        //                    is available.
+        //   ISP / stereo   : color in YUYV/BGR8/RGBA8/BGRA8 (FW-processed). Coexists with IR1/IR2;
+        //                    the raw-only Color 1 is unavailable.
+        // Depth is a separate node and coexists with either mode.
+        rs2_stream stream_type_of(int unique_id) const;   // profile stream type for a unique id (ANY if not found)
+        int        stream_index_of(int unique_id) const;  // profile stream index for a unique id (0 if not found)
+        bool color_uid_is_raw(int unique_id) const;   // this color uid's selected format is RGB8
+        // Raw dual-RGB mode is active iff the second color stream (Color 1, index >= 1) is enabled. A lone
+        // Color 0 (any format, including RGB8) is ISP color and coexists with infrared.
+        bool dual_rgb_active() const;
+        // Reconcile the single-mode invariant after `changed_unique_id` toggled or changed format:
+        // uncheck streams that can't coexist with it and couple the two color pins to the same format.
+        void enforce_dual_color_ir_exclusion(int changed_unique_id);
+        // True when `unique_id`'s checkbox should be greyed out given the current mode (IR while raw
+        // dual-RGB is active; the raw-only Color 1 while IR is active).
+        bool is_stream_mode_locked(int unique_id) const;
         void set_extrinsics_from_depth_if_needed();
         bool is_post_processing_enabled_in_config_file() const;
         void avoid_streaming_on_embedded_filters_not_matching_configuration() const;
+        bool hide_resolutions(const stream_profile& profile) const;
         // used in method get_max_resolution per stream
         std::map<rs2_stream, std::vector<std::pair<int, int>>> resolutions_per_stream;
 
@@ -249,5 +305,34 @@ namespace rs2
         std::atomic_bool _destructing;
         std::mutex _stop_mutex;
         std::future<void> _stop_future;
+
+        // Process-wide singleton background worker that drains the JSON config-save
+        // block off the UI thread. Coalescing: keyed by an opaque void* (subdevice
+        // identity) — if a save for the same subdevice is already pending, the newer
+        // lambda replaces it, so a slider drag posting many _options_invalidated events
+        // still produces at most one save pass per wake-up cycle. Nested + private so
+        // it stays an implementation detail of subdevice_model.
+        class config_save_worker
+        {
+        public:
+            static config_save_worker & instance();
+
+            config_save_worker( config_save_worker const & ) = delete;
+            config_save_worker & operator=( config_save_worker const & ) = delete;
+
+            void post( void * key, std::function< void() > job );
+            void cancel( void * key );
+
+        private:
+            config_save_worker();
+            ~config_save_worker();
+            void run();
+
+            std::mutex _mtx;
+            std::condition_variable _cv;
+            std::map< void *, std::function< void() > > _pending;
+            bool _stop = false;
+            std::thread _worker;  // declared last so other members are init'd before run() starts
+        };
     };
 }

@@ -398,7 +398,7 @@ namespace librealsense
     std::shared_ptr<pointcloud> pointcloud::create()
     {
         #ifdef RS2_USE_CUDA
-        if (rsutils::rs2_is_gpu_available())
+        if (rsutils::rs2_is_cuda_available())
         {
             LOG_INFO("Using CUDA-optimized pointcloud implementation");
             return std::make_shared<librealsense::pointcloud_cuda>();

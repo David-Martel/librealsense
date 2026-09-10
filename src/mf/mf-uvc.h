@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <mutex>
 #include <atomic>
+#include <set>
 
 #ifndef KSCATEGORY_SENSOR_CAMERA
 DEFINE_GUIDSTRUCT("24E552D7-6523-47F7-A647-D3465BF1F5CA", KSCATEGORY_SENSOR_CAMERA);
@@ -141,6 +142,7 @@ namespace librealsense
             std::string                             _location;
             usb_spec                                _device_usb_spec;
             std::string                             _device_serial;
+            std::set<uint32_t>                      _native_formats; // fourccs the device advertises in its USB config descriptor
             std::vector<stream_profile>             _profiles;
             std::vector<frame_callback>             _frame_callbacks;
             bool                                    _streaming = false;

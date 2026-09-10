@@ -6,6 +6,10 @@
 #include "sensor.h"
 #include "platform/uvc-device.h"
 
+#include <atomic>
+#include <memory>
+#include <vector>
+
 
 namespace librealsense {
 
@@ -30,6 +34,22 @@ public:
 
     virtual void prepare_for_bulk_operation() override;
     virtual void finished_bulk_operation() override;
+
+    // Lets the owning device override the SDK stream type/index derived for a raw backend profile.
+    // Needed when several pins expose identical {w,h,fps,format} and must become distinct SDK streams.
+    // The resolver receives the full backend profile list (so it can classify a pin by its companion formats),
+    // the profile being resolved, and the type/index to adjust in place.
+    using stream_id_resolver = std::function< void( const std::vector< platform::stream_profile > & all_profiles,
+                                                     const platform::stream_profile & profile,
+                                                     rs2_stream & type,
+                                                     int & index ) >;
+    void set_stream_id_resolver( stream_id_resolver resolver ) { _stream_id_resolver = std::move( resolver ); }
+
+    // Opt in to a per-stream software frame number for color, for devices whose color pins share one
+    // hardware frame counter (D401 GMSL dual-RGB). Off by default: it makes get_frame_number() count
+    // 1,2,3... so counter-gap frame-drop detection no longer works and the value no longer matches
+    // RS2_FRAME_METADATA_FRAME_COUNTER, which still reports the raw hardware counter.
+    void enable_software_color_frame_numbers() { _sw_color_frame_numbers = true; }
 
     std::vector< platform::stream_profile > get_configuration() const { return _internal_config; }
     std::shared_ptr< platform::uvc_device > get_uvc_device() { return _device; }
@@ -67,6 +87,7 @@ private:
     void reset_streaming();
     std::atomic<int64_t> _gyro_counter;
     std::atomic<int64_t> _accel_counter;
+    bool _sw_color_frame_numbers = false;  // see enable_software_color_frame_numbers()
 
 
     struct power
@@ -100,6 +121,7 @@ private:
     };
 
     std::shared_ptr< platform::uvc_device > _device;
+    stream_id_resolver _stream_id_resolver;
     std::vector< platform::stream_profile > _internal_config;
     std::atomic< int > _user_count;
     std::mutex _power_lock;
@@ -107,6 +129,10 @@ private:
     std::vector< platform::extension_unit > _xus;
     std::unique_ptr< power > _power;
     std::unique_ptr< frame_timestamp_reader > _timestamp_reader;
+    // Per-stream in-flight zero-copy frame counters (shared with each capture callback). close()
+    // drains these before the backend frees its buffers, so a held zero-copy frame is never left
+    // pointing at unmapped memory. Only used on zero-copy builds; empty/no-op otherwise.
+    std::vector< std::shared_ptr< std::atomic< int > > > _zc_inflight;
 };
 
 

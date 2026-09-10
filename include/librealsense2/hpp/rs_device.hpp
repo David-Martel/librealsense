@@ -141,6 +141,21 @@ namespace rs2
             return result;
         }
 
+        /**
+        * Retrieve the current device hardware clock time.
+        * \note Raw ASIC clock, NOT host time and NOT the frame's global-time domain.
+        * \note Underlying counter is 32-bit microseconds — wraps roughly every 71.6 min.
+        * \note Each call is a blocking hardware-monitor round-trip (few ms); do not poll per frame.
+        * \note Not supported on every device/backend; throws if the device lacks RS2_EXTENSION_GLOBAL_TIMER.
+        */
+        double get_device_time_ms() const
+        {
+            rs2_error* e = nullptr;
+            auto result = rs2_get_device_time_ms(_dev.get(), &e);
+            error::handle(e);
+            return result;
+        }
+
         device& operator=(const std::shared_ptr<rs2_device> dev)
         {
             _dev.reset();
@@ -179,6 +194,16 @@ namespace rs2
             bool connected = rs2_device_is_connected( _dev.get(), &e );
             error::handle( e );
             return connected;
+        }
+
+        // Minimum firmware version supported by this device's SKU (e.g. "5.10.0.17").
+        // Throws if the device does not implement the FW-update protocol or has no defined minimum.
+        std::string get_firmware_min_version() const
+        {
+            rs2_error * e = nullptr;
+            auto res = rs2_get_firmware_min_version( _dev.get(), &e );
+            error::handle( e );
+            return res ? std::string( res ) : std::string();
         }
 
         template<class T>

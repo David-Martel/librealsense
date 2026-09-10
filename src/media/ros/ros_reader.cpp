@@ -460,7 +460,7 @@ namespace librealsense
             frame->get_stream()->set_format(stream_format);
             frame->get_stream()->set_stream_index(int(stream_id.stream_index));
             frame->get_stream()->set_stream_type(stream_id.stream_type);
-            video_frame->data = std::move(msg->data);
+            librealsense::assign_frame_data(video_frame->data, msg->data);  // msg->data is const -> copy
             librealsense::frame_holder fh{ video_frame };
             LOG_DEBUG("Created image frame: " << stream_id << " " << video_frame->get_width() << "x" << video_frame->get_height() << " " << stream_format);
 
@@ -476,7 +476,7 @@ namespace librealsense
             frame->get_stream()->set_format(stream_format);
             frame->get_stream()->set_stream_index(int(stream_id.stream_index));
             frame->get_stream()->set_stream_type(stream_id.stream_type);
-            lab_points->data = std::move(msg->data);
+            librealsense::assign_frame_data(lab_points->data, msg->data);  // msg->data is const -> copy
             librealsense::frame_holder fh{ lab_points };
             LOG_DEBUG("Created image frame: " << stream_id << " " << stream_format);
 
@@ -1268,7 +1268,7 @@ namespace librealsense
         if (m_version == legacy_file_format::file_version())
         {
             //TODO: properly implement, currently assuming TM2 devices and Movidius PID
-            infos->register_info(RS2_CAMERA_INFO_NAME, "Intel RealSense TM2");
+            infos->register_info(RS2_CAMERA_INFO_NAME, "RealSense TM2");
             infos->register_info(RS2_CAMERA_INFO_PRODUCT_ID, "2150");
             infos->register_info(RS2_CAMERA_INFO_SERIAL_NUMBER, "N/A");
         }

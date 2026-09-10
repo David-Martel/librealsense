@@ -2,6 +2,8 @@
 // Copyright(c) 2023 RealSense, Inc. All Rights Reserved.
 #pragma once
 
+#include <rsutils/visibility.h>
+
 // Turn off normal JSON I/O (operator<<) serialization
 // This disables a few things like json::parse, but we do it because of conflict between our operator<< and the built-in
 // one by json. Otherwise (if we do not need custom stream serialization) it's not needed...
@@ -72,10 +74,17 @@ using json = nlohmann::basic_json< std::map,  // all template arguments are defa
 
 
 // We can't put these inside json, unfortunately...
-extern json const null_json;     // default json state
-extern json const missing_json;  // i.e., not there: exists() will be 'false'
-extern json const empty_json_string;
-extern json const empty_json_object;
+//
+// RSUTILS_LOCAL (see rsutils/visibility.h) keeps each module's copy of these private: rsutils is a
+// static library linked into both librealsense2 and every executable that loads it, and with
+// default visibility the duplicate definitions collapse onto one object that is then constructed
+// and destroyed twice -- an exit-time double free. It is safe here because these are immutable
+// sentinels compared by VALUE, never by address: "missing" is detected as _j.is_discarded() in
+// json_ref::exists(), not as &_j == &missing_json.
+extern json const RSUTILS_LOCAL null_json;     // default json state
+extern json const RSUTILS_LOCAL missing_json;  // i.e., not there: exists() will be 'false'
+extern json const RSUTILS_LOCAL empty_json_string;
+extern json const RSUTILS_LOCAL empty_json_object;
 
 
 std::ostream & operator<<( std::ostream &, const json & );

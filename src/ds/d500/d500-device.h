@@ -4,6 +4,8 @@
 #pragma once
 
 #include "d500-private.h"
+
+#include <atomic>
 #include "hw_monitor_extended_buffers.h"
 
 #include "core/debug.h"
@@ -17,6 +19,8 @@
 #include <src/depth-sensor.h>
 
 #include <rsutils/lazy.h>
+
+#include <src/embedded-filter-interface.h>
 
 
 namespace librealsense
@@ -44,10 +48,25 @@ namespace librealsense
         float get_stereo_baseline_mm() const override;
         float get_preset_max_value() const override;
 
+        embedded_filters get_supported_embedded_filters() const override { return _embedded_filters; }
+        void add_embedded_filter( std::shared_ptr< embedded_filter_interface > filter ) { _embedded_filters.push_back( filter ); }
+
+        // Throws if a color stream in 'requests' cannot start now. Dual-color: color shares this sensor
+        // and close-range works on depth only, so color is blocked while close-range is enabled.
+        void color_stream_allowed_or_throw( const stream_profiles & requests ) const;
+
+        // Streams contributed by feature mixins (e.g. dual-color) that this sensor physically carries. They are
+        // assigned to matching profiles (by stream type + index) during init_stream_profiles.
+        void add_stream( std::shared_ptr< stream_interface > stream ) { _extra_streams.push_back( stream ); }
+
     protected:
-        const d500_device * _owner;
+        d500_device * _owner;
         mutable std::atomic< float > _depth_units;
         float _stereo_baseline_mm;
+
+    private:
+        embedded_filters _embedded_filters;
+        std::vector< std::shared_ptr< stream_interface > > _extra_streams;
     };
 
     class ds_thermal_monitor;
@@ -81,6 +100,7 @@ namespace librealsense
         }
 
         d500_device( std::shared_ptr< const d500_info > const & );
+        ~d500_device() override;
 
         std::shared_ptr<ds::d500_hwmon_response> _hw_monitor_response;
 
@@ -104,6 +124,7 @@ namespace librealsense
         void update_flash(const std::vector<uint8_t>& image, rs2_update_progress_callback_sptr callback, int update_mode) override;
         bool check_fw_compatibility( const std::vector<uint8_t>& image ) const override { return true; };
         std::string get_opcode_string(int opcode) const override;
+
     protected:
         std::shared_ptr<ds_device_common> _ds_device_common;
 
@@ -121,7 +142,10 @@ namespace librealsense
 
         command get_firmware_logs_command() const;
 
-        void init(std::shared_ptr<context> ctx, const platform::backend_device_group& group);
+        void register_converters( synthetic_sensor & depth_sensor );
+
+        void init( std::shared_ptr< context > ctx, const platform::backend_device_group & group );
+        void register_connection_info( platform::usb_spec usb_spec );
         void register_features();
         void set_imu_type( const std::vector< uint8_t > & gvd_buf, ds::d500_gvd_parsed_fields * parsed_fields );
         friend class d500_depth_sensor;
@@ -133,13 +157,18 @@ namespace librealsense
         std::shared_ptr<stream_interface> _depth_stream;
         std::shared_ptr<stream_interface> _left_ir_stream;
         std::shared_ptr<stream_interface> _right_ir_stream;
-        std::shared_ptr<stream_interface> _color_stream;
 
         uint8_t _depth_device_idx;
 
         rsutils::lazy< std::vector< uint8_t > > _coefficients_table_raw;
         rsutils::lazy< std::vector< uint8_t > > _new_calib_table_raw;
 
+        // MUST be declared before _polling_error_handler — destruction order matters:
+        // members destruct in reverse declaration order, so _polling_error_handler's
+        // worker thread joins (and dereferences this weak_ptr) while _device_alive is
+        // still alive.
+        std::shared_ptr<std::atomic<bool>> _device_alive
+            = std::make_shared<std::atomic<bool>>(true);
         std::shared_ptr<polling_error_handler> _polling_error_handler;
         std::shared_ptr<ds_thermal_monitor> _thermal_monitor;
         std::shared_ptr< rsutils::lazy< rs2_extrinsics > > _left_right_extrinsics;
@@ -147,5 +176,6 @@ namespace librealsense
         std::shared_ptr< rsutils::lazy< rs2_extrinsics > > _color_extrinsic;
         bool _is_locked = true;
         bool _is_symmetrization_enabled = true;
+        bool _is_mipi_device = false;
     };
 }

@@ -18,6 +18,10 @@ accelerated processing paths from an isolated prefix.
   any control-path `-110` timeout, with no recovery (→ reboot). **Not fixable in librealsense** — file with NVIDIA.
 - **Empirical safe envelope is SINGLE high-rate stream only.** Dual 848×480@60 killed a controller (2026-06-03);
   3-stream is lethal. The earlier "1–2 streams rock-solid" note does NOT hold for dual@60 + start/stop cycling.
+  **Superseded in part, 2026-09-10:** on kernel 6.17.0-1029-nvidia this is no longer reproducible on
+  spark-3066 — dual@60 and 3-stream both ran clean with zero kernel USB faults. The envelope is being
+  KEPT regardless, pending a soak and a spark-0060 (behind-a-hub) run. See the 2026-09-10 entry below
+  and [`docs/gb10/benchmarks.md`](docs/gb10/benchmarks.md) §12 before citing this line as current.
 - **Mitigations**: opt-in `RS2_GB10_USB_TUNING` patches P2 (deeper URB pool), P3 (usbfs advisory), P4 (gentler
   stop) reduce the *trigger* only; statically validated, not HIL-validated. **P1 eager-uvcvideo-detach and the
   udev-unbind approach were DROPPED — contraindicated** (the unbind can itself wedge the GB10 controller).
@@ -26,6 +30,54 @@ accelerated processing paths from an isolated prefix.
 - **Corrections to the claims below**: device firmware is **5.13.0.55** (not `5.17.0.10`, which is not a public
   release); actual CUDA Toolkit is **13.0** (not 13.2). Runtime "enumeration instability" was the primary defect,
   now root-caused to USB-2.0 dock topology + the GB10 xHCI fragility.
+
+## 2026-09-10 Update — re-measured platform; several notes above are now stale
+
+> Full detail: **[`docs/gb10/UPGRADE-PLAN-2026-09-10.md`](docs/gb10/UPGRADE-PLAN-2026-09-10.md)**.
+
+- **CUDA is 13.2, not 13.0.** `/usr/local/cuda` -> `/usr/local/cuda-13.2`, `nvcc` reports
+  `release 13.2, V13.2.86`. The June line above calling `/usr/local/cuda-13.2` "nonexistent" is
+  **inverted** — that path exists and is the live toolkit.
+- **`CUDA_HOME=/usr/local/cuda` is now WRONG for the GB10 build, and this is a live breakage.**
+  The prebuilt CUDA OpenCV at `/opt/gb10-cuda/install/opencv` was compiled against **CUDA 13.0**, so
+  with `/usr/local/cuda` -> 13.2 the configure step dies:
+  `OpenCV static library was compiled with CUDA 13.0 support. Please, use the same version or rebuild
+  OpenCV with CUDA 13.2` (`wrappers/opencv/CMakeLists.txt:5`). Until the CUDA OpenCV is rebuilt,
+  **the GB10 build must pin `CUDA_HOME=/usr/local/cuda-13.0`**. Note `nvcc` is also absent from a
+  non-interactive SSH `PATH`, so `CUDACXX` must be set explicitly or CMake reports
+  "No CMAKE_CUDA_COMPILER could be found".
+- **Kernel `6.17.0-1029-nvidia`** (was `-1021`), **driver 595.84** (was 580.159.03).
+  `6.17.0-1032.32` is available and not yet installed.
+- **BIOS `5.36_0ACUM018` (2025-08-06) on BOTH Sparks.** No June document recorded a BIOS version, so
+  **platform firmware cannot be shown to have changed** in either direction.
+- **USB topology improved.** Both D435s now negotiate **5000 Mbps**; spark-3066's sits on a **native
+  xHCI root port** (`6-1`), which is the precondition PR #12 was blocked on. Cameras were physically
+  swapped — all serials differ from those recorded above.
+- **The single-stream envelope is UNCHANGED — but the R6 ramp HAS now been re-run (2026-09-10) and
+  the controller SURVIVED.** The reasoning above was right: zero controller deaths over 7+ days was
+  not evidence of a fix, because both hosts had only ever run inside the safe envelope. So the ramp
+  was run to separate "fixed" from "never provoked".
+
+  **Result: 12/12 PASS on two full stress sweeps (12 s and 60 s per entry), zero kernel USB faults**,
+  including `HEAVY_60fps_848x480_D+C+IR` — the configuration the source annotates as having crashed
+  the GB10 xHCI on 2026-06-02 — at 59.53/60 fps on all three streams with zero gaps. Dual
+  848×480@60 + per-frame align also ran 5/5 clean. No reboot was needed; no service was disrupted.
+  The platform had moved: kernel **6.17.0-1029-nvidia** (June baseline 6.17.0-1021), BIOS
+  **5.36_0ACUM018**.
+
+  **Decision: KEEP the envelope anyway, for now.** Three reasons, and none of them is caution for
+  its own sake: (1) this is **spark-3066 only**, whose D435 is on a native xHCI root port, while
+  **spark-0060's is behind a hub** — a materially different USB topology, unvalidated; (2) ~12
+  minutes of streaming is a probe, not a soak, and the June defect was *intermittent*, so absence
+  over minutes is far weaker evidence than the original presence; (3) kernel, BIOS and camera
+  firmware all moved together, so nothing here isolates a cause that could be relied on.
+  What the result *does* justify is scheduling the soak and the spark-0060 run, instead of treating
+  multistream as permanently forbidden. Evidence:
+  [`docs/gb10/benchmarks.md`](docs/gb10/benchmarks.md) §12.
+- **Upstream v2.58.4 is merged** on `claude/upstream-2.58.4-gb10-20260910` (`d976b8a08`, zero
+  conflicts). It brings `BUILD_WITH_CUDA_ZEROCOPY`, which self-gates to integrated GPUs and **does
+  open on GB10** (`CU_DEVICE_ATTRIBUTE_INTEGRATED = 1`, verified). See the plan doc before enabling —
+  its backend-borrow half is **V4L2-only** and does not apply under `FORCE_RSUSB_BACKEND=ON`.
 
 ## Local Findings
 
@@ -309,16 +361,36 @@ Default feature set:
 - Reboot once to apply the installed kernel command-line power settings, then
   repeat the visible and no-render profiler runs.
 - Keep CUDA architecture `121`; the GB10 configure/build path accepted it.
-- Keep `LRS_GB10_CXX_STANDARD=20` for GB10 experiments unless a downstream
-  wrapper shows an ABI or source-compatibility issue. If production stability is
-  prioritized over toolchain modernization, rebuild with
-  `LRS_GB10_CXX_STANDARD=14` and keep only `rs-gb10-profiler` on C++20.
+- **Keep `LRS_GB10_CXX_STANDARD=20`.** This item previously read "unless a downstream wrapper
+  shows an ABI or source-compatibility issue", and on 2026-09-10 was briefly marked RESOLVED with
+  the default changed to `14`. **That resolution was wrong and has been reverted.** Against upstream
+  2.58.4 every tool did abort at exit (`rs-enumerate-devices --version` -> rc=134, `free(): double
+  free detected in tcache 2`), but C++20 was not the cause: `rsutils` is a STATIC library linked
+  PUBLIC into the shared `realsense2`, so each of the five globals it owns is defined twice, and
+  with default visibility both modules construct and destroy the executable's copy. The `-std` only
+  decides whether the linker drags `json.cpp.o` out of the archive (c++14 pulls 18 rsutils symbols
+  and no sentinels; c++20 pulls 105 including all four). The bug is standard-independent and
+  reproduces on plain x86_64 with a stock configure. Fixed in code by giving all five globals hidden
+  visibility (`fdb79b7c5`, `16382ef5c`); C++20 is restored and verified on both architectures.
+  Upstream `4bbc18032` (`--exclude-libs`) made it easier to reach but is not the cause and must not
+  be reverted. Full evidence:
+  [`docs/gb10/UPGRADE-PLAN-2026-09-10.md`](docs/gb10/UPGRADE-PLAN-2026-09-10.md) §11.
 - Keep `LRS_GB10_WITH_IPO=OFF` for now. LTO should only be enabled after a clean
   A/B benchmark because pybind/CUDA builds are more sensitive to link-time
   optimization and no measured win has been shown yet.
-- Investigate the remaining RealDDS duplicate static/shared symbol issue before
-  relying on normal `rs-dds-adapter` shutdown in production. The `--help` and
-  `--version` paths are fixed and covered by validation.
+- ~~Investigate the remaining RealDDS duplicate static/shared symbol issue before
+  relying on normal `rs-dds-adapter` shutdown in production.~~ **RESOLVED 2026-09-10.**
+  It was the same defect as the json double free (§11): a bundled static archive whose
+  globals are duplicated between `librealsense2.so` and each executable, then collapsed
+  onto one copy by symbol preemption. Two changes close it. Upstream `4bbc18032` added
+  `hide_bundled_archive_symbols(...)` (`CMakeLists.txt:108`), which covers `realdds` and
+  six other archives, so the `.so` no longer exports their globals; `16382ef5c` covers
+  `rsutils`, which that list omits. Measured on the fixed build: across all eight bundled
+  archives (543 global data objects, 80 of them realdds'), **zero** are exported by the
+  `.so` *and* present in an executable's dynamic symbol table — the preemption that caused
+  the double construction is structurally gone. Normal shutdown now verified, not just
+  `--help`/`--version`: `rs-dds-adapter` started, allowed to reach "Start listening to RS
+  devices", and SIGINTed — **rc=0, 3/3 runs**, logging "Shutting down rs-dds-adapter".
 - Build or install CUDA-enabled OpenCV under `/opt/vigil/opt/opencv-cuda` before
   moving VIGIL preview processing onto `cv2.cuda`; the current system `cv2`
   install did not expose usable CUDA devices.

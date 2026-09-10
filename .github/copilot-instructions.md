@@ -2,17 +2,30 @@
 
 ## Skills
 
-Detailed how-to guides for common tasks are maintained as skill files under `.github/skills/`. **Always consult the relevant skill before performing the corresponding task.** Currently available skills:
+Detailed how-to guides for common tasks are maintained as skill files under `.github/skills/`. **Before performing any of the tasks below, you MUST open and read the corresponding skill file.** Do not rely on prior knowledge or assumptions — the skill file is the source of truth.
 
-| Skill file | When to use |
+| Skill file | Read before |
 |---|---|
+| `.github/skills/add_api.md` | Adding API to librealsense SDK |
+| `.github/skills/file_creation.md` | Adding files to librealsense SDK |
+| `.github/skills/cpp_coding.md` | Adding or modifying CPP code |
 | `.github/skills/build.md` | Building the project (CMake configure, compile, flags) |
 | `.github/skills/testing.md` | Running, filtering, and debugging unit tests |
 | `.github/skills/pytest-infra.md` | Migrating tests to pytest, modifying pytest/hub infrastructure, verifying Jenkins CI results |
-| `.github/skills/git-workflow.md` | Branch/PR conventions, commit message style, push remotes |
-| `.github/skills/pr-review.md` | Opening a pull request, updating its description, replying to review comments |
+| `.github/skills/pr-create.md` | Opening a pull request, pushing commits to it, updating its description |
+| `.github/skills/pr-review.md` | Replying to review comments on a pull request |
 
 If a skill file exists for the task at hand, follow its instructions precisely. New skills may be added to this folder over time — check its contents before assuming none applies.
+
+## Git Workflow (quick reference)
+
+These rules apply to all git operations.
+
+- **Base branch**: `development`
+- **Branch naming**: short descriptive name, **no username prefix** (e.g. `fix-platform-camera`, not `nir/fix-platform-camera`)
+- **PR target**: `development` branch
+- **Push to**: `fork` remote (if no `fork` remote, ask the user)
+- **Commits**: short one-sentence message, no Co-Authored-By, plain `git commit -m "message"`
 
 ## Project Overview
 
@@ -64,6 +77,16 @@ If a skill file exists for the task at hand, follow its instructions precisely. 
 - Use the existing code style in surrounding files; the project does not enforce a formatter
 - Logging uses EasyLogging++ (controlled by `BUILD_EASYLOGGINGPP` option)
 
+## Code Change Discipline
+
+These rules apply to every code change.
+
+- **Keep changes minimal.** Every added line must earn its place. Prefer single-line expressions over multi-line blocks, reuse existing helpers and code paths instead of adding new ones, and use the shortest form that doesn't lose clarity.
+- **Comments are sparse.** Keep comments to 1–3 lines unless the code is large and genuinely complex. Don't restate what the code already says. Never reference Jenkins build numbers or Jira tickets in comments.
+- **Check before you add.** Before introducing a check, loop, or helper, verify the same logic doesn't already exist elsewhere in the call chain. If a function has a single caller, consider inlining it there. Never add a second copy of logic that can be merged with an existing one — consolidate first, don't layer.
+- **Clean up after removal.** When deleting a function, block, or feature, search the same patch for everything that only existed to serve it — defines, variables, struct fields, forward declarations, comments — and remove them too. Leave no dead code behind.
+- **Avoid environment variables.** Don't introduce new environment variables to gate or configure behavior; prefer existing options, parameters, and config mechanisms.
+
 ## Build System
 
 See `.github/skills/build.md` for full build instructions. The project uses **CMake**. Key build options are defined in `CMake/lrs_options.cmake`. Platform-specific configuration lives in:
@@ -76,7 +99,7 @@ See `.github/skills/build.md` for full build instructions. The project uses **CM
 | Platform | Notes |
 |---|---|
 | **Windows 10/11** | MSVC (Visual Studio 2019/2022) |
-| **Ubuntu 20.04 / 22.04 / 24.04** | GCC, primary Linux target |
+| **Ubuntu 20.04 / 22.04 / 24.04 / 26.04** | GCC, primary Linux target |
 | **macOS** | Clang, macOS 15+ tested in CI |
 | **NVIDIA Jetson** | ARM64, L4T |
 | **Raspberry Pi** | ARM (Raspbian) |

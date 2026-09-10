@@ -111,12 +111,15 @@ case ${JETSON_L4T_VERSION} in
 		JETSON_L4T_REVISION_LONG=2.0
 		# 38.2 --> JP 7.0
 		;&
-	38.4)
+	38.4 | 39.2)
 		# 38.4 --> JP 7.1
+		# 39.2 --> JP 7.2
 		PATCHES_REV=7.0
 		KERNEL_RELEASE=6.8
 		UBUNTU_CODENAME=noble
 		KBASE=./Tegra/kernel/kernel-${UBUNTU_CODENAME}-src
+		# R39.2's kernel tag keeps the trailing .0 (jetson_39.2.0), unlike the 38.x line
+		[[ $JETSON_L4T_VERSION = 39.2 ]] && JETSON_L4T_REVISION=2.0
 	;;
 	*)
 	echo -e "\e[41mUnsupported JetPack revision ${JETSON_L4T_VERSION} aborting script\e[0m"

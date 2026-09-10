@@ -13,7 +13,9 @@ validation_dir := env_var_or_default("LRS_VALIDATION_DIR", env_var("HOME") + "/r
 venv_python    := validation_dir + "/.venv/bin/python"
 hil_build_dir  := validation_dir + "/build-gb10-full"
 opencv_cmake   := env_var_or_default("LRS_GB10_OPENCV_DIR", "/opt/gb10-cuda/install/opencv") + "/lib/cmake/opencv4"
+opencv_python  := env_var_or_default("LRS_GB10_OPENCV_PYTHONPATH", "/opt/gb10-cuda/install/opencv/lib/python3.12/site-packages")
 cuda_libs      := "/opt/gb10-cuda/install/opencv/lib:/opt/gb10-cuda/install/ffmpeg/lib"
+cuda_root      := env_var_or_default("CUDA_HOME", "/usr/local/cuda")
 
 # Default: show the recipe list
 default:
@@ -36,7 +38,8 @@ build-hil:
     cmake -S "{{repo_root}}" -B "{{hil_build_dir}}" -G Ninja \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=20 -DCMAKE_CXX_STANDARD_REQUIRED=ON \
       -DCMAKE_C_FLAGS_RELEASE="-O3 -DNDEBUG -mcpu=native" -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG -mcpu=native" \
-      -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda -DCMAKE_CUDA_ARCHITECTURES=121 \
+      -DCUDA_TOOLKIT_ROOT_DIR="{{cuda_root}}" -DCMAKE_CUDA_COMPILER="{{cuda_root}}/bin/nvcc" \
+      -DCMAKE_CUDA_ARCHITECTURES=121 \
       -DFORCE_RSUSB_BACKEND=ON -DBUILD_WITH_CUDA=ON -DBUILD_WITH_NEON=ON -DBUILD_WITH_CPU_EXTENSIONS=ON -DBUILD_WITH_OPENMP=ON \
       -DBUILD_PYTHON_BINDINGS=ON -DPYTHON_EXECUTABLE="{{venv_python}}" -DPython_EXECUTABLE="{{venv_python}}" \
       -DPython_ROOT_DIR="$VIRTUAL_ENV" -DPython_FIND_VIRTUALENV=ONLY \
@@ -187,8 +190,18 @@ hil-pc-zerocopy:
 # change) + framerate + recorded NVENC clip + controller-green. Standardized/idempotent (timestamped
 # artifacts, tripwire). Default single COLOR stream (SAFE); `--depth` colorized depth; `--rgbd` (eyes-open).
 hil-nonheadless *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    opencv_python="{{opencv_python}}"
+    if ! compgen -G "${opencv_python}/cv2*" >/dev/null; then
+      opencv_python=/usr/lib/python3/dist-packages
+    fi
+    if ! compgen -G "${opencv_python}/cv2*" >/dev/null; then
+      echo "ERROR: cv2 is unavailable; set LRS_GB10_OPENCV_PYTHONPATH" >&2
+      exit 1
+    fi
     DISPLAY="${DISPLAY:-:1}" LD_LIBRARY_PATH="{{cuda_libs}}:{{hil_build_dir}}/Release" \
-      PYTHONPATH="{{repo_root}}/scripts/gb10:{{hil_build_dir}}/Release:/opt/gb10-cuda/install/opencv/lib/python3.12/site-packages" \
+      PYTHONPATH="{{repo_root}}/scripts/gb10:{{hil_build_dir}}/Release:${opencv_python}" \
       LRS_FFMPEG=/opt/gb10-cuda/install/ffmpeg/bin/ffmpeg \
       "{{venv_python}}" "{{repo_root}}/scripts/gb10/rs-gb10-nonheadless-verify.py" {{ARGS}}
 

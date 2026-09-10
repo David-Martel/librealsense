@@ -12,9 +12,14 @@
 #   3) neon+omp     : adds -fopenmp ; NEON intrinsics + parallel rows
 #
 # Shipping SDK aarch64 flags (CMake/unix_config.cmake): -O3 -ftree-vectorize
-# -mstrict-align -ffp-contract=fast (no -march). We match -O3 -ftree-vectorize
-# -mstrict-align and pin -ffp-contract=off across ALL flavors so scalar/NEON FMA
-# fusion cannot diverge and the bit-identity assertions are meaningful.
+# -mstrict-align -ffp-contract=off (no -march). Upstream 08b6d0031 pinned contraction
+# OFF for bit-identity; this harness matches that by default across ALL flavors so
+# scalar/NEON FMA fusion cannot diverge and the bit-identity assertions are meaningful.
+#
+# Set FP_CONTRACT=fast to measure what that bit-identity costs in throughput on a
+# machine where every NEON lane has a fused multiply-add. Expect the cross-flavor
+# identity assertions to FAIL in that mode -- that failure is the reason the default
+# is off, not a harness bug.
 #
 # Single-thread flavors are pinned to one Cortex-X925 (perf core) to avoid
 # cross-core migration polluting p95. OpenMP flavor reports thread count + binding.
@@ -33,7 +38,8 @@ ITERS="${ITERS:-300}"
 WARMUP="${WARMUP:-30}"
 
 # Common flags: match shipping aarch64 profile + strict warnings.
-COMMON="-std=c++14 -Wall -Wextra -Werror -mstrict-align -ffp-contract=off"
+FP_CONTRACT="${FP_CONTRACT:-off}"
+COMMON="-std=c++14 -Wall -Wextra -Werror -mstrict-align -ffp-contract=${FP_CONTRACT}"
 
 # Pick a Cortex-X925 (perf, 3900MHz) core for single-thread pinning.
 # On GB10 the big cores are odd indices 5-9,15-19; use 19.

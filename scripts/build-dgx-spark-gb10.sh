@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="${LRS_GB10_BUILD_DIR:-/opt/vigil/build/librealsense-v2.58.1-dgx-spark-gb10}"
-PREFIX="${LRS_GB10_PREFIX:-/opt/vigil/opt/librealsense-v2.58.1-dgx-spark-gb10}"
+BUILD_DIR="${LRS_GB10_BUILD_DIR:-/opt/vigil/build/librealsense-v2.58.3-dgx-spark-gb10}"
+PREFIX="${LRS_GB10_PREFIX:-/opt/vigil/opt/librealsense-v2.58.3-dgx-spark-gb10}"
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 CUDA_ARCH="${LRS_GB10_CUDA_ARCH:-121}"
 JOBS="${LRS_GB10_JOBS:-$(nproc)}"
@@ -26,29 +26,53 @@ fi
 GENERATOR="${LRS_GB10_GENERATOR:-Ninja}"
 # Toolchain arch: default -mcpu=native (best perf on THIS host, but binaries are host-CPU-specific and
 # GCC 13.3 silently degrades 'native' to an armv8-a baseline on Cortex-X925). Set LRS_GB10_REPRODUCIBLE=1
-# for an explicit, portable, reproducible GB10 arch (-mcpu=cortex-x925) instead of 'native'.
+# for an explicit GB10 ISA and a GCC-13-supported tuning target. GCC 13.3 rejects both
+# -mcpu=cortex-x925 and -mcpu=cortex-a725; both Spark core classes expose Armv9.2-A, SVE2, BF16, and I8MM.
 if [[ "${LRS_GB10_REPRODUCIBLE:-0}" == "1" ]]; then
-  ARCH_FLAG="${LRS_GB10_ARCH:--mcpu=cortex-x925}"
+  ARCH_FLAG="${LRS_GB10_ARCH:--march=armv9.2-a+sve2+bf16+i8mm -mtune=neoverse-v2}"
 else
   ARCH_FLAG="${LRS_GB10_ARCH:--mcpu=native}"
 fi
+read -r -a ARCH_ARGS <<< "$ARCH_FLAG"
+CXX_COMPILER="${CXX:-c++}"
+if ! printf 'int main() { return 0; }\n' | "$CXX_COMPILER" "${ARCH_ARGS[@]}" -x c++ -c -o /dev/null -; then
+  echo "ERROR: C++ compiler '$CXX_COMPILER' rejects LRS_GB10_ARCH='$ARCH_FLAG'" >&2
+  exit 1
+fi
 NATIVE_FLAGS="${LRS_GB10_NATIVE_FLAGS:--O3 -DNDEBUG $ARCH_FLAG -ffunction-sections -fdata-sections}"
 LINK_FLAGS="${LRS_GB10_LINK_FLAGS:--Wl,--gc-sections}"
+# C++20 restored 2026-09-10 after the underlying defect was FIXED in code rather than worked
+# around. Building the unpinned targets at C++20 used to produce an exit-time double free in
+# every tool, because rsutils (a STATIC lib linked PUBLIC into the shared realsense2) defines
+# four global json sentinels; with default visibility both librealsense2.so and the executable
+# constructed and destroyed the SAME preempted object. Those sentinels are now hidden-visibility
+# (third-party/rsutils/include/rsutils/json-fwd.h), so each module owns a private copy.
+# Verified at C++20 after the fix: 9/9 tools exit 0 with clean stderr, json-compat +
+# json-validator + log-level-race + usb-tuning unit tests pass, pyrealsense2 imports.
 CXX_STANDARD="${LRS_GB10_CXX_STANDARD:-20}"
 WITH_DDS="${LRS_GB10_WITH_DDS:-ON}"
 WITH_OPENMP="${LRS_GB10_WITH_OPENMP:-ON}"
 WITH_IPO="${LRS_GB10_WITH_IPO:-OFF}"
 WITH_EXTERNAL_LZ4="${LRS_GB10_EXTERNAL_LZ4:-OFF}"
 FORCE_RSUSB="${LRS_GB10_FORCE_RSUSB:-ON}"
+# Upstream 2.58.4 zero-copy: cudaHostAlloc(...Mapped) frame buffers, gated at RUNTIME to
+# integrated GPUs (cudaDevAttrIntegrated). GB10 reports 1, measured, so the gate passes.
+# Default ON for GB10 because it was measured to win on spark-3066 (D435, CUDA 13.0):
+#   rs.pointcloud  p50 0.234 -> 0.135 ms   -42%
+#   rs.align       p50 0.321 -> 0.301 ms   -6.2%   (inputs mapped; see RS2_ALIGN_ZC)
+#   rs.colorize    unchanged (no CUDA path) -- the control
+# Byte-identical output, profiler self-test 32/0, all 10 tools clean. Set OFF for the
+# upstream-default leg. NOT the same as LRS_GB10_PC_ZEROCOPY below (the fork's retired ladder).
+CUDA_ZEROCOPY="${LRS_GB10_CUDA_ZEROCOPY:-ON}"
+# -ffp-contract= value. "off" is upstream's default and keeps filter output bit-identical across
+# hosts; "fast" lets aarch64 fuse multiply-add in every vector lane. A3 measures the difference.
+FP_CONTRACT="${LRS_GB10_FP_CONTRACT:-off}"
 # Enable GB10-specific USB mitigations (P2 URB pool depth + P4 watchdog rate-limit + stop settle).
 # Set LRS_GB10_USB_TUNING=0 to produce a vanilla build without the GB10 defaults baked in.
 GB10_USB_TUNING="${LRS_GB10_USB_TUNING:-1}"
-# CUDA cached-buffer ladders, PROMOTED TO DEFAULT (measured: pointcloud 3.3x faster, conversion
-# ~NEON-parity; both byte-identical to baseline, max-abs-diff 0). Default ON here: the ladder is
-# compiled in AND the runtime default is mode 1 (cached) -- see rs2_pc_mode()/rs2_conv_mode().
-# These defines are #if-guarded, so an UPSTREAM cmake build without them is byte-identical; only this
-# GB10 build profile bakes the cached path in. Set =0 to opt back out to the per-frame-malloc baseline.
-GB10_PC_ZEROCOPY="${LRS_GB10_PC_ZEROCOPY:-1}"
+# v2.58.3 owns persistent pointcloud buffers per helper instance.  Keep the retired process-static
+# GB10 ladder explicitly disabled so stale build environments cannot reintroduce it.
+GB10_PC_ZEROCOPY="${LRS_GB10_PC_ZEROCOPY:-0}"
 GB10_CONV_CACHE="${LRS_GB10_CONV_CACHE:-1}"
 # Opt-in to building the unit-test target alongside the SDK (off by default in GB10 builds to
 # avoid requiring Catch2 unless the user explicitly wants tests).
@@ -80,6 +104,10 @@ Useful environment:
   LRS_GB10_BUILD_DIR       Build directory
   LRS_GB10_PREFIX          Install prefix
   LRS_GB10_CUDA_ARCH       CUDA arch, default 121; use 120 if NVCC rejects 121
+  LRS_GB10_LAUNCHER        Host compile cache: auto (default) | sccache | ccache | none
+  LRS_GB10_CUDA_LAUNCHER   nvcc compile cache: none (default) | auto | sccache | ccache.
+                           Defaults to none: sccache mangles nvcc's generated stub TU
+                           (__cudaLaunch macro arity) and breaks every .cu file.
   LRS_GB10_WITH_DDS        Enable RealDDS/FastDDS support, default ON
   LRS_GB10_WITH_OPENMP     Enable OpenMP, default ON
   LRS_GB10_WITH_IPO        Enable release IPO/LTO, default OFF
@@ -87,14 +115,19 @@ Useful environment:
   LRS_GB10_FORCE_RSUSB     Force libusb/RSUSB backend, default ON.
                            Set OFF to validate the native Linux V4L2 backend.
   LRS_GB10_CXX_STANDARD    C++ standard for unpinned targets, default 20
+  LRS_GB10_CUDA_ZEROCOPY   Upstream mapped-host-memory frame buffers
+                           (BUILD_WITH_CUDA_ZEROCOPY), default ON -- measured
+                           pointcloud -42%, align -6.2% on GB10. Runtime-gated to
+                           integrated GPUs. Distinct from LRS_GB10_PC_ZEROCOPY.
+                           Runtime knob RS2_ALIGN_ZC selects which align buffers map.
+  LRS_GB10_FP_CONTRACT     -ffp-contract= value: off (default, bit-identical) | on | fast
   PYTHON_EXECUTABLE        Python ABI for pyrealsense2
   LRS_GB10_PYTHON_INSTALL_DIR
                            Python install dir, default under the GB10 prefix
   LRS_GB10_USB_TUNING      Bake in GB10 USB mitigations (RS2_GB10_USB_TUNING=1),
                            default 1 (ON). Set to 0 for a vanilla build.
-  LRS_GB10_PC_ZEROCOPY     Pointcloud cached-buffer ladder, default 1 (ON +
-                           runtime mode 1 = cached, 3.3x faster). Set 0 to opt out
-                           (or RS2_PC_MODE=0 at runtime for the malloc baseline).
+  LRS_GB10_PC_ZEROCOPY     Retired process-static pointcloud ladder; must remain 0.
+                           v2.58.3 reuses per-instance CUDA buffers by default.
   LRS_GB10_CONV_CACHE      YUYV->color cached-buffer ladder, default 1 (ON +
                            runtime mode 1 = cached, ~NEON-parity). Set 0 to opt out
                            (or RS2_CONV_MODE=0 at runtime for the malloc baseline).
@@ -163,20 +196,52 @@ configure() {
   fi
   generator_args=(-G "$GENERATOR")
 
+  # Host (C/C++) compile launcher. LRS_GB10_LAUNCHER: auto (default) | sccache | ccache | none.
   local launcher=""
-  if have sccache; then
-    launcher="sccache"
-  elif have ccache; then
-    launcher="ccache"
-  fi
+  case "${LRS_GB10_LAUNCHER:-auto}" in
+    none) launcher="" ;;
+    sccache|ccache) launcher="${LRS_GB10_LAUNCHER}"
+      if ! have "$launcher"; then
+        echo "ERROR: LRS_GB10_LAUNCHER=$launcher requested but not on PATH" >&2
+        exit 1
+      fi ;;
+    auto)
+      if have sccache; then
+        launcher="sccache"
+      elif have ccache; then
+        launcher="ccache"
+      fi ;;
+    *) echo "ERROR: LRS_GB10_LAUNCHER must be auto, sccache, ccache, or none" >&2
+       exit 1 ;;
+  esac
+
+  # CUDA launcher is SEPARATE and defaults to none. sccache mangles nvcc's generated
+  # stub translation unit -- measured 2026-09-10 on spark-3066, CUDA 13.0 + sccache:
+  #   /tmp/sccache_nvcc*/x_0.cudafe1.stub.c: error: macro "__cudaLaunch" requires 2
+  #   arguments, but only 1 given
+  # which fails every .cu in the tree. Host caching is unaffected and stays on, so the
+  # cost of this default is only that .cu files recompile. Override with
+  # LRS_GB10_CUDA_LAUNCHER=sccache|ccache|<name> once the toolchain pairing is fixed.
+  local cuda_launcher=""
+  case "${LRS_GB10_CUDA_LAUNCHER:-none}" in
+    none) cuda_launcher="" ;;
+    auto) cuda_launcher="$launcher" ;;
+    *) cuda_launcher="${LRS_GB10_CUDA_LAUNCHER}"
+      if ! have "$cuda_launcher"; then
+        echo "ERROR: LRS_GB10_CUDA_LAUNCHER=$cuda_launcher requested but not on PATH" >&2
+        exit 1
+      fi ;;
+  esac
 
   local launcher_args=()
   if [[ -n "$launcher" ]]; then
     launcher_args=(
       -DCMAKE_C_COMPILER_LAUNCHER="$launcher"
       -DCMAKE_CXX_COMPILER_LAUNCHER="$launcher"
-      -DCMAKE_CUDA_COMPILER_LAUNCHER="$launcher"
     )
+  fi
+  if [[ -n "$cuda_launcher" ]]; then
+    launcher_args+=(-DCMAKE_CUDA_COMPILER_LAUNCHER="$cuda_launcher")
   fi
 
   local enable_legacy_ccache="ON"
@@ -248,6 +313,8 @@ configure() {
     -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
     -DFORCE_RSUSB_BACKEND="$FORCE_RSUSB" \
     -DBUILD_WITH_CUDA=ON \
+    -DBUILD_WITH_CUDA_ZEROCOPY="$CUDA_ZEROCOPY" \
+    -DRS2_FP_CONTRACT="$FP_CONTRACT" \
     -DBUILD_WITH_NEON=ON \
     -DBUILD_WITH_CPU_EXTENSIONS=ON \
     -DBUILD_WITH_OPENMP="$WITH_OPENMP" \

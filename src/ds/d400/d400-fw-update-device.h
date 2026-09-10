@@ -17,9 +17,8 @@ namespace librealsense
         virtual ~ds_d400_update_device() = default;
 
         virtual bool check_fw_compatibility(const std::vector<uint8_t>& image) const override;
+        std::string get_firmware_min_version() const override;
 
         float compute_progress(float progress, float start, float end, float threshold) const override;
-    private:
-        std::string parse_serial_number(const std::vector<uint8_t>& buffer) const;
     };
 }

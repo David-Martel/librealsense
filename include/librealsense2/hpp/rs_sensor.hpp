@@ -787,5 +787,20 @@ namespace rs2
         operator bool() const { return _sensor.get() != nullptr; }
     };
 
+    class perception_sensor : public sensor
+    {
+    public:
+        perception_sensor(sensor s) : sensor(s.get())
+        {
+            rs2_error* e = nullptr;
+            if (rs2_is_sensor_extendable_to(_sensor.get(), RS2_EXTENSION_PERCEPTION_SENSOR, &e) == 0 && !e)
+            {
+                _sensor.reset();
+            }
+            error::handle(e);
+        }
+        operator bool() const { return _sensor.get() != nullptr; }
+    };
+
 }
 #endif // LIBREALSENSE_RS2_SENSOR_HPP

@@ -28,6 +28,7 @@ void init_device(py::module &m) {
         .def("first_motion_sensor", [](rs2::device& self) { return self.first<rs2::motion_sensor>(); }) // No docstring in C++
         .def("first_fisheye_sensor", [](rs2::device& self) { return self.first<rs2::fisheye_sensor>(); }) // No docstring in C++
         .def("first_safety_sensor", [](rs2::device& self) { return self.first<rs2::safety_sensor>(); }) // No docstring in C++
+        .def("first_perception_sensor", [](rs2::device& self) { return self.first<rs2::perception_sensor>(); }) // No docstring in C++
         .def("supports", &rs2::device::supports, "Check if specific camera info is supported.", "info"_a)
         .def("get_info", &rs2::device::get_info, "Retrieve camera specific information, "
              "like versions of various internal components", "info"_a)
@@ -38,6 +39,11 @@ void init_device(py::module &m) {
         .def("__bool__", &rs2::device::operator bool) // Called to implement truth value testing in Python 3
         .def( "is_connected", &rs2::device::is_connected )
         .def("is_in_recovery_mode", &rs2::device::is_in_recovery_mode)
+        .def("get_device_time_ms", &rs2::device::get_device_time_ms,
+             "Retrieve the current device hardware clock time in milliseconds.")
+        .def("get_firmware_min_version", &rs2::device::get_firmware_min_version,
+             "Get the minimum firmware version supported by this device's SKU (e.g. \"5.10.0.17\"). "
+             "Throws if the device does not implement the FW-update protocol or has no defined minimum.")
         .def(BIND_DOWNCAST(device, debug_protocol))
         .def(BIND_DOWNCAST(device, playback))
         .def(BIND_DOWNCAST(device, recorder))
@@ -50,8 +56,8 @@ void init_device(py::module &m) {
         .def("__repr__", [](const rs2::device &self) {
             std::ostringstream ss;
             auto name = self.get_info( RS2_CAMERA_INFO_NAME );
-            if( 0 == strncmp( name, "Intel RealSense ", 16 ) )
-                name += 16;
+            if( 0 == strncmp( name, "RealSense ", 10 ) )
+                name += 10;
             ss << "<" SNAME ".device: " << name;
             if (self.supports(RS2_CAMERA_INFO_SERIAL_NUMBER))
                 ss << " (S/N: " << self.get_info(RS2_CAMERA_INFO_SERIAL_NUMBER);
@@ -92,6 +98,13 @@ void init_device(py::module &m) {
 
             return rs2::metadata_helper::instance().is_enabled(id);
         });
+
+    m.def("enable_metadata", []() {
+        rs2::metadata_helper::instance().enable_metadata();
+    }, "Enable per-frame metadata at OS level for connected D400/D500 devices. "
+       "Windows: writes HKLM UVC registry keys; must be called from an admin process. "
+       "Throws RuntimeError on failure.",
+       py::call_guard<py::gil_scoped_release>());
 
     // not binding update_progress_callback, templated
 

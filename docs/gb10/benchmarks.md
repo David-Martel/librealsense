@@ -35,6 +35,12 @@ Numbers marked **cited** come from dated HIL logs or docs; camera is required to
 | **Advanced single-stream HIL** (depth 848×480@60, 300 frames) | effective fps | **57.17 fps** (1 stream gap; full CUDA+pointcloud+postproc chain) | cited — HIL-RESULTS-2026-06-03.md §2 | Yes |
 | **Long soak — RSUSB clean bus** (phased single→dual→churn→quad) | controller | **GREEN, zero -110, SURVIVED** | cited — HIL-SOAK-AND-ACCEL-2026-06-03.md §1 | Yes |
 | **P7 re-acquire guard false-fire** under strict REFUSE | false-fire rate | **0 / 5 opens** (guard stays silent; never fires on a valid session) | cited — HIL-RESULTS-2026-06-03.md §P7 | Yes |
+| **CUDA zero-copy — rs.pointcloud** 848×480 (2026-09-10) | p50 ms | **0.234 → 0.135 ms (−42%)** with `BUILD_WITH_CUDA_ZEROCOPY=ON` | §9 below | Yes |
+| **CUDA zero-copy — rs.align** depth→color 848×480 (2026-09-10) | p50 ms | **0.321 → 0.301 ms (−6.2%)**, inputs mapped only | §9 below | Yes |
+| **CUDA zero-copy — align OUTPUT mapped** (2026-09-10) | p50 ms | **0.321 → 2.237 ms (+6.9×, REGRESSION)** — atomics on host memory | §9 below | Yes |
+| **`-ffp-contract=off` cost** on GB10 depth filters (2026-09-10) | relative perf | **≤2.5%, mostly <1%** — bit-identity is effectively free; keep `off` | §10 below | No |
+| **D435 codec capability** — firmware 5.17.3.10 (2026-09-10) | formats | **Y8/Y16/Z16/RGB8/RAW16/YUYV/BGRA only** — no MJPEG, no H.264/H.265, no Z16H | §11 below | Yes |
+| **R6 multistream envelope ramp** — spark-3066, kernel 6.17.0-1029 (2026-09-10) | verdict | **12/12 PASS, 0 kernel USB faults**, incl. the config that crashed the xHCI 2026-06-02 | §12 below | Yes |
 
 ---
 
@@ -367,3 +373,200 @@ Multi-stream operations are **eyes-open** — the GB10 xHCI controller can die (
 6. **Multi-stream safety boundary.** Long soak on the clean USB-3 bus SURVIVED (HIL-SOAK-AND-ACCEL). This is NOT an envelope relaxation — four confounds changed at once, runs were ~5 minutes, and V4L2 soak data is still absent. Conservative single-stream guidance remains for anything that must not fail.
 
 7. **ROS2 0x0300 root cause.** The minimal-config fix is proven (4/4 PASS); H1 (manual-exposure-under-AE write) is REFUTED. The actual cause is a combination of node-default parameter overrides that cannot be isolated to a single variable with the current A/B runs. A follow-on 2^N parameter-subset scan is deferred.
+
+
+---
+
+## 9. CUDA zero-copy on GB10 — measured 2026-09-10
+
+**Not comparable to the June rows above without care.** Different SDK (**2.58.4**, not 2.58.1) and
+different camera firmware (**5.17.3.10**, not 5.15.1.55). Every number in this section was measured
+in one session on `spark-3066` with CUDA 13.0, so the ON/OFF comparisons within it are internally
+valid; comparisons against June's absolute figures are not.
+
+### The runtime gate does pass
+
+`BUILD_WITH_CUDA_ZEROCOPY` allocates frame buffers with `cudaHostAlloc(cudaHostAllocMapped)` and is
+gated at runtime on `cudaDevAttrIntegrated`. That GB10 satisfies this was **measured, not assumed**:
+
+```
+device            : NVIDIA GB10 (sm_121)
+INTEGRATED        : 1        <- the gate librealsense uses
+canMapHostMemory  : 1     pageableMemAccess : 1
+concurrentManaged : 1     usesHostPageTables: 1
+```
+
+### Results — D435 848×480, 200–400 frames per leg
+
+| Op | zero-copy OFF | zero-copy ON | Δ |
+|---|---:|---:|---|
+| `rs.pointcloud` (p50) | 0.234 ms | **0.135 ms** | **−42%** |
+| `rs.align` depth→color (p50) | 0.321 ms | **0.301 ms** | **−6.2%** |
+| `rs.colorize` (p50) — control, no CUDA path | 1.952 ms | 1.943 ms | ~0 |
+
+align was measured over 400 frames × 3 alternating runs per leg to cancel scene and thermal drift;
+p95 also improved (0.367 → 0.334 ms).
+
+### The important part: zero-copy is NOT uniformly a win
+
+`cuda-align.cu` was not wired for zero-copy upstream. Wiring it naively made align **6.6× slower**.
+The per-buffer ladder (`RS2_ALIGN_ZC`, added in this session) isolates why:
+
+| Mode | What maps | p50 |
+|---|---|---:|
+| 0 | nothing (upstream staging) | 0.321 ms |
+| **1** | **inputs only — default** | **0.301 ms** |
+| 2 | output only | 2.237 ms (**+6.9×**) |
+| 3 | inputs and output | 2.195 ms (**+6.8×**) |
+
+The discriminator is the **access pattern of the mapped buffer, not zero-copy itself**:
+
+- Reads of the depth/colour planes are streaming and coalesced → serving them from mapped host
+  memory costs almost nothing and saves a full-frame H2D.
+- `kernel_depth_to_other` resolves occlusion with `atomic_min_uint16`. **Atomics against host memory
+  over the coherence fabric are dramatically slower than against device-local memory.** Keeping the
+  output in device memory and paying one D2H is far cheaper.
+- `cuda-pointcloud.cu` writes its output with no atomics — one point per thread — which is why
+  upstream's mapping of *its* output is a 42% win rather than a regression.
+
+**Generalisable rule for GB10: map streaming reads, keep atomic or scattered writes device-local.**
+"Unified memory means copies are free" is wrong here, and by a factor of ~7.
+
+### Correctness
+
+All four modes are **byte-identical**: a 164-frame `.db3` playback aligned under modes 0, 1 and 3
+produces the same SHA-256 over every aligned depth plane. Profiler self-test 32/0 and all 10 tools
+rc=0 ×3 on the zero-copy build.
+
+`LRS_GB10_CUDA_ZEROCOPY` now defaults **ON** in `scripts/build-dgx-spark-gb10.sh` on this evidence.
+
+---
+
+## 10. `-ffp-contract` — measured 2026-09-10, camera-free
+
+Upstream `08b6d0031` hard-coded `-ffp-contract=off` for bit-identical filter output. On aarch64
+every NEON lane has a fused multiply-add, so the question is what that bit-identity costs. Made
+selectable (`RS2_FP_CONTRACT` / `FP_CONTRACT=` in `bench-filters.sh`) and measured, 300 iterations:
+
+| Filter (1280×720, deterministic rows) | `off` | `fast` | Δ |
+|---|---:|---:|---|
+| threshold scalar/autovec | 1.5686 | 1.5405 | −1.8% |
+| threshold neon | 0.2861 | 0.2856 | −0.2% |
+| disparity scalar/autovec | 1.3003 | 1.3063 | +0.5% |
+| disparity neon | 0.2600 | 0.2599 | ~0 |
+| temporal scalar/autovec | 4.2597 | 4.2433 | −0.4% |
+| temporal neon | 0.9050 | 0.8824 | −2.5% |
+| decimation scalar/autovec | 2.0602 | 2.0565 | −0.2% |
+| spatial-hv scalar/autovec | 15.7042 | 15.6897 | −0.1% |
+
+**Verdict: keep `off`.** The cost is ≤2.5% and mostly under 1% — inside run-to-run noise for most
+rows — so there is nothing to buy by giving up bit-identity. Both modes also reported *all variants
+bit-identical to the scalar reference*, so on these filters GCC does not actually contract
+differently across flavours; the guarantee upstream wanted is being had for free.
+
+The OpenMP rows are excluded from the comparison: they swing far more than the effect size
+(e.g. temporal neon+omp 0.393 vs 0.213 ms) because of thread scheduling, not contraction.
+
+**Scope:** this measures **host** filter code only. `-ffp-contract` in `CMAKE_C/CXX_FLAGS` never
+reaches device code — `nvcc` defaults to `--fmad=true`, so the CUDA kernels already fuse regardless.
+
+---
+
+## 11. D435 codec capability — measured 2026-09-10
+
+The question was whether the camera can compress on-device (H.264/H.265/smarter depth coding) to
+relieve the USB link. **It cannot.** Firmware **5.17.3.10** advertises only:
+
+```
+Y8   Y16   Z16   RGB8   RAW16   YUYV   BGRA
+```
+
+No MJPEG, no H.264, no H.265, no Z16H. The D4 ASIC has no video encoder, so **compression cannot
+come from firmware on this camera** — it must be host-side on GB10 (NVENC/NVDEC), which the June
+NVENC rows above already characterise (h264_nvenc cq=23 → 10.9× real-time, 39.14 dB XPSNR-Y).
+
+This also means the USB link carries raw frames, and the binding constraint is the **xHCI
+controller defect, not bandwidth**: 848×480 Z16@60 ≈ 49 MB/s plus 1080p YUYV@30 ≈ 124 MB/s sit well
+inside USB 3.2 Gen 1.
+
+**Caveat for any depth-compression work:** H.264/HEVC are 8-bit-luma codecs and quantise 16-bit Z16
+destructively. Encoding depth needs either a plane-split into two 8-bit channels or a lossless /
+Main12 HEVC profile. That is a real experiment, not a settled result, and is not claimed here.
+
+
+---
+
+## 12. R6 multistream envelope ramp — measured 2026-09-10
+
+The GB10 xHCI controller-death defect produced the fleet's **single-high-rate-stream-only**
+operating envelope. Because that envelope has been enforced continuously since June, "the defect is
+fixed" and "the defect was never provoked again" have been observationally identical. This is the
+test that separates them.
+
+**The premise did change:** spark-3066's kernel has moved **6.17.0-1021-nvidia → 6.17.0-1029-nvidia**
+since the June baseline. Platform provenance recorded in full, because no June document captured a
+BIOS version and every earlier comparison was therefore impossible:
+
+```
+kernel  6.17.0-1029-nvidia      BIOS 5.36_0ACUM018 (2025-08-06)
+product NVIDIA_DGX_Spark        D435 347622075921 firmware 5.17.3.10
+```
+
+### Results — `scripts/gb10/rs-gb10-stress.sh`, two sweeps
+
+| Sweep | Entries | Result | Kernel USB faults |
+|---|---|---|---|
+| 12 s/entry | 12 | **12 PASS / 0 fail** | **0** |
+| 60 s/entry (~12 min streaming) | 12 | **12 PASS / 0 fail** | **0** |
+
+Including, at 60 s/entry:
+
+| Entry | Measured |
+|---|---|
+| **`HEAVY_60fps_848x480_D+C+IR`** — source-annotated *"crashed GB10 xHCI 2026-06-02"* | 59.53/60 fps on all three streams, 0 gaps |
+| `90fps_848x480_D+IR` | 89.72/90 fps |
+| `300fps_848x100_depth` | 293.68/300 fps |
+| `60fps_960x540color_+848D` | 59.41/60 fps |
+
+Fault tally with benign librealsense/UVC noise excluded (`USBDEVFS_CLEAR_HALT`, UVC control
+`981ae2`) — **all zero**: USB disconnect, clear_halt, xhci fail, device reset, cannot enable,
+over-current, bandwidth, descriptor read, babble.
+
+Separately, dual depth+color 848×480@60 with per-frame `rs.align` — the incident-#3 configuration
+class — ran **5 consecutive times**: 300/300 frames each, 0 stream gaps, 59.52–59.54 fps, 0 faults
+per run. The camera enumerated normally afterwards and no service was disrupted (`vigil-router` and
+all three CI runner containers stayed up; no reboot was needed).
+
+### Verdict: do NOT lift the envelope yet
+
+The lethal configuration class is no longer lethal on this kernel. That is a real change and it is
+now measured rather than assumed. It is **not** sufficient to change fleet policy:
+
+1. **This is spark-3066 only.** Its D435 sits on a **native xHCI root port**; **spark-0060's sits
+   behind a hub**, which is a materially different USB topology and is unvalidated.
+2. **~12 minutes is not a soak.** The June defect was intermittent, so absence over minutes is much
+   weaker evidence than the original presence.
+3. Nothing here isolates *which* change fixed it — kernel, BIOS, and camera firmware all moved
+   together since June.
+
+**Recommendation: keep the single-high-rate-stream envelope until a long soak and an equivalent
+spark-0060 run agree.** What this result does justify is *scheduling* that work instead of treating
+multistream as permanently forbidden.
+
+---
+
+## 13. Upstream ABI breaks in 2.58.4 — checked against this fleet, 2026-09-10
+
+Upstream issue [#15617](https://github.com/IntelRealSense/librealsense/issues/15617) reports that
+2.58.4 breaks ABI against 2.58.3 despite being a patch release. Both breaks were checked against
+what this fleet actually uses, rather than assumed harmless:
+
+| Break | Blast radius here |
+|---|---|
+| `rs2_software_sensor_add_inference_stream{,_ex}` removed | **None** — no reference in vigil-spark or vigil-utils |
+| `RS2_EXTENSION_OBJECT_DETECTION_SENSOR` removed **from the middle** of `rs2_extension`, shifting every later value | **Negligible** — it sat at position **69 of 71**, so only `RS2_EXTENSION_PERCEPTION_PROFILE` and `RS2_EXTENSION_COUNT` shift. Both are D555/perception features; the fleet runs D435 and references neither. |
+
+This is a near miss rather than a non-issue: a mid-enum removal silently changes integer values for
+anything compiled against 2.58.3 headers that then loads a 2.58.4 `.so`. **Any A7 re-pin must
+rebuild every consumer against the same headers**, not just repoint the `.so` — in particular
+`pyrealsense2` and any ROS 2 node binary, which are separately compiled artifacts.

@@ -64,7 +64,7 @@ namespace librealsense
                 device_info.mi = info.mi;
                 device_info.unique_id = info.unique_id;
                 device_info.device_path = info.id;
-                device_info.conn_spec = info.conn_spec;
+                device_info.usb_conn_spec = info.conn_spec;
                 //LOG_INFO("Found UVC device: " << std::string(device_info).c_str());
                 rv.push_back(device_info);
             }
@@ -362,6 +362,9 @@ namespace librealsense
                 sp.height = f.height;
                 sp.fps = f.fps;
                 sp.format = f.fourcc;
+                // Preserve the VS interface (pin) so identical {w,h,fps,format} profiles coming from different
+                // streaming interfaces (e.g. the two M420 RGB endpoints) stay distinct and route to the right pin.
+                sp.pin_index = f.interfaceNumber;
                 results.push_back(sp);
             }
 
@@ -386,7 +389,7 @@ namespace librealsense
 
         usb_spec rs_uvc_device::get_usb_specification() const
         {
-            // On Win7, USB type is determined only when the USB device is created, _info.conn_spec holds wrong information
+            // On Win7 the cached uvc_device_info.usb_conn_spec is wrong, so read it live from the USB device's own info
             return _usb_device->get_info().conn_spec; 
         }
 
@@ -473,7 +476,8 @@ namespace librealsense
                 if ((profile.format == f.fourcc) &&
                     (profile.fps == f.fps) &&
                     (profile.height == f.height) &&
-                    (profile.width == f.width)) {
+                    (profile.width == f.width) &&
+                    (profile.pin_index == f.interfaceNumber)) {
                         foundFormat = true;
                         selected_format = f;
                         interface_number = f.interfaceNumber;

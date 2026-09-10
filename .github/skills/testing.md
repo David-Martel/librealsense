@@ -13,9 +13,14 @@
 
 ## Test Framework
 
-- librealsense uses a **custom Python-based test framework**
-- The test orchestrator is `unit-tests/run-unit-tests.py`
-- Tests must be run **from the `unit-tests/` directory**
+Two frameworks, split by test language:
+
+- **C++ tests** (`test-*.cpp`) are orchestrated by the legacy runner `unit-tests/run-unit-tests.py`.
+  Keeping that runner for C++ testing is its only remaining purpose.
+- **Python tests** (`pytest-*.py`) are pytest only. See `.github/skills/pytest-infra.md`.
+  No legacy `test-*.py` scripts remain, and `run-unit-tests.py` never collects `pytest-*.py`.
+
+Either way, run **from the `unit-tests/` directory**.
 
 ## Test Categories
 
@@ -31,7 +36,21 @@
 | `unit-tests/log/` | Logging | Logging infrastructure tests |
 | `unit-tests/types/` | Types | Type system tests |
 
-## Running All Tests
+## Running the pytest Tests
+
+```bash
+cd unit-tests
+python3 -m pytest -v                        # all collectable tests
+python3 -m pytest -v live/frames            # one directory
+python3 -m pytest -v pytest-fw-update.py    # one file
+python3 -m pytest -v -k "hdr and not preset"   # filter by test name
+```
+
+Flags are registered in `conftest.py`: `--live`, `--not-live`, `--device`, `--exclude-device`,
+`--context`, `--tag`, `--repeat`, `--reruns`, `--debug`, `--rslog`, `--test-dir`. Note that `-s`
+disables the per-test log files. See `.github/skills/pytest-infra.md` for fixtures and markers.
+
+## Running the C++ Tests (legacy runner)
 
 Navigate to the `unit-tests/` directory and run:
 
@@ -57,21 +76,23 @@ For full usage and all available flags:
 python3 run-unit-tests.py --help
 ```
 
-## Running Specific Tests
+## Running Specific C++ Tests
+
+The flags below belong to `run-unit-tests.py`, so they select among the C++ tests.
+For pytest use `-k`, `-m` and the flags listed above.
 
 ### By Name (Regex)
 
 Use `-r` / `--regex` to run tests whose names match a regular expression:
 
 ```bash
-python3 run-unit-tests.py -s -r "test-hdr"
-python3 run-unit-tests.py -s -r "test-metadata"
-python3 run-unit-tests.py -s --regex "test-stream.*"
+python3 run-unit-tests.py -s -r "test-log-vs-LOG"
+python3 run-unit-tests.py -s --regex "rsutils-string.*"
 ```
 
 **Test name derivation**: the orchestrator builds a test's name from its path relative to `unit-tests/`, replacing directory separators with `-` and stripping the leading `test-` from the filename. For example:
-- `live/hw-reset/test-stress.py` → `test-live-hw-reset-stress`
-- `func/test-hdr.py` → `test-func-hdr`
+- `rsutils/string/test-hexarray.cpp` becomes `test-rsutils-string-hexarray`
+- `log/test-vs-LOG-shared.cpp` becomes `test-log-vs-LOG-shared`
 
 So when using `-r`, omit the `test-` filename prefix and join subdirectories with `-`.
 
@@ -80,18 +101,18 @@ So when using `-r`, omit the `test-` filename prefix and join subdirectories wit
 Use `--skip-regex` to exclude tests whose names match:
 
 ```bash
-python3 run-unit-tests.py -s --skip-regex "test-fw-update"
+python3 run-unit-tests.py -s --skip-regex "test-rsutils-string-hexarray"
 ```
 
 ### By Tag
 
-Use `-t` / `--tag` to run tests with a specific tag. Tags are assigned automatically based on:
-- File type: `exe` (C++ binaries) or `py` (Python scripts)
+Use `-t` / `--tag` to run tests with a specific tag. Tags come from:
+- File type: `exe` (C++ binaries). The `py` tag matches nothing now that no legacy `test-*.py` remain.
 - Directory location: e.g., tests in `unit-tests/live/` get the `live` tag
+- An explicit `//#test:tag <name>` directive in the source file
 
 ```bash
 python3 run-unit-tests.py -s -t live          # run only live tests
-python3 run-unit-tests.py -s -t py            # run only Python tests
 python3 run-unit-tests.py -s -t exe           # run only compiled C++ tests
 python3 run-unit-tests.py -s -t live -t exe   # run tests that have BOTH tags
 ```
@@ -136,31 +157,34 @@ python3 run-unit-tests.py --rslog          # enable LibRS debug logging in tests
 python3 run-unit-tests.py --debug          # enable framework debug output; also prints "test took X seconds" per test
 ```
 
-## Running Nightly-Only Tests
+## Running Nightly-Only and Weekly Tests
 
-Some tests are marked `# test:donotrun:!nightly` and are **skipped by default**. Pass `--context nightly` to enable them:
+Both runners take `--context`, which accepts a **space-separated list**.
 
-```bash
-python3 run-unit-tests.py --context nightly -r hw-reset-stress ../build/Release
-```
-
-## Running Weekly Tests
-
-Weekly tests use a higher iteration count / longer timeout (controlled by `'weekly' in test.context` inside the test). The `--context` flag accepts a **space-separated list**, so to run a nightly-guarded test with weekly behaviour pass **both** contexts:
+pytest tests gated with `@pytest.mark.context("nightly")` are skipped unless the context is passed:
 
 ```bash
-# 'nightly' satisfies the test:donotrun:!nightly guard
-# 'weekly' activates higher iteration counts and longer timeouts inside the test
-python3 run-unit-tests.py --context "nightly weekly" -r hw-reset-stress ../build/Release
+python3 -m pytest -v live/hw-reset/pytest-stress.py --context nightly
 ```
 
-Passing `--context weekly` alone is **not sufficient** — the `test:donotrun:!nightly` directive will still filter the test out.
+A test that also scales its iteration count or timeout for weekly runs reads the context through the
+`test_context_var` fixture, so pass both words to get nightly collection plus weekly behaviour:
+
+```bash
+python3 -m pytest -v live/hw-reset/pytest-stress.py --context "nightly weekly"
+```
+
+C++ tests use a `//#test:donotrun:<context>` directive in the source file, evaluated by
+`run-unit-tests.py` against the same `--context` list.
 
 ## Repeating and Retrying
 
 ```bash
 python3 run-unit-tests.py --repeat 3       # repeat each test 3 times
 python3 run-unit-tests.py --retry 2        # retry failed tests up to 2 times
+
+python3 -m pytest --repeat 3               # pytest: repeat each file's tests 3 times
+python3 -m pytest --reruns 2               # pytest: retry a failed test up to 2 times
 ```
 
 ## Recording and Playback (Mock Hardware)
@@ -185,7 +209,7 @@ This is useful for:
 The `UNIT_TESTS_ARGS` CMake variable passes arguments to `unit-test-config.py` during configuration:
 
 ```bash
-cmake .. -DBUILD_UNIT_TESTS=ON -DUNIT_TESTS_ARGS="-t live -r test-streaming"
+cmake .. -DBUILD_UNIT_TESTS=ON -DUNIT_TESTS_ARGS="-t live -r rsutils-string.*"
 ```
 
 ## Using a Custom Test Directory
@@ -196,12 +220,16 @@ python3 run-unit-tests.py --test-dir /path/to/custom/tests
 
 ## Custom Firmware for Testing
 
-The SDK no longer ships a bundled firmware blob, so `test-fw-update` **requires** a custom firmware path for the device under test. Without one it logs a warning and skips. Download a signed `.bin` from <https://dev.realsenseai.com/docs/firmware-updates>, then:
+The SDK no longer ships a bundled firmware blob, so `pytest-fw-update` **requires** a custom firmware path for the device under test. Without one it skips. Download a signed `.bin` from <https://dev.realsenseai.com/docs/firmware-updates>, then:
 
 ```bash
-python3 run-unit-tests.py --custom-fw-d400 /path/to/firmware.bin
-python3 run-unit-tests.py --custom-fw-d555 /path/to/firmware.bin
+python3 -m pytest pytest-fw-update.py --custom-fw-d400 /path/to/firmware.bin
+python3 -m pytest pytest-fw-update.py --custom-fw-d555 /path/to/firmware.bin
+python3 -m pytest pytest-fw-update.py --custom-fw-d585 /path/to/firmware.bin
 ```
+
+`--custom-fw-d585` targets the non-safety D585 only (e.g. "D585 Prototype"). The safety SKU is kept
+out of the test by `pytest.mark.device_exclude("D585S")`, so it is never collected and never flashed.
 
 ## Troubleshooting
 
