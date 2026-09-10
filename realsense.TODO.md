@@ -33,8 +33,15 @@ accelerated processing paths from an isolated prefix.
 
 - **CUDA is 13.2, not 13.0.** `/usr/local/cuda` -> `/usr/local/cuda-13.2`, `nvcc` reports
   `release 13.2, V13.2.86`. The June line above calling `/usr/local/cuda-13.2` "nonexistent" is
-  **inverted** — that path exists and is the live toolkit. `CUDA_HOME=/usr/local/cuda` remains correct
-  because the symlink now resolves there.
+  **inverted** — that path exists and is the live toolkit.
+- **`CUDA_HOME=/usr/local/cuda` is now WRONG for the GB10 build, and this is a live breakage.**
+  The prebuilt CUDA OpenCV at `/opt/gb10-cuda/install/opencv` was compiled against **CUDA 13.0**, so
+  with `/usr/local/cuda` -> 13.2 the configure step dies:
+  `OpenCV static library was compiled with CUDA 13.0 support. Please, use the same version or rebuild
+  OpenCV with CUDA 13.2` (`wrappers/opencv/CMakeLists.txt:5`). Until the CUDA OpenCV is rebuilt,
+  **the GB10 build must pin `CUDA_HOME=/usr/local/cuda-13.0`**. Note `nvcc` is also absent from a
+  non-interactive SSH `PATH`, so `CUDACXX` must be set explicitly or CMake reports
+  "No CMAKE_CUDA_COMPILER could be found".
 - **Kernel `6.17.0-1029-nvidia`** (was `-1021`), **driver 595.84** (was 580.159.03).
   `6.17.0-1032.32` is available and not yet installed.
 - **BIOS `5.36_0ACUM018` (2025-08-06) on BOTH Sparks.** No June document recorded a BIOS version, so

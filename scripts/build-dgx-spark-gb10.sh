@@ -84,6 +84,10 @@ Useful environment:
   LRS_GB10_BUILD_DIR       Build directory
   LRS_GB10_PREFIX          Install prefix
   LRS_GB10_CUDA_ARCH       CUDA arch, default 121; use 120 if NVCC rejects 121
+  LRS_GB10_LAUNCHER        Host compile cache: auto (default) | sccache | ccache | none
+  LRS_GB10_CUDA_LAUNCHER   nvcc compile cache: none (default) | auto | sccache | ccache.
+                           Defaults to none: sccache mangles nvcc's generated stub TU
+                           (__cudaLaunch macro arity) and breaks every .cu file.
   LRS_GB10_WITH_DDS        Enable RealDDS/FastDDS support, default ON
   LRS_GB10_WITH_OPENMP     Enable OpenMP, default ON
   LRS_GB10_WITH_IPO        Enable release IPO/LTO, default OFF
@@ -166,20 +170,52 @@ configure() {
   fi
   generator_args=(-G "$GENERATOR")
 
+  # Host (C/C++) compile launcher. LRS_GB10_LAUNCHER: auto (default) | sccache | ccache | none.
   local launcher=""
-  if have sccache; then
-    launcher="sccache"
-  elif have ccache; then
-    launcher="ccache"
-  fi
+  case "${LRS_GB10_LAUNCHER:-auto}" in
+    none) launcher="" ;;
+    sccache|ccache) launcher="${LRS_GB10_LAUNCHER}"
+      if ! have "$launcher"; then
+        echo "ERROR: LRS_GB10_LAUNCHER=$launcher requested but not on PATH" >&2
+        exit 1
+      fi ;;
+    auto)
+      if have sccache; then
+        launcher="sccache"
+      elif have ccache; then
+        launcher="ccache"
+      fi ;;
+    *) echo "ERROR: LRS_GB10_LAUNCHER must be auto, sccache, ccache, or none" >&2
+       exit 1 ;;
+  esac
+
+  # CUDA launcher is SEPARATE and defaults to none. sccache mangles nvcc's generated
+  # stub translation unit -- measured 2026-09-10 on spark-3066, CUDA 13.0 + sccache:
+  #   /tmp/sccache_nvcc*/x_0.cudafe1.stub.c: error: macro "__cudaLaunch" requires 2
+  #   arguments, but only 1 given
+  # which fails every .cu in the tree. Host caching is unaffected and stays on, so the
+  # cost of this default is only that .cu files recompile. Override with
+  # LRS_GB10_CUDA_LAUNCHER=sccache|ccache|<name> once the toolchain pairing is fixed.
+  local cuda_launcher=""
+  case "${LRS_GB10_CUDA_LAUNCHER:-none}" in
+    none) cuda_launcher="" ;;
+    auto) cuda_launcher="$launcher" ;;
+    *) cuda_launcher="${LRS_GB10_CUDA_LAUNCHER}"
+      if ! have "$cuda_launcher"; then
+        echo "ERROR: LRS_GB10_CUDA_LAUNCHER=$cuda_launcher requested but not on PATH" >&2
+        exit 1
+      fi ;;
+  esac
 
   local launcher_args=()
   if [[ -n "$launcher" ]]; then
     launcher_args=(
       -DCMAKE_C_COMPILER_LAUNCHER="$launcher"
       -DCMAKE_CXX_COMPILER_LAUNCHER="$launcher"
-      -DCMAKE_CUDA_COMPILER_LAUNCHER="$launcher"
     )
+  fi
+  if [[ -n "$cuda_launcher" ]]; then
+    launcher_args+=(-DCMAKE_CUDA_COMPILER_LAUNCHER="$cuda_launcher")
   fi
 
   local enable_legacy_ccache="ON"
