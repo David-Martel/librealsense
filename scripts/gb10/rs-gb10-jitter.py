@@ -124,6 +124,35 @@ def _apply_options(profile, args: argparse.Namespace) -> dict | None:
     return applied
 
 
+def _domain(frame) -> str:
+    """Short timestamp-domain name, or the reason it could not be read."""
+    try:
+        return str(frame.get_frame_timestamp_domain()).rsplit(".", 1)[-1].lower()
+    except Exception as exc:  # pragma: no cover - SDK surface, not logic
+        return f"unreadable:{type(exc).__name__}"
+
+
+def describe_negotiated(profile) -> dict:
+    """Report what the device ACTUALLY opened, not what was requested.
+
+    Requested and negotiated are not the same thing, and on this fleet the gap
+    is load-bearing: 18.4 records depth modes the SDK advertises but cannot
+    open. A harness that prints only its arguments cannot tell a substitution
+    from a success.
+    """
+    out = {}
+    for stream in profile.get_streams():
+        try:
+            video = stream.as_video_stream_profile()
+            out[str(stream.stream_type()).rsplit(".", 1)[-1]] = (
+                f"{video.width()}x{video.height()}@{stream.fps()}"
+                f" {str(stream.format()).rsplit('.', 1)[-1]}"
+            )
+        except Exception:  # pragma: no cover - non-video streams
+            continue
+    return out
+
+
 def assert_device_present(serial: str | None) -> None:
     """Fail fast and loudly when no camera is attached.
 
@@ -167,6 +196,7 @@ def run(args: argparse.Namespace) -> dict:
 
     profile = pipeline.start(config)
     try:
+        negotiated = describe_negotiated(profile)
         applied_queue_size = _apply_options(profile, args)
 
         # Discard the first frames: pipeline start includes sensor power-up,
@@ -177,6 +207,7 @@ def run(args: argparse.Namespace) -> dict:
         while time.perf_counter() < deadline:
             pipeline.wait_for_frames(int(args.timeout_ms))
 
+        domains: dict[str, set[str]] = {"depth": set(), "color": set()}
         inter_arrival: list[float] = []
         frame_age: list[float] = []
         skew: list[float] = []
@@ -221,12 +252,21 @@ def run(args: argparse.Namespace) -> dict:
             if not depth:
                 continue
             stamp = depth.get_timestamp()  # ms; wall clock under global time
+            # Record the DOMAIN, not just the value. A skew computed from two
+            # `system_time` stamps is the difference between two host dequeue
+            # instants and says nothing about the imagers; only `global_time`
+            # (or `hardware_clock`) stamps make a sub-millisecond skew a claim
+            # about the sensors. Reporting one without the other is how a 24 us
+            # number gets quoted as a hardware-sync property it may not be.
+            domains["depth"].add(_domain(depth))
             if stamp > 0:
                 frame_age.append(receipt_realtime_ms - stamp)
             else:
                 missing_metadata += 1
             if not args.depth_only:
                 color = frameset.get_color_frame()
+                if color:
+                    domains["color"].add(_domain(color))
                 if color and color.get_timestamp() > 0:
                     # Depth and colour are separate imagers. If this skew is
                     # large or unstable, anything fusing them (align, coloured
@@ -235,6 +275,8 @@ def run(args: argparse.Namespace) -> dict:
 
         return {
             "frames": frames,
+            "timestamp_domains": {k: sorted(v) for k, v in domains.items()},
+            "negotiated": negotiated,
             "missing_timestamp_frames": missing_metadata,
             "stalls": stalls,
             "applied_queue_size": applied_queue_size,
@@ -310,6 +352,8 @@ def main() -> int:
             f"frame={stall['frame_index']}"
         )
     print(f"frames={result['frames']} queue_size={result['applied_queue_size']}")
+    print(f"negotiated={result['negotiated']}")
+    print(f"timestamp_domains={result['timestamp_domains']}")
     return 0
 
 
