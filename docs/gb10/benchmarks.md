@@ -1685,3 +1685,153 @@ protect the acquisition thread from preemption. Raising `RLIMIT_RTPRIO` for the
 service user is the precondition for any `SCHED_FIFO` work on the capture path.
 `xhci-hcd:usb3` carries 3.9M interrupts and is the camera's controller, so it is
 the candidate for IRQ affinity pinning if that is ever pursued.
+
+## 26. The skew was never the sync mode — it was the frame interval (60 Hz halves everything)
+
+Acting on "make it sync and sync fast". Three prior claims in this document are
+corrected here, two of them mine.
+
+### 26.1 §18's 0.024 ms skew does not reproduce, and §25.2 is void
+
+§18 and §18.5 recorded depth/colour skew as `p50 = p99 = 0.024 ms` on both
+hosts, and §25.2 built on it: "the SDK's own syncer … 280x better than mode 1's
+6.8 ms, so the hardware mode is not the ceiling."
+
+Re-measured with the same instrument on the same host and camera, 60 s, and
+this time **recording the timestamp domain**, which §18 never did:
+
+| config | skew p50 | skew p99 | skew max | domains |
+|---|---:|---:|---:|---|
+| 1280×720@30 | 6.653 | 16.469 | 16.670 | depth+colour `global_time` |
+| 640×480@30 | 7.230 | 16.527 | 16.683 | depth+colour `global_time` |
+
+**0.024 ms does not reproduce at either resolution.** ~6.7 ms p50 with a max of
+16.67 ms is the *textbook free-running signature*: two imagers that are not
+locked to each other get paired by the syncer to the nearest frame, so the
+residual is uniform on `[0, one frame interval]` — p50 ≈ half a period, max ≈
+exactly one period (16.667 ms at 30 Hz). The D435's RGB is **not**
+hardware-synchronised to depth; that is a D435i/D455 property. 24 µs was the
+anomalous number all along, not 6.8 ms.
+
+`rs-gb10-jitter.py` now reports `timestamp_domains` and `negotiated` on every
+run, because the two failure modes that could produce a bogus 24 µs — stamps
+that are really host-arrival times, and a profile that silently opened as
+something other than what was requested — are both invisible in the numbers
+alone. Recording only the value and not the domain is what let this stand.
+
+### 26.2 `inter_cam_sync_mode=1` did nothing, which retracts §24.3
+
+§24.3 credited hardware sync with 164 → **6.777 ms**, "a 24x improvement".
+Free-running at the node's own resolution measures **7.230 ms**. Those are the
+same number. Mode 1 moved nothing; the entire 24× was `global_time_enabled`
+fixing the stamps, and attributing any of it to the sync mode was a confound I
+introduced by changing both at once (§25 notes this and still under-corrected).
+
+This is consistent with what the mode is for: on D400 it synchronises *depth
+between cameras*, not RGB to depth within one camera.
+
+### 26.3 §18.4's "only 1280×720 negotiates" is wrong for depth+colour pairs
+
+Probed directly, D+C, `z16` + `bgr8`:
+
+| mode | opens |
+|---|:-:|
+| 640×480 @30 / @60 | **yes** |
+| 848×480 @30 / @60 | **yes** |
+| 1280×720@30 | yes |
+| 640×480@90, 848×480@90, 1280×800@30 | no |
+
+The 90 Hz failures are not the probe-commit stall §18.4 described — the
+**colour** imager has no 90 Hz mode, so a *pair* cannot resolve. §18.4 tested
+depth alone and depth+IR and generalised to a configuration it did not run.
+The consequence recorded there ("30 Hz is a hard floor", "this campaign's M1 is
+void") does not hold.
+
+### 26.4 The frame interval is the lever, and it is worth ~2x on every metric
+
+If skew is bounded by one frame interval, halving the interval halves the skew.
+It does, and it takes latency with it — spark-3066, 60 s per leg:
+
+| 640×480 | skew p50 | skew max | skew jitter | age p50 | age jitter | inter-arrival jitter |
+|---|---:|---:|---:|---:|---:|---:|
+| @30 | 7.230 | 16.683 | 9.297 | 35.450 | 14.053 | 1.478 |
+| **@60** | **4.202** | **8.448** | **4.114** | **16.571** | **8.664** | 1.469 |
+
+848×480@60 measures identically (4.192 / 8.449 / 16.462) and is the sensor's
+native depth aspect — better depth FOV at the same cost — but it changes the
+published image dimensions, so it is left for a deliberate downstream migration
+rather than taken as a side effect of a latency fix.
+
+### 26.5 End-to-end, deployed on both Sparks
+
+Two node changes shipped together (`vigil-spark` `361a94308`): `fps` now reaches
+the device (it was a declared ROS parameter that only sized the drain tick while
+the pipeline config hardcoded 30), and the acquisition path uses
+`try_wait_for_frames` instead of `poll_for_frames` + a sleep.
+
+Measured with `rs-gb10-pipeline-age.py` through the node and DDS:
+
+| topic | | p50 | p99 | max | **jitter** |
+|---|---|---:|---:|---:|---:|
+| depth | 30 Hz baseline | 42.84 | — | — | **24.31** |
+| depth | **60 Hz, no poll** | **23.79** | 28.61 | 29.46 | **4.82** |
+| colour | 30 Hz baseline | 43.12 | — | — | **10.26** |
+| colour | **60 Hz, no poll** | **23.40** | 28.24 | 29.27 | **4.83** |
+
+spark-0060 agrees: depth p50 23.54, jitter 4.95; colour 23.05 / 5.02; **zero**
+executor evictions. Jitter — the operator-visible quantity this campaign exists
+to reduce — is down **5x**, and depth and colour now track each other to 0.39 ms
+in age and 0.01 ms in jitter, where before they diverged by 14 ms of jitter.
+
+### 26.6 The poll interval was a red herring, and the negative is the point
+
+§25.2 predicted that shrinking `FRAME_POLL_INTERVAL_SECONDS` was "the cheapest
+remaining lever". Measured at 200 µs: skew 6.777 → **11.174** ms, depth jitter
+24.31 → **27.47** ms. Worse on both.
+
+It could not have helped, and the reason is structural rather than empirical:
+skew is `|colour_ts − depth_ts|` **within a frameset**, fixed at the syncer's
+output. When you dequeue a frameset cannot change what is inside it. The
+prediction was wrong because it reasoned about *when frames are collected*
+against a quantity determined by *how they are paired*. The 5 ms sleep was real
+latency — worth removing, and removed — but it was never the skew.
+
+### 26.7 Verification through the launch path, and two things the runs surfaced
+
+Every number above was taken through `ros2 run`, which picks up the node's own
+default. The launch path — the one the fleet is told to use — declared
+`fps` with `default_value="30"` and passed it to every camera node, so it would
+have **overridden the win to zero**. Fixed in `vigil-spark` `b33a7ba4d`; the
+deployed copies on both Sparks are patched and `--show-args` now reports
+`default: '60'`.
+
+Two properties were verified rather than assumed:
+
+- **`fps` now reaches the device.** Requesting 30 negotiates 30 (33.34 ms
+  measured interval) and requesting 60 negotiates 60 (16.79 ms), alternated
+  twice to rule out an ordering artifact. Before the change both negotiated 30
+  while only the executor's drain tick moved.
+- **The blocking call does not wedge.** With the USB device de-authorised
+  mid-stream on spark-3066, `try_wait_for_frames(50)` returned in **50.2 ms**
+  (worst single call 51.2 ms) and kept returning — it honours its timeout, so
+  the Python deadline is enforceable and the aggregator hang that motivated
+  polling in the first place does not recur. The camera re-enumerated cleanly.
+  This matters because the node had deliberately avoided the SDK's blocking
+  path; that avoidance is now measured rather than inherited.
+
+The 60 Hz runs also surfaced:
+
+- **`ros2 run` collides where `ros2 launch` does not.** The instrument on
+  spark-0060 counted exactly 2× the expected messages on
+  `/realsense/depth/image_raw` once both nodes were up: over IPv6 link-local the
+  two hosts are one graph, and a bare `ros2 run` applies no namespace. This is
+  an artifact of how these measurements were taken, **not** a defect in the
+  deployed graph — `fleet.json` gives every camera its own `topic_prefix`
+  (`/realsense/spark_0060`, `/realsense/spark_0060_lateral`, …) and the launch
+  path passes it. The rule is still: start cameras via the launch path, and read
+  any ad-hoc `ros2 run` measurement on a shared domain with this in mind.
+- **`max_depth_color_skew_ms` defaults to 3.0**, below the 4.2 ms that 60 Hz
+  free-running delivers and far below the 7.2 ms that 30 Hz did. The node has
+  been logging a violation it can do nothing about. 60 Hz nearly closes the gap;
+  the threshold should be set from the measured bound (one frame interval),
+  not from an aspiration.
