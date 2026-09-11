@@ -89,7 +89,74 @@ between the two masks is an empirical question, and this is a medical
 procedure. `rs-record`/playback (`.db3`, rosbag2) gives a deterministic harness
 for exactly that comparison.
 
-### 2. Auto-exposure ROI, AE limit, and visual preset
+### 2. Auto-exposure ROI, AE limit, and visual preset — MEASURED AND LARGELY REJECTED
+
+**Update 2026-09-11, after measuring on spark-3066.** This was ranked #2 on the
+reasoning below. Three of its four claims did not survive contact with the
+device. Read this block before acting on the rationale that follows it.
+
+Live option state, independently verified: `visual_preset` = 0 (CUSTOM),
+`auto_exposure_limit_toggle` = 0, `auto_exposure_limit` = 165000 us,
+depth `exposure` = 8500 us with AE on, colour `exposure` = 166 us with AE on.
+
+**(a) The AE-limit toggle cannot be set. Silent write refusal.**
+`set_option(auto_exposure_limit_toggle, 1.0)` returns without raising and reads
+back **0**, in every combination tried: toggle-then-limit, limit-then-toggle,
+while streaming, while not streaming, and with AE disabled first. The *limit
+value* writes fine (165000 -> 16000); the toggle that would arm it does not.
+
+This is precisely the failure class `realsensenode._set_verified_option()`
+exists to catch. A naive `set_option` here would have looked like it worked and
+done nothing, forever.
+
+**(b) The rationale for the AE limit — "silent fps halving in dim rooms" — does
+not apply to this device.** Measured directly by forcing manual depth exposure
+past the frame period, 10 s per point:
+
+| depth exposure | achieved fps | gap p50 | valid px |
+|---:|---:|---:|---:|
+| 8 500 us | 59.60 | 16.81 ms | 77.65% |
+| 16 000 us | 59.60 | 16.80 ms | 79.14% |
+| 20 000 us | 59.60 | 16.80 ms | 77.87% |
+| 33 000 us | 59.60 | 16.80 ms | 73.37% |
+| 60 000 us | 59.60 | 16.81 ms | 59.81% |
+| 100 000 us | 59.60 | 16.79 ms | 43.86% |
+
+**Frame rate is flat from 8.5 ms to 100 ms** — six times the 16.67 ms frame
+period. The D435 does not trade frame rate for exposure at 60 fps. So the
+uncapped 165 ms limit is not a threat to the rate this campaign bought.
+
+What long exposure *does* cost is **depth validity**, monotonically: 77.65% ->
+43.86%. That is a real effect and a milder problem, and AE already sits near
+its optimum (8 500 us, with the best fill at 16 000).
+
+**(c) `HIGH_DENSITY` does not raise valid-depth coverage here — it lowers it.**
+12 s per leg on one open pipeline, options changed without restarting (repeated
+probe-commit is what wedges the xHCI controller on this fleet):
+
+| preset | valid px | vs baseline |
+|---|---:|---:|
+| CUSTOM (as deployed) | **93.72%** | — |
+| HIGH_DENSITY | 93.01% | **-0.71 pts** |
+| HIGH_ACCURACY | 78.30% | **-15.42 pts** |
+
+The deployed CUSTOM preset already beats HIGH_DENSITY. HIGH_ACCURACY trades
+away 15 points of fill, which is the wrong direction for consumers whose
+failure mode is `return None` on an empty patch. **Set no preset.**
+
+**(d) Colour exposure is already 166 us**, so the "pin a short colour exposure
+to sharpen temporal alignment" idea is already banked and yields nothing today.
+It survives only as a *guard*: AE may legally raise colour to 10 ms, which
+would matter. Pin it so AE cannot; do not expect a win now.
+
+**What survives:** the AE **ROI** (`rs2_set_region_of_interest`), which was not
+measured and is the one item here still worth testing — constraining AE to the
+patient region is about *where* the exposure is metered, which none of the above
+tested. The original reasoning for it follows.
+
+---
+
+#### Original reasoning (AE ROI only; the rest is superseded above)
 
 The node sets **only** `inter_cam_sync_mode`, `global_time_enabled`, and
 `frames_queue_size`. No visual preset, no AE ROI, no AE limit, no exposure —
@@ -179,9 +246,11 @@ at the frame edges — and it belongs to the `lower_limb` owners.
 
 ## What to do first
 
-1. **Measure** the AE/preset A/B (#2). It is a device-config change with an
-   existing verified-set seam, and it either justifies itself on valid-pixel
-   fraction or closes the question.
+1. ~~Measure the AE/preset A/B (#2).~~ **DONE, and it closed the question the
+   other way** — the toggle cannot be set, the fps rationale is refuted, and
+   HIGH_DENSITY is worse than what is deployed. Only the AE **ROI** is still
+   open. This is what "either justifies itself or closes the question" looks
+   like when the answer is no.
 2. **Prototype #1 against recorded data**, not live. It is the biggest win and
    the only one that removes a network, but it changes a clinician-facing
    signal and must be shown to agree with the mask it replaces.
