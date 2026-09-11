@@ -1796,13 +1796,40 @@ prediction was wrong because it reasoned about *when frames are collected*
 against a quantity determined by *how they are paired*. The 5 ms sleep was real
 latency — worth removing, and removed — but it was never the skew.
 
-### 26.7 Two things the 60 Hz runs surfaced
+### 26.7 Verification through the launch path, and two things the runs surfaced
 
-- **Both cameras publish to the same unnamespaced topic.** The instrument on
+Every number above was taken through `ros2 run`, which picks up the node's own
+default. The launch path — the one the fleet is told to use — declared
+`fps` with `default_value="30"` and passed it to every camera node, so it would
+have **overridden the win to zero**. Fixed in `vigil-spark` `b33a7ba4d`; the
+deployed copies on both Sparks are patched and `--show-args` now reports
+`default: '60'`.
+
+Two properties were verified rather than assumed:
+
+- **`fps` now reaches the device.** Requesting 30 negotiates 30 (33.34 ms
+  measured interval) and requesting 60 negotiates 60 (16.79 ms), alternated
+  twice to rule out an ordering artifact. Before the change both negotiated 30
+  while only the executor's drain tick moved.
+- **The blocking call does not wedge.** With the USB device de-authorised
+  mid-stream on spark-3066, `try_wait_for_frames(50)` returned in **50.2 ms**
+  (worst single call 51.2 ms) and kept returning — it honours its timeout, so
+  the Python deadline is enforceable and the aggregator hang that motivated
+  polling in the first place does not recur. The camera re-enumerated cleanly.
+  This matters because the node had deliberately avoided the SDK's blocking
+  path; that avoidance is now measured rather than inherited.
+
+The 60 Hz runs also surfaced:
+
+- **`ros2 run` collides where `ros2 launch` does not.** The instrument on
   spark-0060 counted exactly 2× the expected messages on
-  `/realsense/depth/image_raw` once both nodes were up: over IPv6 link-local
-  they are one graph, and `ros2 run` applies no namespace. The launch path must
-  be the only way these start for ETI.
+  `/realsense/depth/image_raw` once both nodes were up: over IPv6 link-local the
+  two hosts are one graph, and a bare `ros2 run` applies no namespace. This is
+  an artifact of how these measurements were taken, **not** a defect in the
+  deployed graph — `fleet.json` gives every camera its own `topic_prefix`
+  (`/realsense/spark_0060`, `/realsense/spark_0060_lateral`, …) and the launch
+  path passes it. The rule is still: start cameras via the launch path, and read
+  any ad-hoc `ros2 run` measurement on a shared domain with this in mind.
 - **`max_depth_color_skew_ms` defaults to 3.0**, below the 4.2 ms that 60 Hz
   free-running delivers and far below the 7.2 ms that 30 Hz did. The node has
   been logging a violation it can do nothing about. 60 Hz nearly closes the gap;
