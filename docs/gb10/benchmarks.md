@@ -1512,3 +1512,87 @@ demonstrably healthy — the same camera was publishing eight topics, enumerated
 without difficulty by `rs-gb10-pipeline-age.py` through the rclpy graph API.
 That is a third independent confirmation that the CLI is not a usable instrument
 on this fleet and must not be used as a readiness assertion.
+
+## §24 §23 measured the wrong span — global time reveals 33 ms that was hidden
+
+§23 reported "the publish path multiplies jitter 6.5x" by comparing the SDK's
+1.4 ms against 9.07 ms at the ROS topic. **That comparison was invalid**, and the
+reason is in the deployed node's own stamping logic:
+
+```python
+def _stamp_for_frame(arrival_stamp, timing, *, trust_global_time):
+    if not trust_global_time:
+        return arrival_stamp     # arrival AT THE NODE, not capture time
+    ...                          # the real capture timestamp
+```
+
+With `global_time_enabled=False` — the deployed default — `header.stamp` is the
+moment the frame **reached the node**. So `now - stamp` measured only
+node-to-subscriber transport. It was a truthful number for a different span than
+the one §23 claimed.
+
+### 24.1 The corrected measurement
+
+Same host, camera, topics, duration (60 s) and tool; the only change is
+`global_time_enabled:=true` and `inter_cam_sync_mode:=1`:
+
+| | OFF (stamp = node arrival) | ON (stamp = capture) |
+|---|---:|---:|
+| depth p50 | 10.25 | **42.84** |
+| depth p99 | 19.33 | **67.15** |
+| depth p99.9 | 19.68 | **70.41** |
+| depth max | 20.28 | **87.28** |
+| **depth jitter** | 9.07 | **24.31** |
+| colour p50 | 10.03 | 45.29 |
+| **colour jitter** | 9.03 | **10.26** |
+| depth/colour skew max | **166.893** | **6.777** |
+
+**Turning global time on did not make anything slower.** It changed what the
+stamp means, so the same pipeline now reports the latency it always had. The
+newly visible term is roughly **33 ms between capture and the node**, which
+arrival-stamping had been absorbing silently.
+
+### 24.2 What the fleet actually looks like
+
+Composing the spans, all measured on this hardware:
+
+```
+capture -> node        ~33 ms      newly visible; previously unmeasured
+node -> subscriber     ~10 ms      what 23 actually measured
+                       ------
+capture -> subscriber   42.84 ms p50, 67.15 p99, jitter 24.31 ms
+```
+
+And inside the SDK, §18's 1.4 ms delivery jitter is a component of the first
+span, not a competitor to the total.
+
+**The headline for an operator-facing system: the true tail is 24.31 ms of
+jitter on depth, not 9.07.** That is the number to reduce, and it is nearly
+three times what §23 implied.
+
+### 24.3 Hardware sync fixes the skew, and the skew was real
+
+`inter_cam_sync_mode=1` takes depth/colour skew from a **166.893 ms** violation
+to **6.777 ms** — a 24x improvement. §18 measured 0.024 ms via the SDK's own
+synchronised framesets, so 6.777 ms is still far from what the hardware can do,
+but the deployed default was producing skew large enough for an operator to see
+depth and colour disagree about the same moment.
+
+The node continues to log `free-run ... skew exceeded its telemetry budget` at
+6.777 ms, so its budget is tighter than that and the condition is steady rather
+than a startup artifact — which retires §23.4's guess that the 166 ms was
+convergence-only.
+
+### 24.4 Why this was invisible
+
+Arrival-stamping cannot produce a wrong-looking number. Ages stay small,
+positive and plausible; nothing warns. The tool reported exactly what it was
+asked and the question was wrong — the same failure that has recurred all day.
+**A latency measurement is only meaningful once you know what the producer put
+in the stamp**, and that is a property of the producer's configuration, not of
+the measurement.
+
+**Recommendation: enable `global_time_enabled` in the deployed configuration.**
+It costs nothing measurable, it is what makes stamps comparable across hosts
+(§20.5), and without it every latency number taken downstream silently measures
+transport instead of latency.
