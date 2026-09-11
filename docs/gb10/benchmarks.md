@@ -1596,3 +1596,92 @@ the measurement.
 It costs nothing measurable, it is what makes stamps comparable across hosts
 (§20.5), and without it every latency number taken downstream silently measures
 transport instead of latency.
+
+## §25 Depth/colour sync needs no cable — and policy is blocking it (2026-09-10)
+
+§24 changed **two** variables at once (`global_time_enabled` and
+`inter_cam_sync_mode`) and attributed a 24x skew improvement to the pair. That
+was a confound of this author's making. Separated:
+
+| configuration | depth/colour skew max |
+|---|---:|
+| `global_time=false, sync=0` — **the deployed default** | 166.893 ms |
+| `global_time=true,  sync=0` | **164.214 ms** |
+| `global_time=true,  sync=1` | **6.777 ms** |
+
+**The skew fix is entirely `inter_cam_sync_mode=1`.** Global time moves it by
+~2.7 ms — nothing. The two settings fix different problems and neither
+substitutes for the other:
+
+- `global_time_enabled` fixes the **timestamp domain** (§24): without it the
+  stamp is node-arrival, so every downstream latency number measures transport
+  instead of latency, and cross-host stamps are incomparable.
+- `inter_cam_sync_mode=1` fixes **depth/colour skew**: 164 ms -> 6.8 ms, 24x.
+
+### 25.1 No hardware trigger cable is involved
+
+This matters because it contradicts a guard in the fleet config
+(`vigil_utils/config_models.py`):
+
+```python
+if mode and not self.hardware_sync_cable_attested:
+    raise ValueError("nonzero RealSense sync mode requires an attested cable")
+```
+
+**No cable is attached to this camera.** Mode 1 is `MASTER` with
+`TriggerSource.INTERNAL` — the config model's own table says so. A master
+generates its sync internally and *emits* it for others; it does not consume an
+external trigger. The cable is required for **slave** modes (2, 3, genlock),
+which take `TriggerSource.EXTERNAL`.
+
+So the guard is correct for modes 2/3/259/260 and **over-broad for mode 1**,
+where it currently blocks a 24x improvement that costs nothing and needs no
+hardware. Recommend narrowing it to the external-trigger modes:
+
+```python
+if self.trigger_source is TriggerSource.EXTERNAL and not self.hardware_sync_cable_attested:
+```
+
+### 25.2 Software framesets are the other cable-free path, and they are better
+
+§18 measured depth/colour skew of **0.024 ms** through
+`pipeline.wait_for_frames()` — the SDK's own syncer, composite framesets, no
+cable and no `inter_cam_sync_mode`. That is **280x better than mode 1's 6.8 ms**,
+so the hardware mode is not the ceiling.
+
+The deployed node cannot simply switch to it, and its reason is recorded in its
+own source: `wait_for_frames()` was observed stuck inside librealsense's
+aggregator dequeue "for minutes" on spark-0060 after USB delivery stopped, so it
+polls to keep the deadline in Python and can restart a pinned device instead of
+looking healthy while publishing nothing. That is a legitimate robustness
+requirement, not an oversight.
+
+But the poll granularity is a tunable that nobody has tuned:
+
+```python
+FRAME_POLL_INTERVAL_SECONDS = 0.005   # up to 5 ms added per frame
+```
+
+Every frame whose pair is not instantly ready waits up to **5 ms**, which is
+latency *and* jitter contributed by the polling loop rather than the hardware.
+It is a module constant, not a ROS parameter, so it cannot be tuned at deploy
+time. Making it a parameter and reducing it is the cheapest remaining lever.
+
+### 25.3 Host levers surveyed
+
+Measured on spark-3066; most are already optimal, which is worth recording so
+nobody re-tunes them:
+
+| lever | state | verdict |
+|---|---|---|
+| CPU governor | `performance` | already optimal |
+| USB link speed | 5000 Mbps (SuperSpeed) | already optimal |
+| USB autosuspend | `control=auto` but `autosuspend_delay_ms=-1` | effectively disabled; setting `control=on` is belt-and-braces |
+| **`rtprio` ulimit** | **0** | **the capture thread cannot be given realtime priority at all** |
+| cpuidle driver | `acpi_idle` | see §22 before touching idle states |
+
+The `rtprio` limit is the notable one: with it at 0, no amount of code change can
+protect the acquisition thread from preemption. Raising `RLIMIT_RTPRIO` for the
+service user is the precondition for any `SCHED_FIFO` work on the capture path.
+`xhci-hcd:usb3` carries 3.9M interrupts and is the camera's controller, so it is
+the candidate for IRQ affinity pinning if that is ever pursued.
