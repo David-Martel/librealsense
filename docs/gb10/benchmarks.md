@@ -1440,3 +1440,75 @@ that same session.
 The §18 steady-state figures remain the only measured jitter numbers on this fleet.
 Whether disabling idle states improves the delivery tail is still an open question, and
 answering it now requires the §22.2 changes plus a host that is not the only live one.
+
+## §23 The end-to-end number, measured at last (2026-09-10)
+
+Every prior number on this fleet was single-stage. This is the first measurement
+of how stale a frame is **at the ROS layer**, on the real pipeline, from the
+deployed release's own `sensors realsense` node.
+
+spark-3066, D435 `347622075921` fw 5.17.3.10, release `bfaf7a2f4`, 60 s,
+~31 Hz, under normal co-tenancy:
+
+| topic | n | p50 | p99 | p99.9 | max | **jitter** |
+|---|---:|---:|---:|---:|---:|---:|
+| `/realsense/depth/image_raw` | 1861 | 10.25 | 19.33 | 19.68 | 20.28 | **9.07** |
+| `/realsense/color/image_raw` | 1862 | 10.03 | 19.06 | 19.76 | 19.92 | **9.03** |
+| `/realsense/color/compressed` | 1861 | 10.45 | 19.53 | 20.26 | 20.41 | **9.07** |
+
+All figures milliseconds; jitter is p99 − p50; percentiles nearest-rank.
+
+### 23.1 The publish path multiplies jitter ~6.5x
+
+§18 measured delivery jitter **inside the SDK** at **1.4 ms** (p99 − p50, same
+camera, same 1280x720). At the ROS topic the same quantity is **9.07 ms**.
+
+So roughly **7.6 ms of jitter is added between `wait_for_frames()` returning and
+a subscriber receiving the message** — node callback, message construction,
+serialisation, DDS, and delivery. That is 6.5x the camera's own contribution, and
+it is the first evidence locating operator-visible jitter in the transport rather
+than the sensor.
+
+This retires the framing that the camera needed tuning. It did not: §18 already
+showed 1.4 ms, and this shows the SDK is responsible for ~15% of what reaches a
+consumer.
+
+### 23.2 Compression is not a jitter source
+
+`color/compressed` costs **+0.42 ms** at p50 and **+0.04 ms** of jitter over
+`color/image_raw`. Compression is effectively free in tail terms here and should
+not be a suspect.
+
+### 23.3 What this does NOT include
+
+Render submission to photons, deliberately (§20's reasoning): it needs a screen
+witness, and X11 capture returns uniform zero on this Wayland fleet rather than
+failing. The compositor presents on a fixed cadence, so it adds roughly constant
+latency and at most one refresh interval of spread — the variance is upstream,
+which is what this measures.
+
+### 23.4 Two node-level findings surfaced by the same run
+
+- **Global time is OFF in the deployed node**: it logs
+  `global_time_requested=False, global_time_effective=False`. §18 measured with
+  it ON. Frame stamps are therefore device-domain here, which is exactly the
+  condition §20.5 warned makes cross-host stamps non-comparable.
+- **A 166.893 ms depth/colour skew violation** was logged during startup
+  (`free-run depth/color skew exceeded its telemetry budget`), against the
+  **0.024 ms** §18 measured with hardware sync. The steady-state age difference
+  between the two topics is only 0.22 ms, so this looks like a startup artifact
+  during timestamp convergence rather than a steady-state property — but
+  "free-run" in the node's own wording indicates it is **not** using the hardware
+  sync that produced 0.024 ms. Worth establishing which, because 166 ms of skew
+  between depth and colour is squarely operator-visible.
+- The node also errors `Standard RealSense depth companions are disabled ...
+  distortion model=2 has no exact CameraInfo representation`, so
+  `depth_standard` companions are suppressed on this stream generation.
+
+### 23.5 Instrument note
+
+`ros2 topic list` returned **empty** throughout this run while the graph was
+demonstrably healthy — the same camera was publishing eight topics, enumerated
+without difficulty by `rs-gb10-pipeline-age.py` through the rclpy graph API.
+That is a third independent confirmation that the CLI is not a usable instrument
+on this fleet and must not be used as a readiness assertion.
