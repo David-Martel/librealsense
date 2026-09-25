@@ -24,15 +24,19 @@ depth ops. This ranking reflects that, and it is not the ranking a
 
 ## The structural observation
 
-**The node aligns 307,200 depth pixels every frame; its three consumers need a
-9x9 patch and two rectangle means.**
+**The node aligns 307,200 depth pixels every frame; its consumers reduce them to
+a handful of scalars -- but those scalars are computed over nearly every aligned
+pixel.**
 
 - `realsensenode.py` enables colour+depth 640x480, builds
   `realsense.align(realsense.stream.color)`, and runs it on every frame.
 - `person_segmentation_node.depth_at_bbox()` takes the median of a **9x9 patch**
   (`depth_patch_half_px` 4) at the bbox centroid. One scalar.
-- `chest_rise_node` uses a **percent-ROI rectangle** plus a reference region.
-  Region means only.
+- `chest_rise_node` averages a **percent-ROI rectangle** (default rows 30-70%,
+  columns 45-85%: 192x256 = **49,152 px** at 640x480, also split into lateral
+  halves) and takes a median over a **reference region that is every pixel
+  outside that ROI** (**258,048 px**). Between them they read the whole frame:
+  the *outputs* are scalars, the *inputs* are not.
 - `eti_sniffer` is a third subscriber on the same topic.
 
 `align` still earns its keep — the bbox and ROI are produced in *colour* space
@@ -166,8 +170,15 @@ insertion point.
 - `rs2_set_region_of_interest` — D435 supports AE ROI on **both** sensors
   (colour gated at fw >= 5.10.9.0; this fleet is 5.17.3.10).
 - `RS2_OPTION_AUTO_EXPOSURE_LIMIT` — gated at fw >= 5.12.10.11 + global
-  shutter; passes. **This is the classic cause of silent fps halving in dim
-  rooms**, so it protects the 60 Hz that §26 just bought.
+  shutter; passes. **Depth sensor only:** `d400_device` binds
+  `auto_exposure_limit_feature` to `get_depth_sensor()`
+  (`src/ds/d400/d400-device.cpp`), so it caps depth exposure and protects only
+  the **depth** stream's 60 Hz. It does nothing for the colour stream, which is
+  the one driving inference. Colour frame rate under low light is governed
+  separately, by the colour sensor's `RS2_OPTION_AUTO_EXPOSURE_PRIORITY`
+  (registered in `src/ds/d400/d400-color.cpp`; set it to 0 so AE cannot trade
+  frame rate for exposure) or by a fixed colour exposure. Silent fps halving in
+  dim rooms needs **both** controls, one per sensor.
 - `RS2_OPTION_VISUAL_PRESET` (`HIGH_DENSITY`) — raises valid-depth coverage,
   which directly reduces the `return None` path in `depth_at_bbox`.
 
@@ -199,8 +210,10 @@ of a 16.67 ms budget, spent on the cheap side of the asymmetry.
 (`src/proc/pointcloud.cpp`). So the CUDA path is real and reaches the deployed
 bindings.
 
-**But nothing in vigil-spark needs it.** The consumers want ~85 pixels, not
-307,200 points. Recorded here so the next person does not spend a day wiring up
+**But nothing in vigil-spark needs it.** The consumers want per-pixel *depth
+values* reduced to scalars -- a 9x9-patch median (81 px) plus ROI and
+reference-region statistics that together touch all 307,200 pixels -- and never
+3-D points. Recorded here so the next person does not spend a day wiring up
 an accelerated block for a pipeline that has no use for its output.
 
 ### 6. `rs2_deproject_pixel_to_point` — a correctness gap, not a speed one
