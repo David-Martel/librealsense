@@ -3,7 +3,7 @@
 Survey against the deployed fork (`v2.58.4`, `LRS_GB10_FORCE_RSUSB=ON`,
 `BUILD_WITH_CUDA=ON`, `BUILD_WITH_NEON=ON`) and the live consumers in
 `vigil-spark`, 2026-09-11. Every claim below is verified in one of the two
-trees or by enumeration on `spark-3066`, with the path cited.
+trees or by enumeration on a deployed GB10 host, with the path cited.
 
 ## The headline inverts the question
 
@@ -49,7 +49,7 @@ the frame.
 
 Verified: the only librealsense surface used is `pipeline`, `config`, and
 `align`. Every block below is present in the **deployed** bindings on
-spark-3066 and none is used:
+a GB10 host and none is used:
 
 ```
 decimation_filter  temporal_filter  spatial_filter  threshold_filter
@@ -95,7 +95,7 @@ for exactly that comparison.
 
 ### 2. Auto-exposure ROI, AE limit, and visual preset — MEASURED AND LARGELY REJECTED
 
-**Update 2026-09-11, after measuring on spark-3066.** This was ranked #2 on the
+**Update 2026-09-11, after measuring on a deployed GB10 host.** This was ranked #2 on the
 reasoning below. Three of its four claims did not survive contact with the
 device. Read this block before acting on the rationale that follows it.
 
