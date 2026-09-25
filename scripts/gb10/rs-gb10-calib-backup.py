@@ -101,12 +101,14 @@ try:
         print(f"  rgb (t32): firmware returned {rc} - NOT dumped")
     else:
         results["rgb_t32"] = split_and_check(raw[4:], 32, "rgb (t32)")
-except Exception as exc:  # noqa: BLE001 - deliberate; see below
+except (Exception, SystemExit) as exc:  # noqa: BLE001 - deliberate; see below
     # Deliberately broad. The RGB read is best-effort: it goes through the raw
     # debug_protocol path, which can fail in ways the typed API cannot (an
     # unsupported opcode on some firmware, a short reply, a malformed header).
     # None of that should cost us the DEPTH backup, which is the one that
-    # matters and has already succeeded by this point. Report and continue --
+    # matters and has already succeeded by this point. SystemExit is listed
+    # explicitly because split_and_check() refuses a bad table by raising it,
+    # and it is not an Exception subclass. Report and continue --
     # but report loudly, and let RESULT say 1 of 2 rather than claiming success.
     print(f"  rgb (t32): FAILED {type(exc).__name__}: {exc} - NOT dumped")
 
