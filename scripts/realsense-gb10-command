@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cmd="$(basename "$0")"
+exec /usr/local/bin/realsense-gb10-env "$cmd" "$@"

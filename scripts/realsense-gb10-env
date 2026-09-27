@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PREFIX="${REALSENSE_GB10_PREFIX:-/opt/vigil/opt/librealsense-v2.58.1-dgx-spark-gb10}"
+# The install prefix comes from VIGIL_RS_GB10_PREFIX, the one variable the VIGIL GB10 deploy
+# (vigil-spark ops/deploy_gb10_realsense.sh -> /etc/profile.d/vigil-realsense-gb10.sh) exports.
+# There is deliberately no default: a hardcoded prefix silently selected v2.58.1 on hosts
+# where the deployed SDK is v2.58.4.
+PREFIX="${VIGIL_RS_GB10_PREFIX:?VIGIL_RS_GB10_PREFIX is not set; source /etc/profile.d/vigil-realsense-gb10.sh or export the GB10 librealsense install prefix}"
+if [[ ! -d "$PREFIX/lib" ]]; then
+    echo "realsense-gb10-env: VIGIL_RS_GB10_PREFIX=$PREFIX has no lib/ directory; is the GB10 SDK installed there?" >&2
+    exit 1
+fi
 PYTHON_VERSION="${REALSENSE_GB10_PYTHON_VERSION:-$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')}"
 
 export PATH="$PREFIX/bin:${PATH:-}"
