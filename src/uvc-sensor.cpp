@@ -41,7 +41,9 @@ void log_callback_end( uint32_t fps,
 // behavior is byte-for-byte unchanged.
 static bool capture_zerocopy_enabled()
 {
-#ifdef RS2_USE_CUDA_ZEROCOPY
+    // RSUSB callbacks release their buffer on return; their continuation does not retain it.
+    // Keep capture copying on that backend; CUDA processing and owned buffers remain enabled.
+#if defined( RS2_USE_CUDA_ZEROCOPY ) && ! defined( RS2_USE_LIBUVC_BACKEND )
     static bool const enabled = rsutils::rs2_is_cuda_integrated();
     return enabled;
 #else
