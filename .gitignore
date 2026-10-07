@@ -112,3 +112,5 @@ unit-tests/logs/pytest-results.xml
 
 # Local git worktrees (in-repo per fleet worktree discipline; never committed)
 /.worktrees/
+
+/worktrees/
