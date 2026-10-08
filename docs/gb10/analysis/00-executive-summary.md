@@ -3,7 +3,7 @@
 **Host:** `spark-3066` — NVIDIA **DGX Spark / GB10** (aarch64), Ubuntu 24.04.4 LTS, kernel `6.17.0-1021-nvidia`, CUDA 13.0, driver 580.159.03
 **Camera:** Intel RealSense **D435** (`8086:0b07`), ASIC/serial `404543020690`, firmware **5.13.0.55**
 **Date:** 2026-06-02
-**Author:** automated analysis (Claude Code) for david.martel@auricleinc.com
+**Author:** automated analysis (Claude Code) for David T. Martel
 
 ---
 
