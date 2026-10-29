@@ -65,7 +65,9 @@ jobs:
 
       - name: Upload logs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        continue-on-error: true
         with: 
+          retention-days: 1
           name: cppcheck_log
           path: |
             cppcheck_run.log
@@ -143,7 +145,9 @@ jobs:
       
       - name: Upload Valgrind log
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        continue-on-error: true
         with:
+          retention-days: 1
           name: valgrind-log
           path: build/valgrind-out.txt
 
@@ -199,7 +203,9 @@ jobs:
 
     - name: Upload ASAN log
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+      continue-on-error: true
       with:
+          retention-days: 1
           name: asan-log
           path: build/asan-out.txt*
 
