@@ -59,18 +59,17 @@ jobs:
 
     steps:
       - name: Refuse to run on a host with a RealSense attached
-        # Defence in depth behind the label. If someone ever adds this label to a
-        # Spark, or plugs a camera into asuspro13, this job must stop rather than
-        # become a lint job quietly sharing a host with a live HIL soak.
+        # Fail if enumeration is unavailable or a matching camera is visible.
+        # Container enumeration describes only its visible device namespace.
         run: |
           set -euo pipefail
-          if lsusb 2>/dev/null | grep -qiE '8086:0b(07|3a|64)'; then
-            echo "::error::A RealSense device is attached to this runner host." \
-                 "This job is lint-only and must never share a host with a deployed camera."
-            lsusb | grep -iE '8086:0b' || true
+          usb_devices="$(lsusb)"
+          if [[ "${usb_devices,,}" =~ 8086:0b(07|3a|64) ]]; then
+            echo "::error::A matching RealSense device is visible to this runner."
+            printf '%s\n' "$usb_devices"
             exit 1
           fi
-          echo "no RealSense device on this host - safe to lint"
+          echo "No matching RealSense device visible to this runner; continuing lint-only checks."
 
       - uses: actions/checkout@v4
         with:
@@ -106,6 +105,9 @@ jobs:
           echo "--- fork-owned files changed ---"
           cat changed.txt
           echo "count=$(wc -l < changed.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Test USB enumeration guard without hardware
+        run: uv run --no-project --python 3.14 python scripts/gb10/test_gb10_ci_guard.py
 
       - name: Prove the linter actually runs
         # A gate that cannot fire is indistinguishable from a gate that passes.

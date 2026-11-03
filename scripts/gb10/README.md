@@ -4,6 +4,23 @@ Build, test, HIL-stress, quality-measure, and firmware tooling for the David-Mar
 fork on NVIDIA DGX Spark / GB10 (ARM64). Most are driven by the repo-root **`justfile`** (`just`).
 Findings these tools produced live in [`../../docs/gb10/`](../../docs/gb10/).
 
+## CI device guard (no hardware)
+
+Run `uv run --no-project --python 3.14 python scripts/gb10/test_gb10_ci_guard.py`
+from the repository root. This standard-library [regression test](test_gb10_ci_guard.py)
+executes the actual named guard in the [lint workflow](../../.github/workflows/gb10-lint.yaml)
+with controlled `lsusb` outcomes and a real Bash. Its eleven cases cover failed
+or unavailable enumeration, successful absence, all three guarded IDs, mixed
+case, output larger than a pipe buffer and missing/broken matcher commands.
+Real `grep` is available only as a fixture for comparison with the old guard;
+the candidate guard uses Bash's built-in matcher. The [review register](TEST_REVIEW.csv) binds
+the test group and exact guard source; `unreviewed` does not imply acceptance.
+The carried review identifies an
+[organization source commit](https://github.com/vigil-paradigm/librealsense/commit/870f0ccb3ff97dfc984c6b872980159ce5d8a855)
+and applies here through the matching test and guard hashes.
+These controls neither enumerate a physical device nor establish host-wide
+camera absence, SDK correctness or HIL qualification.
+
 ## Runtime environment (all HIL/quality tools need this)
 - **pyrealsense2** from a GB10 build dir on `LD_LIBRARY_PATH` + `PYTHONPATH`
   (`~/realsense-gb10-validation/build-gb10-full/Release` = CUDA build; `build-gb10-nocuda` = CPU baseline).
